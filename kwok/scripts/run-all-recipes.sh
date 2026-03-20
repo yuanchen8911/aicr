@@ -39,7 +39,7 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 
 # Find recipes with service criteria (testable cloud configurations)
 get_recipes() {
-    for overlay in "${OVERLAYS_DIR}"/*.yaml; do
+    for overlay in $(find "${OVERLAYS_DIR}" -name '*.yaml' -type f | sort); do
         local name service
         name=$(basename "$overlay" .yaml)
         service=$(yq eval '.spec.criteria.service // ""' "$overlay" 2>/dev/null)

@@ -88,7 +88,7 @@ jobs:
           tier1="[]"   # generic overlays (no accelerator specialization)
           all="[]"     # every testable overlay
 
-          for overlay in recipes/overlays/*.yaml; do
+          for overlay in $(find recipes/overlays -name '*.yaml' -type f | sort); do
             name=$(basename "$overlay" .yaml)
             service=$(yq eval '.spec.criteria.service // ""' "$overlay" 2>/dev/null || true)
 
@@ -120,13 +120,16 @@ jobs:
             # If registry.yaml or base.yaml changed, all accelerator overlays are
             # potentially affected — promote the full accelerator set to Tier 2.
             promote_all=false
-            if echo "$changed_files" | grep -qE '^recipes/(registry\.yaml|overlays/base\.yaml)$'; then
+            if echo "$changed_files" | grep -qE '^recipes/(registry\.yaml|overlays/(base\.yaml|.*/base\.yaml))$'; then
               promote_all=true
               echo "registry.yaml or base.yaml changed — all accelerator overlays promoted to Tier 2"
             fi
 
+            # find_overlay resolves an overlay name to its file path under recipes/overlays/
+            find_overlay() { find recipes/overlays -name "${1}.yaml" -type f | head -1; }
+
             # Build set of affected accelerator-specific overlays
-            for overlay in recipes/overlays/*.yaml; do
+            for overlay in $(find recipes/overlays -name '*.yaml' -type f | sort); do
               name=$(basename "$overlay" .yaml)
               service=$(yq eval '.spec.criteria.service // ""' "$overlay" 2>/dev/null || true)
               accel=$(yq eval '.spec.criteria.accelerator // ""' "$overlay" 2>/dev/null || true)
@@ -148,7 +151,7 @@ jobs:
               include=false
 
               # Rule 1: overlay file itself changed
-              if echo "$changed_files" | grep -qF "recipes/overlays/${name}.yaml"; then
+              if echo "$changed_files" | grep -qF "$overlay"; then
                 include=true
               fi
 
@@ -160,12 +163,12 @@ jobs:
                   if [[ -z "$parent" || "$parent" == "null" ]]; then
                     break
                   fi
-                  if echo "$changed_files" | grep -qF "recipes/overlays/${parent}.yaml"; then
-                    include=true
+                  current=$(find_overlay "$parent")
+                  if [[ -z "$current" || ! -f "$current" ]]; then
                     break
                   fi
-                  current="recipes/overlays/${parent}.yaml"
-                  if [[ ! -f "$current" ]]; then
+                  if echo "$changed_files" | grep -qF "$current"; then
+                    include=true
                     break
                   fi
                 done
@@ -185,8 +188,8 @@ jobs:
                   if [[ -z "$parent" || "$parent" == "null" ]]; then
                     break
                   fi
-                  current="recipes/overlays/${parent}.yaml"
-                  if [[ ! -f "$current" ]]; then
+                  current=$(find_overlay "$parent")
+                  if [[ -z "$current" || ! -f "$current" ]]; then
                     break
                   fi
                 done

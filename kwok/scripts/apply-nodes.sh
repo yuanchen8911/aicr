@@ -137,9 +137,10 @@ generate_node() {
 
 create_nodes() {
     local recipe="$1"
-    local overlay_file="${OVERLAYS_DIR}/${recipe}.yaml"
+    local overlay_file
+    overlay_file=$(find "$OVERLAYS_DIR" -name "${recipe}.yaml" -type f | head -1)
 
-    [[ -f "$overlay_file" ]] || { log_error "Recipe overlay not found: $overlay_file"; exit 1; }
+    [[ -n "$overlay_file" && -f "$overlay_file" ]] || { log_error "Recipe overlay not found: ${recipe}.yaml under $OVERLAYS_DIR"; exit 1; }
 
     # Extract criteria from overlay
     local service accelerator

@@ -114,8 +114,9 @@ func loadMetadataStore(_ context.Context) (*MetadataStore, error) {
 			}
 
 			// Categorize as base or overlay
-			// base.yaml is now in overlays/ directory but still identified by filename
-			if filename == "base.yaml" && strings.Contains(path, "overlays/") {
+			// base.yaml lives at overlays/base.yaml (not in a subdirectory).
+			// Use slash-separated path (not filepath.Join) because embed.FS paths are always slash-separated.
+			if filename == "base.yaml" && path == "overlays/base.yaml" {
 				store.Base = &metadata
 			} else {
 				store.Overlays[metadata.Metadata.Name] = &metadata
