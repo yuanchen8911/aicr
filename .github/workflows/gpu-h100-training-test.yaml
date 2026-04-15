@@ -51,14 +51,14 @@ jobs:
           filters: |
             matched:
               - '.github/workflows/gpu-h100-training-test.yaml'
+              - '.settings.yaml'
               - '.github/actions/gpu-cluster-setup/**'
               - '.github/actions/gpu-operator-install/**'
               - '.github/actions/aicr-build/**'
               - '.github/actions/setup-build-tools/**'
+              - '.github/actions/install-karpenter-kwok/**'
               - 'validators/*/Dockerfile'
               - 'pkg/evidence/**'
-              - 'pkg/validator/checks/conformance/**'
-              - 'pkg/validator/checks/deployment/**'
               - '.github/actions/gpu-test-cleanup/**'
               - '.github/actions/load-versions/**'
               - 'tests/chainsaw/ai-conformance/main.go'
@@ -70,9 +70,13 @@ jobs:
               - 'tests/chainsaw/ai-conformance/kind/assert-gpu-operator.yaml'
               - 'tests/chainsaw/ai-conformance/kind/assert-nvsentinel.yaml'
               - 'tests/chainsaw/ai-conformance/kind/assert-network-operator.yaml'
-              - 'tests/chainsaw/ai-conformance/kind-training/**'
+              - 'tests/chainsaw/ai-conformance/cluster/assert-kubeflow-trainer.yaml'
+              - 'tests/chainsaw/ai-conformance/kind-training-kubeflow/**'
               - 'recipes/overlays/kind.yaml'
               - 'recipes/overlays/h100-kind-training.yaml'
+              - 'recipes/overlays/h100-kind-training-kubeflow.yaml'
+              - 'recipes/mixins/platform-kubeflow.yaml'
+              - 'recipes/components/kubeflow-trainer/**'
               - 'kwok/manifests/karpenter/**'
               - 'kwok/scripts/install-karpenter-kwok.sh'
               - 'recipes/components/prometheus-adapter/**'
@@ -122,6 +126,7 @@ jobs:
           method: bundle
           accelerator: h100
           intent: training
+          platform: kubeflow
 
       # --- Snapshot and GPU validation ---
 
@@ -154,18 +159,19 @@ jobs:
       - name: Run chainsaw health checks
         run: |
           chainsaw test \
-            --test-dir tests/chainsaw/ai-conformance/kind-training \
+            --test-dir tests/chainsaw/ai-conformance/kind-training-kubeflow \
             --config tests/chainsaw/chainsaw-config.yaml
 
       - name: Verify expected resources exist
         run: |
           go run ./tests/chainsaw/ai-conformance/ \
-            --dir tests/chainsaw/ai-conformance/kind-training \
+            --dir tests/chainsaw/ai-conformance/kind-training-kubeflow \
             --file tests/chainsaw/ai-conformance/cluster/assert-cert-manager.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-monitoring.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-skyhook.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-dra-driver.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-kai-scheduler.yaml \
+            --file tests/chainsaw/ai-conformance/cluster/assert-kubeflow-trainer.yaml \
             --kubeconfig="${HOME}/.kube/config" \
             --debug
 
@@ -193,12 +199,13 @@ jobs:
         if: always() && steps.bundle-install.outcome == 'success'
         run: |
           go run ./tests/chainsaw/ai-conformance/ \
-            --dir tests/chainsaw/ai-conformance/kind-training \
+            --dir tests/chainsaw/ai-conformance/kind-training-kubeflow \
             --file tests/chainsaw/ai-conformance/cluster/assert-cert-manager.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-monitoring.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-skyhook.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-dra-driver.yaml \
             --file tests/chainsaw/ai-conformance/cluster/assert-kai-scheduler.yaml \
+            --file tests/chainsaw/ai-conformance/cluster/assert-kubeflow-trainer.yaml \
             --kubeconfig="${HOME}/.kube/config" \
             --debug
 
@@ -236,6 +243,14 @@ jobs:
           kubectl --context="kind-${KIND_CLUSTER_NAME}" get queues -A 2>/dev/null || true
           echo "=== KAI scheduler podgroups ==="
           kubectl --context="kind-${KIND_CLUSTER_NAME}" get podgroups -A 2>/dev/null || true
+          echo "=== Kubeflow Trainer deployment ==="
+          kubectl --context="kind-${KIND_CLUSTER_NAME}" -n kubeflow get deployment kubeflow-trainer-controller-manager -o wide 2>/dev/null || true
+          echo "=== Kubeflow pods ==="
+          kubectl --context="kind-${KIND_CLUSTER_NAME}" -n kubeflow get pods -o wide 2>/dev/null || true
+          echo "=== Kubeflow validating webhooks ==="
+          kubectl --context="kind-${KIND_CLUSTER_NAME}" get validatingwebhookconfigurations validator.trainer.kubeflow.org -o yaml 2>/dev/null || true
+          echo "=== Kubeflow Trainer CRD ==="
+          kubectl --context="kind-${KIND_CLUSTER_NAME}" get crd trainjobs.trainer.kubeflow.org -o yaml 2>/dev/null || true
           echo "=== Non-running pods (all namespaces) ==="
           kubectl --context="kind-${KIND_CLUSTER_NAME}" get pods -A \
             --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null || true

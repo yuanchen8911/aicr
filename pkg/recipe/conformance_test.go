@@ -66,6 +66,7 @@ func TestConformanceRecipeInvariants(t *testing.T) {
 				"dra-support",
 				"accelerator-metrics",
 				"ai-service-metrics",
+				"gang-scheduling",
 				"inference-gateway",
 				"robust-controller",
 				"secure-accelerator-access",
@@ -98,8 +99,42 @@ func TestConformanceRecipeInvariants(t *testing.T) {
 				"accelerator-metrics",
 				"ai-service-metrics",
 				"gang-scheduling",
+				"secure-accelerator-access",
 				"pod-autoscaling",
 				"cluster-autoscaling",
+			},
+			wantDRAConstraint: true,
+		},
+		{
+			name: "h100-kind-training-kubeflow",
+			criteria: func() *Criteria {
+				c := NewCriteria()
+				c.Service = CriteriaServiceKind
+				c.Accelerator = CriteriaAcceleratorH100
+				c.Intent = CriteriaIntentTraining
+				c.Platform = CriteriaPlatformKubeflow
+				return c
+			},
+			requiredComponents: []string{
+				"cert-manager",
+				"gpu-operator",
+				"kube-prometheus-stack",
+				"prometheus-adapter",
+				"nvidia-dra-driver-gpu",
+				"kai-scheduler",
+				"kubeflow-trainer",
+			},
+			requiredChecks: []string{
+				"platform-health",
+				"gpu-operator-health",
+				"dra-support",
+				"accelerator-metrics",
+				"ai-service-metrics",
+				"gang-scheduling",
+				"secure-accelerator-access",
+				"pod-autoscaling",
+				"cluster-autoscaling",
+				"robust-controller",
 			},
 			wantDRAConstraint: true,
 		},

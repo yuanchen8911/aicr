@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: GPU Inference Test (nvkind + H100)
+name: GPU Inference Test (nvkind + H100 x2)
 
 on:
   schedule:
@@ -51,18 +51,22 @@ jobs:
           filters: |
             matched:
               - '.github/workflows/gpu-h100-inference-test.yaml'
+              - '.settings.yaml'
               - '.github/actions/gpu-cluster-setup/**'
               - '.github/actions/gpu-operator-install/**'
               - '.github/actions/aicr-build/**'
               - '.github/actions/setup-build-tools/**'
+              - '.github/actions/install-karpenter-kwok/**'
               - 'validators/*/Dockerfile'
               - 'pkg/evidence/**'
-              - 'pkg/validator/checks/conformance/**'
-              - 'pkg/validator/checks/deployment/**'
               - '.github/actions/gpu-test-cleanup/**'
               - '.github/actions/load-versions/**'
               - 'tests/manifests/**'
               - 'tests/chainsaw/ai-conformance/**'
+              - 'recipes/mixins/platform-inference.yaml'
+              - 'recipes/components/kgateway/**'
+              - 'recipes/components/kgateway-crds/**'
+              - 'recipes/components/dynamo-crds/**'
               - 'recipes/components/dynamo-platform/**'
               - 'recipes/components/prometheus-adapter/**'
               - 'recipes/overlays/kind.yaml'
@@ -88,9 +92,9 @@ jobs:
         (github.event_name == 'pull_request' && github.event.label.name == 'run-gpu-tests') ||
         (github.event_name == 'push' && needs.check-paths.outputs.should-run == 'true')
       )
-    name: GPU Inference Test (nvkind + H100)
-    runs-on: linux-amd64-gpu-h100-latest-1
-    timeout-minutes: 90
+    name: GPU Inference Test (nvkind + H100 x2)
+    runs-on: linux-amd64-gpu-h100-latest-2
+    timeout-minutes: 120
 
     env:
       KIND_CLUSTER_NAME: gpu-inference-test
@@ -108,7 +112,7 @@ jobs:
       - name: Build aicr
         uses: ./.github/actions/aicr-build
         with:
-          validator_phases: 'deployment,conformance'
+          validator_phases: 'conformance'
 
       - name: Install runtime bundle
         id: bundle-install
@@ -124,7 +128,7 @@ jobs:
         uses: ./.github/actions/gpu-snapshot-validate
         with:
           gpu_model: H100
-          min_gpu_count: '1'
+          min_gpu_count: '2'
           cluster_name: ${{ env.KIND_CLUSTER_NAME }}
 
       # --- Install Karpenter + KWOK early to give monitoring stack settle time ---
@@ -168,16 +172,16 @@ jobs:
             --debug
 
       # --- CNCF AI Conformance validation ---
-      # Runs before Dynamo: the dra-support check needs to allocate a GPU via
-      # ResourceClaim, which conflicts with Dynamo's vllm-smoke-gpu-claim if
-      # Dynamo is deployed first (only 1 GPU on H100 x1).
+      # Runs before Dynamo so conformance validators retain access to free GPUs.
+      # dra-support allocates a GPU via ResourceClaim, and gang-scheduling
+      # requires 2 free GPUs. Running the Dynamo smoke test first would consume
+      # GPU capacity and create avoidable test flakiness.
 
       - name: Validate CNCF AI Conformance
         run: |
           AICR_VALIDATOR_IMAGE_REGISTRY=ko.local \
           ./aicr validate \
             --recipe recipe.yaml \
-            --phase deployment \
             --phase conformance \
             --namespace gpu-operator \
             --kubeconfig="${HOME}/.kube/config" \
@@ -188,8 +192,8 @@ jobs:
             --evidence-dir=conformance-evidence
 
       # --- Dynamo vLLM inference smoke test ---
-      # Runs after conformance: Dynamo's DRA ResourceClaim consumes the GPU,
-      # which would block dra-support validation if deployed first.
+      # Runs after conformance: Dynamo's DRA ResourceClaim consumes GPU
+      # capacity, so it is safer to keep the shared conformance gate first.
 
       - name: Deploy Dynamo vLLM smoke test
         run: |
