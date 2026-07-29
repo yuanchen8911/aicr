@@ -16,7 +16,8 @@ description: |
 
 Review a GitHub Projects v2 board, produce structured recommendations across
 five actionable buckets plus a no-change list, get explicit user confirmation,
-then apply the approved changes via `gh`.
+then apply the approved changes via `gh` and comment the outcome on every
+triaged issue.
 
 **Default board:** <https://github.com/orgs/NVIDIA/projects/248> (AICR). Pass
 `owner/number` as the skill arg to triage a different board.
@@ -85,6 +86,13 @@ rendered into any table, escape `|` and replace CR/LF with spaces in every cell.
 ```bash
 owner="<owner>"; num="<project-number>"   # default: NVIDIA / 248
 
+# Stamp the run start BEFORE any write — Step 7's dedupe compares comment
+# timestamps against it, so a value captured later would miss earlier comments.
+# Every block is a fresh shell, so this variable does NOT survive: read the
+# printed value and paste it literally into Step 7. Re-running `date` there
+# would postdate this run's own comments and report zero duplicates every time.
+date -u +%Y-%m-%dT%H:%M:%SZ
+
 gh project view "$num" --owner "$owner" --format json \
   || { echo "project read failed for $owner/$num — stop and report"; exit 1; }
 gh project field-list "$num" --owner "$owner" --format json --limit 100 \
@@ -93,6 +101,7 @@ gh project field-list "$num" --owner "$owner" --format json --limit 100 \
 
 Capture for this run:
 
+- Run-start timestamp (`run_start`, ISO 8601 UTC) — Step 7 dedupe
 - Project node ID (`PVT_*`)
 - `Status` field ID (`PVTSSF_*`) and option IDs: Backlog, Ready, In progress, In review, Done
 - `Priority` field ID (`PVTSSF_*`) and option IDs: P0, P1, P2
@@ -204,7 +213,13 @@ act of triaging an issue makes it look freshly active on the next run, and the
 item can never age past the 30-day line. The bug is live today: on
 `NVIDIA/aicr#870`, `updatedAt` reads 2026-07-14, which is a maintainer's
 `Triaged:` comment, while the newest real activity is a contributor comment from
-2026-07-02. Compute a clock triage bookkeeping cannot touch:
+2026-07-02.
+
+Commenting on no-change verdicts widens this from a handful of issues to the whole
+board: a routine pass touches every active item, so reading staleness off `updatedAt`
+would report the board as freshly active *because* it was triaged, and the stalled
+signal would go permanently dark one run after this skill is first used. Compute a
+clock triage bookkeeping cannot touch:
 
 ```bash
 repo="<owner/repo>"     # fresh shell — reassign, or both paths below lose the suffix
@@ -275,8 +290,8 @@ comments the loop body never runs and the cost is one `jq` pass. Do not skip it 
 grounds that the current board is small — the skill takes any board as an argument.
 
 The prefix is a reserved marker on this board, not free text: a substantive
-update never opens with `Triaged:`. Matching on author instead would leave
-issue #870 unfixed, since the comment there is a maintainer's.
+update never opens with `Triaged:`. Matching on author instead would leave the
+#870 case unfixed, since the comment there is a maintainer's.
 
 `stallBase` sees only issue creation and non-triage comments, so it ignores
 commits, label changes, and edits — it can report an issue as stalled that saw
@@ -389,13 +404,16 @@ Never promote an umbrella epic to Ready; its children carry the work.
 - Priority → P0 only for active incidents: data loss, broken CI gate, security
   breach. When torn between P0 and P1, use P1
 
-**No change** — correctly placed. Listed in the report, no comment, no edit.
+**No change** — correctly placed. No edit, but it **does** get a confirming
+comment (Step 7): a Projects v2 field edit leaves no trace on the issue, so
+without one an assignee cannot tell "reviewed, placement is right" from "never
+triaged". Silence is the ambiguous outcome, not the quiet one.
 
 **Stalled (information only):** an `In progress` item whose `stallBase` from
 Step 3 is more than 30 days old. Its own table, never a bucket: being stalled
 neither creates nor suppresses a verdict, and does not withdraw an item from
 Step 6 selection. Use `stallBase`, not `updatedAt` — see Step 3 for why the
-latter reports an issue as fresh precisely because the skill triaged it.
+latter is self-defeating once this skill comments on unchanged issues.
 
 ### 5. Present recommendations
 
@@ -415,6 +433,12 @@ escaping convention to every cell, reasoning included.
 Stalled and Manual Review items get their own tables, labelled as not
 actionable.
 
+The **no-change list** is a table too, not a count: issue | current
+Status/Priority | the one-sentence reason each confirming comment will carry.
+It writes no fields but does post publicly, so the reader needs to see the text
+before approving it — and a no-change list rendered as "the remaining 76 are
+fine" is not reviewable.
+
 ### 6. Confirm
 
 Use `AskUserQuestion`: one multi-select question per actionable bucket. It takes
@@ -423,6 +447,13 @@ holding exactly one item cannot be asked as a one-option multi-select — ask it
 a yes/no question instead. Closures are irreversible, so list each closure as its
 own option and let the user accept a subset. Each option repeats the exact write
 as `owner/repo#N — <proposed action>`.
+
+**Ask about the no-change comments as one all-or-nothing question**, separate
+from the field buckets. They are the run's highest-volume output — a routine pass
+leaves most of the board unchanged, so this is typically dozens of comments on a
+shared org board in one burst, and it is the part a maintainer is most likely to
+decline. Per-item options for that batch would be unusable; a single accept/decline
+is the honest unit. State the count in the question.
 
 Where `AskUserQuestion` is unavailable, present each bucket as a numbered list
 and require a reply of accepted numbers, "all", or "none". Do not proceed
@@ -436,8 +467,8 @@ the analysis, and the mutation is opt-in.
 
 Combine every field change the Step 4 rules independently require into one
 confirmed verdict, then run the field stanza below once per changed field — and
-only for those fields. Every applied verdict gets a comment; a Close edits no
-fields and comments before closing.
+only for those fields. **Every triaged issue gets a comment, including no-change
+verdicts**; a Close edits no fields and comments before closing.
 
 **Failure contract.** Any nonzero exit in this step stops the run. Report three
 states, not one:
@@ -472,20 +503,17 @@ gh project item-edit \
   || { echo "$label edit failed for #$n — outcome unknown; stop and report"; exit 1; }
 ```
 
-**Comment on every applied verdict** — board field edits leave no trace in the
-issue timeline. Pipe the body in from a **quoted** heredoc, which blocks
-expansion and command substitution.
+**Comment on every triaged issue** — board field edits leave no trace in the
+issue timeline, so the comment is the only signal an assignee or watcher gets
+that triage happened at all. Pipe the body in from a **quoted** heredoc, which
+blocks expansion and command substitution.
 
-```bash
-n="<issue-number>"; repo="<owner/repo>"
-
-# Field updates — comment after the edits land. <transition> is the arrow form
-# defined below (`Ready→Backlog`, `P1→P2`), NOT the Step 4 verdict name.
-gh issue comment "$n" -R "$repo" --body-file - <<'BODY' \
-  || { echo "comment failed for #$n — outcome unknown, report under Manual review"; exit 1; }
-Triaged: <state>. <one or two sentences of reasoning>
-BODY
-```
+The body format is defined below and the **posting stanza is further down still** —
+one guarded block that assigns its own `n` and `repo`, checks for a comment this run
+already posted, and only then sends. Every `Triaged:` comment goes through it, applied and no-change alike; closures have
+their own guarded stanza further down, which runs the same dedupe. Do not write a `gh issue comment` call here from the
+body format alone: it would run in a fresh shell with nothing assigned and would skip
+the duplicate check.
 
 **Write in one voice.** These comments are read as a series, so a reader scanning an
 issue's history should not be able to tell which of them a skill wrote. **Every rule
@@ -586,6 +614,85 @@ gap to improvise around.
   verdict. A status-only structural demote yields
   `Triaged: Ready→Backlog, Priority stays P2. <reasoning>`.
 
+**No-change verdicts get the confirming form**, which states the placement being
+affirmed rather than a transition:
+
+```text
+Triaged: confirmed at <Priority> / <Status>. <one sentence on why the current placement is correct>.
+```
+
+This is a **body shape, not a runnable block** — it is posted through the single
+dedupe stanza below, which is the only place this skill sends a comment. Do not copy
+it into a `gh issue comment` call of its own: that would be a fresh shell with no `n`
+or `repo` assigned, so both arguments expand empty, and it would bypass the duplicate
+check entirely.
+
+Give a reason that could only come from having looked — the thread, the blocker
+that cleared, the child issue carrying the work. "Placement is correct" restates
+the verdict and tells a reader nothing; it is worse than staying silent, because
+it looks like review without being it.
+
+**Never comment twice on one issue in a run.** Before any comment, check whether
+this run already left one — a resumed or re-run pass would otherwise stack
+duplicates on a shared board:
+
+The check and the comment must live in **one** shell block, with the comment
+inside the zero branch. Split across two blocks — or written as a bare
+`[ "$dupes" = "0" ] || echo skipping` followed by an unguarded `gh issue
+comment` — the guard prints "skipping" and then posts the duplicate anyway.
+
+```bash
+n="<issue-number>"; repo="<owner/repo>"
+# Paste the literal value stamped at Step 1 — not a fresh `date`, which would be
+# later than every comment this run posted and so always report zero duplicates.
+run_start="2026-07-29T17:00:00Z"
+me=$(gh api user --jq .login) \
+  || { echo "cannot resolve running identity — stop and report"; exit 1; }
+
+# Fetch and filter as SEPARATE steps. Piping gh straight into jq discards the API's
+# exit status: without pipefail the pipeline reports jq's, and jq -s on empty stdin
+# yields [] -> length 0 -> dupes="0" with rc 0, so the `||` guard never fires and the
+# duplicate gets posted. Reproduced in both bash and zsh.
+raw=$(gh api "repos/$repo/issues/$n/comments?per_page=100" --paginate) \
+  || { echo "comment fetch failed for #$n — skip the comment and report"; exit 1; }
+# Pipe to real jq, not `gh api --jq`: the latter rejects --arg ("unknown flag"),
+# and --paginate emits one JSON array per page, so -s flattens them ( .[][] ).
+dupes=$(printf '%s' "$raw" \
+  | jq -s --arg me "$me" --arg since "$run_start" \
+      '[ .[][] | select(.user.login == $me)
+               | select(.created_at > $since)
+               | select(.body | test("^\\s*(Triaged|Closing):")) ] | length') \
+  || { echo "dedupe filter failed for #$n — skip the comment and report"; exit 1; }
+
+if [ "$dupes" = "0" ]; then
+  # ONE body per item, chosen by verdict — an applied verdict uses the derived
+  # <state> clause, a no-change verdict uses the confirming form. This is the only
+  # place a `Triaged:` comment is sent; `Closing:` comments have their own guarded
+  # stanza below, which runs the same dedupe.
+  gh issue comment "$n" -R "$repo" --body-file - <<'BODY' \
+    || { echo "comment failed for #$n — report under Manual review"; exit 1; }
+Triaged: <state, or "confirmed at <Priority> / <Status>" for a no-change verdict>. <one or two sentences of reasoning>
+BODY
+else
+  echo "#$n already has a triage comment from this run — skipping; report commented: yes"
+fi
+```
+
+This stanza is the skill's **only** comment call, and it assigns `n` and `repo` at the
+top of its own block because every block is a fresh shell. Applied verdicts and
+no-change verdicts differ only in the body they substitute — routing the no-change
+case through a separate block would give it neither the assignments nor the duplicate
+check, so it would post with empty arguments or post twice.
+
+A dedupe hit reports **`commented: yes`**, not `no`. The check only fires when *this
+run* already posted the comment, so the issue has it — the audit record must say so.
+Reporting `no` there would be a false record on a resumed pass and would invite a
+human to post the duplicate by hand.
+
+The window is this run only. An older `Triaged:` comment is history, not a
+duplicate — a placement re-confirmed three months later is worth recording again,
+and suppressing on it would silence every repeat triage of a long-lived issue.
+
 For closures, the first line starts with `Closing:` instead, followed by what
 changed, where the work lives now, and how to reopen.
 
@@ -597,6 +704,8 @@ n="<issue-number>"
 repo="<owner/repo>"
 close_reason="<duplicate | not planned>"
 original="<surviving issue number, or full URL if in another repo>"
+# Fresh shell: the dedupe below needs the Step 1 timestamp, pasted literally.
+run_start="2026-07-29T17:00:00Z"
 
 # Runs BEFORE the comment: failing after it would leave a public "Closing:" on
 # an issue that stays open.
@@ -609,12 +718,29 @@ if [ "$close_reason" = "duplicate" ]; then
     || { echo "duplicate close for #$n has no surviving issue — stop and report"; exit 1; }
 fi
 
+# Same-run dedupe, as on the triage stanza: if the close failed after its comment
+# landed, a resumed run would otherwise post the closure comment a second time.
+me=$(gh api user --jq .login) \
+  || { echo "cannot resolve running identity — stop and report"; exit 1; }
+raw=$(gh api "repos/$repo/issues/$n/comments?per_page=100" --paginate) \
+  || { echo "comment fetch failed for #$n — stop and report"; exit 1; }
+posted=$(printf '%s' "$raw" \
+  | jq -s --arg me "$me" --arg since "$run_start" \
+      '[ .[][] | select(.user.login == $me)
+               | select(.created_at > $since)
+               | select(.body | test("^\\s*Closing:")) ] | length') \
+  || { echo "dedupe filter failed for #$n — stop and report"; exit 1; }
+
+if [ "$posted" = "0" ]; then
 gh issue comment "$n" -R "$repo" --body-file - <<'BODY' \
   || { echo "closure comment failed for #$n — issue NOT closed; stop and report"; exit 1; }
 Closing: <reason>.
 
 <what changed, where the work lives now, how to reopen>
 BODY
+else
+  echo "#$n already has a Closing: comment from this run — not re-posting"
+fi
 
 if [ "$close_reason" = "duplicate" ]; then
   gh issue close "$n" -R "$repo" --reason duplicate --duplicate-of "$original"
@@ -655,7 +781,9 @@ failure contract already separates.** A nonzero exit from `gh issue comment` mea
 **outcome unknown**, never "not posted": GitHub can accept the request and the
 response be lost to a timeout. Recording that as `no` invites a second run to post a
 duplicate on an issue that already has the comment, so every failure is `unknown`,
-resolved by reading the issue rather than re-posting.
+resolved by reading the issue rather than re-posting. The Step 7 dedupe only covers a
+re-run *within* one run, so an `unknown` carried across runs is exactly the case it
+cannot catch.
 
 `no` means the command is known not to have run. It is reached whenever an edit lands
 but Step 7 exits before the comment stanza — which is **not** limited to multi-field
@@ -677,3 +805,23 @@ The **field** is the opposite: report it `unknown`, not failed. A nonzero `item-
 carries the same post-acceptance-timeout ambiguity as any other write in Step 7, so the
 second field may well have landed. Name it as unverified rather than as not applied, and
 let Step 8's re-read of the board settle it.
+
+Two further paths reach `no` on this branch. A **no-change batch the user declined at
+Step 6** is reported rather than silently dropped. And the **dedupe preflight can fail
+after the field edits** — the identity lookup, the comment fetch, or the filter — which
+aborts before `gh issue comment` runs at all. Nothing was sent in either case, so both
+are `no`, not `unknown`. For a declined or un-started no-change batch the per-issue
+state is *not attempted*, which the three counts below already carry.
+
+**A Step 7 dedupe hit is `yes`, not `no`.** The check fires only because this run
+already posted the comment, so the issue has it and the audit record must say so.
+Calling that `no` writes a false record and invites a human to post the duplicate the
+check just prevented.
+
+**Report the no-change comments as three counts, not one** — approved-and-posted,
+`unknown`, and not-attempted. Step 7 stops the run on the first nonzero exit, so a
+batch of ten can end as three posted, one unknown, and six never attempted; a single
+"posted" number would report that as partial success with no trace of the other seven.
+Put every `unknown` in Manual review by issue number. Keep it to those counts plus the
+unknown list rather than a row per issue: they carry no field change, and a
+several-dozen-row table would bury the ten rows that do.
