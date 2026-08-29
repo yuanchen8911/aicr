@@ -2384,7 +2384,7 @@ webhooks operational, and custom resources reconciled.
 2. **Custom Resource Definitions** — 6 Dynamo CRDs registered (DynamoGraphDeployment, DynamoComponentDeployment, etc.)
 3. **Webhooks Operational** — Validating webhook configured and active
 4. **Custom Resource Reconciled** — `DynamoGraphDeployment/vllm-agg` reconciled into running workload pods via PodCliques
-5. **Supporting Services** — NATS running for Dynamo's Kubernetes event plane
+5. **Supporting Services** — ZMQ-based KV-cache event plane (no NATS; Dynamo 1.4+ default)
 6. **Result: PASS**
 
 ---

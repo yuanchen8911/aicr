@@ -102,7 +102,7 @@ SERVE_NAMESPACE="${SERVE_NAMESPACE:-dynamo-workload}"
 SERVE_NAME="${SERVE_NAME:-vllm-agg}"
 SERVE_QUEUE="${SERVE_QUEUE:-dynamo}"
 SERVE_MODEL="${SERVE_MODEL:-Qwen/Qwen3-0.6B}"
-SERVE_RUNTIME_IMAGE="${SERVE_RUNTIME_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1}"
+SERVE_RUNTIME_IMAGE="${SERVE_RUNTIME_IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1}"
 # GPU worker placement. The demo pins nodeGroup=gpu-worker; both UAT clusters
 # label their GPU pool the same way (tests/uat/*/cluster-config.yaml), so the
 # default lands the decode worker on the GPU node on either cloud.
