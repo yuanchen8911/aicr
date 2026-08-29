@@ -38,6 +38,13 @@ type EvalResult struct {
 // Used by the recipe package to filter overlays based on constraint
 // evaluation during snapshot-based recipe generation.
 func Evaluate(constraint recipe.Constraint, snap *snapshotter.Snapshot) EvalResult {
+	// The node-set form dispatches by exact name before the scalar path: its
+	// value grammar (key=value / !key) is not the operator grammar, and its
+	// name is a virtual path no snapshot producer emits directly.
+	if constraint.Name == GPUNodesLabelConstraintName {
+		return evaluateGPUNodesLabel(constraint.Value, snap)
+	}
+
 	result := EvalResult{}
 
 	path, err := ParseConstraintPath(constraint.Name)
@@ -46,14 +53,30 @@ func Evaluate(constraint recipe.Constraint, snap *snapshotter.Snapshot) EvalResu
 		return result
 	}
 
-	actual, err := path.ExtractValue(snap)
+	// Path.Extract takes the measurement slice, so the nil-snapshot guard that
+	// used to live inside ExtractValue has to be re-acquired here — otherwise
+	// snap.Measurements panics (issue #1783).
+	//
+	// Its placement is load-bearing: it MUST stay below the node-set dispatch
+	// above. evaluateGPUNodesLabel handles a nil snapshot itself, via
+	// findLabelSubtype, and reports ErrCodeNotFound; the scalar path reports
+	// ErrCodeInvalidRequest. evaluateOverlayConstraints branches on exactly
+	// that distinction — NotFound is graceful exclusion, anything else fails
+	// resolution closed — so hoisting one guard to the top of Evaluate would
+	// silently turn an excluded overlay into a failed resolve.
+	if snap == nil {
+		result.Error = errors.New(errors.ErrCodeInvalidRequest, "snapshot is nil")
+		return result
+	}
+
+	actual, err := path.Extract(snap.Measurements)
 	if err != nil {
 		result.Error = errors.Wrap(errors.ErrCodeNotFound, "value not found in snapshot", err)
 		return result
 	}
 	result.Actual = actual
 
-	parsed, err := ParseConstraintExpression(constraint.Value)
+	parsed, err := ParseCompoundConstraint(constraint.Value)
 	if err != nil {
 		result.Error = errors.Wrap(errors.ErrCodeInvalidRequest, "invalid constraint expression", err)
 		return result

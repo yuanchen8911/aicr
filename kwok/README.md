@@ -52,15 +52,76 @@ flowchart LR
 | Scripts | `kwok/scripts/` | Create nodes, validate scheduling |
 | CI Workflow | `.github/workflows/kwok-recipes.yaml` | Auto-discover and test recipes |
 
-## Profile Mapping
+## Profile Selection
 
-`apply-nodes.sh` reads recipe criteria and selects matching profiles:
+Selection happens in two steps: normalize the recipe criteria, then match
+profiles against the normalized values.
 
-| Service | Accelerator | GPU Profile |
-|---------|-------------|-------------|
-| eks | h100 (default) | `eks/p5-h100.yaml` |
-| eks | gb200 | `eks/p6-gb200.yaml` |
-| other | any | `eks/p5-h100.yaml` (fallback) |
+**1. Criteria normalization.** `resolve_recipe_criteria` in
+`kwok/scripts/lib/profile-select.sh` reads
+`spec.criteria.{service,accelerator}` from the overlay and applies:
+
+| Input value | Normalized to |
+|-------------|---------------|
+| missing / `null` — `service` | `eks` |
+| `any` — `service` | `eks` |
+| missing / `null` — `accelerator` | `h100` |
+| `any` — `accelerator` | `h100` |
+| any other value | passed through verbatim |
+
+Both `apply-nodes.sh` (direct path) and `run-all-recipes.sh` (batch path)
+call this same resolver, so the two entry points cannot drift on how
+placeholder values collapse.
+
+**2. Profile matching.** The normalized `(service, accelerator)` pair is
+then looked up under `kwok/profiles/<service>/` by matching each
+candidate's `metadata.labels`:
+
+| Role | Match rule |
+|------|------------|
+| system | `provider == <service>` and `nodeType == system` |
+| gpu | `provider == <service>` and `nodeType == accelerated` and `accelerator == <accelerator>` |
+
+Exactly one match per role is required. There is no silent fallback to
+another provider (see #1997). The selector distinguishes two failure
+classes so batch mode can be forgiving about coverage without hiding
+tree faults:
+
+- **No match** (zero matching profiles for `(service, accelerator)`) —
+  the recipe is out of scope for what is currently on disk. This
+  covers both an unknown service (its `kwok/profiles/<service>/`
+  directory doesn't exist) and an unknown accelerator (the directory
+  exists but has no `accelerated` profile carrying that label).
+  Selector returns `PROFILE_SELECT_RC_NO_MATCH` (2); how the caller
+  treats it depends on the entry point (see below).
+- **Ambiguous or invalid** (multiple matching profiles, malformed
+  profile YAML, or a profile whose `metadata.labels.provider` label
+  disagrees with its parent directory) — always a hard error (rc=1),
+  never skippable. All three are real tree faults the caller must
+  surface; a mislabeled file that happens to be the sole profile for
+  its role would otherwise silently degrade to a no-match and zero
+  coverage without warning.
+
+Selection is implemented in `kwok/scripts/lib/profile-select.sh` and
+unit-tested by the sibling `profile-select_test.sh` (wired into the
+`kwok-recipes.yaml` discover job).
+
+**Entry-point behavior on `no match`.** The three entry points treat
+rc=2 differently — a recipe you can't test isn't the same as a recipe
+that failed, but explicit user asks must never silently do nothing:
+
+| Entry point | Behavior on `no match` (rc=2) | Behavior on `ambiguous/invalid` (rc=1) |
+|-------------|-------------------------------|----------------------------------------|
+| Direct: `apply-nodes.sh <recipe>` / `make kwok-e2e RECIPE=...` | **Fail closed** with the full diagnostic — user named a specific recipe. | Fail closed. |
+| Implicit batch: `run-all-recipes.sh` / `make kwok-test-all` | **SKIP with WARN** so backfilling profiles doesn't turn every batch red. | Fail closed (batch cannot mask a broken tree). |
+| CI matrix: `.github/workflows/kwok-recipes.yaml` | **DROP at classify** (`::notice`), never dispatched — the tier-2/3 cell would otherwise report green without validating anything. `workflow_dispatch` of a specific recipe **fails closed** (explicit ask). | Fail closed at classify. |
+
+Currently on disk:
+
+| Service | Accelerator | System profile | GPU profile |
+|---------|-------------|----------------|-------------|
+| eks | h100 | `eks/system-m7i.yaml` | `eks/p5-h100.yaml` |
+| eks | gb200 | `eks/system-m7i.yaml` | `eks/p6-gb200.yaml` |
 
 **Cluster defaults:** 2 system nodes, 4 GPU nodes (32 GPUs), Kubernetes v1.33.5, region `us-east-1`.
 
@@ -128,13 +189,38 @@ Test it: `unset GITLAB_TOKEN && make build && make kwok-e2e RECIPE=your-recipe-n
 
 ## Adding Node Profiles or Cloud Providers
 
-Copy an existing profile and modify, then update the mapping in `kwok/scripts/apply-nodes.sh` (`get_profiles()` around line 52):
+Profiles are discovered by label — no script edit is needed. Copy an
+existing profile, update `metadata.labels.{provider,nodeType,accelerator}`
+and `spec.*`, and drop it under `kwok/profiles/<provider>/`:
 
 ```bash
 cp kwok/profiles/eks/p5-h100.yaml kwok/profiles/eks/p5-a100.yaml
+# then edit metadata.labels.accelerator and spec.gpu.* to match the new instance type
 ```
 
-For new cloud providers, copy the `kwok/profiles/eks/` directory structure and update `apply-nodes.sh`.
+For a new cloud provider, create the `kwok/profiles/<provider>/` directory
+and add:
+
+- **exactly one** system profile with `metadata.labels.{provider: <provider>, nodeType: system}`, and
+- **exactly one** accelerated profile *per supported accelerator* with `metadata.labels.{provider: <provider>, nodeType: accelerated, accelerator: <accelerator>}`.
+
+`select_profiles` requires a unique match in each role and returns a
+fatal error (not a skip) on any tree-integrity fault, so all of the
+following break both direct invocations and batch CI:
+
+- a duplicate `nodeType: system` under the same provider,
+- two profiles carrying the same accelerator label,
+- a profile whose `provider` label disagrees with its parent directory
+  (e.g. an `eks`-labeled file dropped under `kwok/profiles/gke/`),
+- an accelerated profile missing its `accelerator` label,
+- a profile whose `nodeType` label is neither `system` nor
+  `accelerated` (typos such as `sytem`).
+
+All of these are treated fatally rather than silently skipped — if the
+mislabeled file is the sole profile for its role, silent skipping
+would zero coverage without a warning (the same coverage-lie #1997
+targets, via a different field). `apply-nodes.sh` picks up the new
+profiles on the next run.
 
 ## CI Integration
 

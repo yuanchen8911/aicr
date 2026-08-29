@@ -148,11 +148,11 @@ descendants — pick the narrowest root that covers the diff.
 
 ```bash
 # 1. Profile the working tree (changes must be committed first).
-GOFLAGS="-mod=vendor" go test -coverprofile=cover.out ./pkg/recipe/...
+go test -coverprofile=cover.out ./pkg/recipe/...
 
 # 2. Profile origin/main from a clean worktree, outside the source tree.
 git worktree add $TMPDIR/baseline origin/main \
-  && (cd $TMPDIR/baseline && GOFLAGS="-mod=vendor" go test \
+  && (cd $TMPDIR/baseline && go test \
         -coverprofile=$TMPDIR/base.out ./pkg/recipe/...); \
   rc=$?; git worktree remove --force $TMPDIR/baseline; \
   (exit $rc)
@@ -479,10 +479,14 @@ half of the pipeline and skips deploy-side assertions.
 `make qualify` is the canonical pre-push command. It runs:
 
 - `test-coverage` — `go test -race ./...` plus the 80% coverage floor.
-- `lint` — golangci-lint with `.golangci.yaml` plus yamllint.
+- `lint` — golangci-lint with `.golangci.yaml`, yamllint, and the docs checks
+  (filenames, MDX patterns, MDX parse — see [Docs MDX Gate](#docs-mdx-gate)).
 - `e2e` — the end-to-end pipeline runner.
 - `scan` — Grype vulnerability scan.
 - `license-check` — license header / dependency-license sweep.
+- `api-diff` — exported `pkg/client/v1` compatibility, including the scoped
+  repository-local type closure reachable through transparent aliases, against
+  the latest stable release.
 
 CI runs the equivalent. If `make qualify` passes locally on the
 current branch, push CI will pass.
@@ -498,6 +502,66 @@ golangci-lint run -c .golangci.yaml ./...           # full sweep
 This applies even to PRs labeled `documentation` when they include
 incidental Go changes. Do not rely on CI to surface lint failures —
 the pre-push gate is local.
+
+## Docs MDX Gate
+
+Fern renders published docs through an MDX parser, so a construct that is valid
+CommonMark can still abort `fern generate --docs` at publish time. A bare `<=`
+in prose is the classic case — MDX reads the `<` as the start of a JSX tag and
+fails with `Unexpected character = (U+003D) before name`.
+
+**Which files are checked.** Both checks derive their file list from
+`docs/index.yml` via `tools/docs-published-files` — Fern's navigation manifest
+is the authoritative statement of what gets parsed. Globbing
+`docs/user`/`docs/integrator`/`docs/contributor` instead was a denylist in
+disguise: it missed `docs/README.md`, the published landing page, so a hazard
+there passed both gates and still broke the publish. Add a page to
+`docs/index.yml` and it is gated that day; a file that is not published is not
+gated at all.
+
+Two checks cover this, both run by `make lint`:
+
+| Check | What it is | Speed |
+|-------|-----------|-------|
+| `make check-docs-mdx` | Pattern-based bash approximation. Names the specific hazard, needs no dependencies. | Instant |
+| `make check-docs-mdx-parse` | The real MDX parser (`@mdx-js/mdx`, locked in `tools/mdx/package-lock.json`). Authoritative. | ~2 s + one `npm ci` |
+
+The parser is the source of truth. The bash rules are deliberately kept as a
+strict **subset** of what it rejects: a miss is caught by the parse gate, but a
+false positive would force you to mangle prose the publish step would have
+accepted. That is why `< 500` and `< 10 s` are fine (MDX only enters tag mode
+when a name-ish character follows `<` immediately) while `<= 2,000` and `<30 s`
+are not.
+
+Hazards only the parser sees: a stray closing tag (`</div>`), an unclosed
+fragment (`<>`), a placeholder sharing a line with well-formed JSX, unbalanced
+expression braces spanning lines, and any acorn-level syntax error.
+
+Well-formed JSX is fine in both — `<Component />` and `<span>text</span>` parse,
+and the Fern component set is authored that way. So is YAML frontmatter: Fern
+strips it before MDX, so a `title: gate <= 2,000` is valid, and both checks skip
+it by line number so later diagnostics still cite the true line.
+
+`check-docs-mdx-parse` needs Node 20+. Without it the script prints a warning
+and exits 0 locally, but **hard-fails under CI** — the `docs-mdx` job in
+`merge-gate.yaml` blocks on it, and the merge gate is the only required status
+check. This is the one place where a green local `make qualify` does not
+guarantee a green CI: if you have no Node, the MDX gate did not actually run.
+
+Fixing a violation is usually one of:
+
+```markdown
+gate <= 2,000   →  gate `<= 2,000`
+<30 s           →  `<30 s`        or  &lt;30 s
+<br>            →  <br />
+{template}      →  \{template\}
+```
+
+Note that `fern check` (the Fern Docs CI job) does **not** parse MDX, and the
+job that does — `fern generate --docs --preview` — runs as a `workflow_run`
+companion whose status never lands on the PR head SHA, so it cannot be a
+required check. `make check-docs-mdx-parse` exists to close that gap without a
+token or a dependency on Fern's service at merge time.
 
 ## Common Gotchas
 
@@ -517,15 +581,27 @@ the pre-push gate is local.
   re-render comparison) is its **opt-in** blocking check, and the weekly
   BOM-refresh workflow auto-detects it and opens a PR. So run
   `make bom-docs` locally any time the change touches charts.
-- **Forgetting `make notices`** after a `go.mod`, `go.sum`, or `vendor/`
-  change. `THIRD_PARTY_NOTICES.md` is the union of every vendored
+- **Forgetting `make notices`** after a `go.mod` or `go.sum` change.
+  `THIRD_PARTY_NOTICES.md` is the union of every redistributed
   dependency's license across the released OS/arch matrix
   (linux+darwin × amd64+arm64), so a dependency-graph change can add or
-  drop entries. `make tidy` regenerates the file as its last step (right
-  after `go mod vendor`), so the normal dependency-update flow keeps it
-  fresh with nothing to remember — but if you edit `go.mod`/vendor by
-  hand, run `make notices` yourself. The `notices-freshness` merge-gate
-  job regenerates the file and fails CI if the committed copy is stale.
+  drop entries. `make tidy` regenerates the file as its last step, so the
+  normal dependency-update flow keeps it fresh with nothing to remember —
+  but if you edit `go.mod` by hand, run `make notices` yourself. The
+  `notices-freshness` merge-gate job regenerates the file and fails CI if
+  the committed copy is stale.
+- **Forgetting `make python-licenses`** after editing
+  `validators/performance/requirements.txt`. The notices file also covers
+  the Python closure installed into the `aiperf-bench` image, but that
+  closure is fetched from PyPI at image-build time and is not part of the
+  Go dependency graph, so `make notices` cannot regenerate it.
+  `make python-licenses`
+  (needs network) refreshes the committed fragment at
+  `validators/performance/licenses/python-notices.md`; `make notices`
+  then folds it in. The fragment records the sha256 of the requirements
+  file it came from, and `make notices` fails closed when that no longer
+  matches, so any edit without a refresh is caught by the same
+  `notices-freshness` job rather than shipping stale attributions.
   The generator sets a fixed platform matrix and `LC_ALL=C`, so
   `make notices` produces byte-identical output on macOS and Linux.
 - **Coverage decrease > 0.5%** is flagged for justification (the project-wide

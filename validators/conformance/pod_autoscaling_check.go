@@ -72,12 +72,28 @@ func CheckPodAutoscaling(ctx *validators.Context) error {
 		return errors.New(errors.ErrCodeInvalidRequest, "kubernetes client is not available")
 	}
 
-	// 0. Check if DCGM exporter is running (needed for GPU-aware HPA).
+	// 0. Applicability gate (#2122). prometheus-adapter is the discriminating
+	// component for GPU-aware HPA — the monitoring-hpa overlay injects it, and
+	// without it there is no custom/external GPU metrics API for the HPA to read.
+	// The DCGM exporter is the live prerequisite. Crucially, a LIST ERROR
+	// (Forbidden/timeout/transport) must fail closed — it is NOT evidence that
+	// GPU metrics are unavailable — so it is passed as probeErr rather than being
+	// conflated with the empty-result case. An empty result (no error, zero
+	// dcgm-exporter pods) skips only when the recipe does not declare
+	// prometheus-adapter; when it does, the missing exporter is a real failure.
 	dcgmPods, dcgmErr := ctx.Clientset.CoreV1().Pods("").List(ctx.Ctx, metav1.ListOptions{
 		LabelSelector: "app=nvidia-dcgm-exporter",
 	})
-	if dcgmErr != nil || len(dcgmPods.Items) == 0 {
-		return validators.Skip("DCGM exporter not found — GPU metrics not available for HPA")
+	present := dcgmErr == nil && len(dcgmPods.Items) > 0
+	if err := (validators.Capability{
+		Component: "prometheus-adapter",
+		Subject:   "nvidia-dcgm-exporter pods (app=nvidia-dcgm-exporter)",
+		AbsentMsg: "recipe declares prometheus-adapter (GPU HPA) but no nvidia-dcgm-exporter pods are running — " +
+			"apply the bundle or check RBAC; GPU metrics cannot reach the HPA without them",
+		InapplicableMsg: "DCGM exporter not found and prometheus-adapter not declared in recipe — " +
+			"GPU metrics not available for HPA",
+	}).Require(ctx, dcgmErr, present); err != nil {
+		return err
 	}
 
 	// 1. Custom metrics API available
@@ -250,13 +266,25 @@ pollLoop:
 		fmt.Sprintf("Created namespace=%s deployment=%s hpa=%s via Kubernetes API",
 			hpaReport.Namespace, hpaReport.DeploymentName, hpaReport.HPAName))
 	recordRawTextArtifact(ctx, "HPA Behavioral Test",
-		"kubectl get hpa -n hpa-test && kubectl get deploy -n hpa-test",
+		fmt.Sprintf("kubectl get hpa -n %s && kubectl get deploy -n %s",
+			hpaReport.Namespace, hpaReport.Namespace),
 		fmt.Sprintf("Namespace:            %s\nHPA:                  %s\nScale-up desired:     %d\nScale-up current:     %d\nDeployment scale-up:  %d\nDeployment scale-down:%d",
 			hpaReport.Namespace, hpaReport.HPAName, hpaReport.ScaleUpDesiredReplicas,
 			hpaReport.ScaleUpCurrentReplicas, hpaReport.ScaleUpDeploymentReplica, hpaReport.ScaleDownReplica))
+	// The namespace is randomized per run, so the replay command must name the
+	// actual namespace. validateHPABehavior's deferred cleanup has already run
+	// by the time this executes, but a returning Delete call only means the
+	// request was accepted — the namespace terminates asynchronously. The
+	// artifact therefore records that deletion was requested, never that it
+	// completed; a rejected request is reported by the warning cleanup logs.
 	recordRawTextArtifact(ctx, "Delete test namespace",
-		"kubectl delete namespace hpa-test --ignore-not-found",
-		fmt.Sprintf("Deleted namespace %s after HPA behavioral test.", hpaReport.Namespace))
+		fmt.Sprintf("kubectl delete namespace %s --ignore-not-found", hpaReport.Namespace),
+		fmt.Sprintf("Deletion of namespace %s was requested after the HPA behavioral test; "+
+			"the namespace terminates asynchronously and this artifact does not confirm it. "+
+			"If the request failed, the check logs a warning naming the namespace. "+
+			"Find leftovers from earlier runs with: "+
+			"kubectl get namespaces -o name | grep %s",
+			hpaReport.Namespace, hpaTestPrefix))
 	return nil
 }
 
@@ -319,8 +347,14 @@ func validateHPABehavior(ctx context.Context, clientset kubernetes.Interface) (*
 		slog.Debug("cleaning up HPA test namespace", "namespace", nsName)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), defaults.K8sCleanupTimeout)
 		defer cleanupCancel()
-		_ = k8s.IgnoreNotFound(clientset.CoreV1().Namespaces().Delete(
-			cleanupCtx, nsName, metav1.DeleteOptions{}))
+		// Surface a failed delete: silently discarding it leaves the namespace
+		// (and anything still running in it) behind with no operator-visible
+		// signal, while the recorded artifact describes a cleanup that ran.
+		if err := k8s.IgnoreNotFound(clientset.CoreV1().Namespaces().Delete(
+			cleanupCtx, nsName, metav1.DeleteOptions{})); err != nil {
+			slog.Warn("failed to delete HPA test namespace; delete it manually",
+				"namespace", nsName, "error", err)
+		}
 	}()
 
 	// Create test Deployment (simple sleep pod, 1 replica, no GPU).

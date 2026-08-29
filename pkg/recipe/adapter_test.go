@@ -738,7 +738,9 @@ func buildProviderWithValues(t *testing.T, valuesPath string, values map[string]
 		t.Fatalf("marshal values: %v", err)
 	}
 
-	registryYAML := []byte(`components: []
+	registryYAML := []byte(`apiVersion: aicr.run/v1alpha2
+kind: ComponentRegistry
+components: []
 `)
 	baseYAML := []byte(`kind: RecipeMetadata
 apiVersion: aicr.run/v1alpha2
@@ -871,5 +873,161 @@ func TestGetManifestContentWithProvider_NotFound(t *testing.T) {
 	}
 	if !stderrors.Is(err, fs.ErrNotExist) {
 		t.Errorf("expected wrap chain to preserve fs.ErrNotExist, got %v", err)
+	}
+}
+
+// TestWithResolvedValues covers the read-once view that lets one operation
+// pin a component's effective values so a gate and the emitted artifact
+// cannot observe different results from a mutable DataProvider (#1873 A).
+func TestWithResolvedValues(t *testing.T) {
+	t.Parallel()
+
+	newResult := func() *RecipeResult {
+		return &RecipeResult{
+			Kind:       "RecipeResult",
+			APIVersion: RecipeResultAPIVersion,
+			ComponentRefs: []ComponentRef{
+				{Name: "pinned", Type: ComponentTypeHelm, Overrides: map[string]any{"from": "provider"}},
+				{Name: "unpinned", Type: ComponentTypeHelm, Overrides: map[string]any{"from": "provider"}},
+			},
+		}
+	}
+
+	t.Run("nil receiver returns nil", func(t *testing.T) {
+		t.Parallel()
+		var r *RecipeResult
+		if got := r.WithResolvedValues(map[string]map[string]any{"x": {}}); got != nil {
+			t.Errorf("WithResolvedValues() on nil receiver = %v, want nil", got)
+		}
+	})
+
+	t.Run("empty snapshot returns receiver unchanged", func(t *testing.T) {
+		t.Parallel()
+		r := newResult()
+		if got := r.WithResolvedValues(nil); got != r {
+			t.Error("WithResolvedValues(nil) returned a copy, want the receiver unchanged")
+		}
+	})
+
+	t.Run("pinned component bypasses the provider, unpinned does not", func(t *testing.T) {
+		t.Parallel()
+		r := newResult()
+		pinned := r.WithResolvedValues(map[string]map[string]any{
+			"pinned": {"from": "snapshot", "nested": map[string]any{"k": "v"}},
+		})
+
+		got, err := pinned.GetValuesForComponentWithContext(context.Background(), "pinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext(pinned): %v", err)
+		}
+		if got["from"] != "snapshot" {
+			t.Errorf("pinned component values = %v, want the snapshot value", got)
+		}
+
+		got, err = pinned.GetValuesForComponentWithContext(context.Background(), "unpinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext(unpinned): %v", err)
+		}
+		if got["from"] != "provider" {
+			t.Errorf("unpinned component values = %v, want the provider-resolved value", got)
+		}
+
+		// The receiver is untouched: WithResolvedValues returns a view.
+		got, err = r.GetValuesForComponentWithContext(context.Background(), "pinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext(receiver): %v", err)
+		}
+		if got["from"] != "provider" {
+			t.Errorf("receiver values = %v, want the provider-resolved value", got)
+		}
+	})
+
+	t.Run("callers receive deep copies", func(t *testing.T) {
+		t.Parallel()
+		snapshot := map[string]map[string]any{
+			"pinned": {"nested": map[string]any{"k": "original"}, "list": []any{"a"}},
+		}
+		pinned := newResult().WithResolvedValues(snapshot)
+
+		first, err := pinned.GetValuesForComponentWithContext(context.Background(), "pinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext: %v", err)
+		}
+		// Mutate exactly as the coherence gate does when it layers --set
+		// overrides onto the values it resolved.
+		first["nested"].(map[string]any)["k"] = "mutated"
+		first["list"].([]any)[0] = "mutated"
+
+		second, err := pinned.GetValuesForComponentWithContext(context.Background(), "pinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext (second): %v", err)
+		}
+		if got := second["nested"].(map[string]any)["k"]; got != "original" {
+			t.Errorf("nested map leaked a caller mutation: got %v, want %q", got, "original")
+		}
+		if got := second["list"].([]any)[0]; got != "a" {
+			t.Errorf("slice leaked a caller mutation: got %v, want %q", got, "a")
+		}
+	})
+
+	t.Run("canceled context is honored", func(t *testing.T) {
+		t.Parallel()
+		pinned := newResult().WithResolvedValues(map[string]map[string]any{"pinned": {"from": "snapshot"}})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := pinned.GetValuesForComponentWithContext(ctx, "pinned"); err == nil {
+			t.Error("GetValuesForComponentWithContext(canceled) = nil error, want cancellation")
+		}
+	})
+
+	t.Run("DeepCopy drops the pin", func(t *testing.T) {
+		t.Parallel()
+		pinned := newResult().WithResolvedValues(map[string]map[string]any{"pinned": {"from": "snapshot"}})
+		got, err := pinned.DeepCopy().GetValuesForComponentWithContext(context.Background(), "pinned")
+		if err != nil {
+			t.Fatalf("GetValuesForComponentWithContext on DeepCopy: %v", err)
+		}
+		if got["from"] != "provider" {
+			t.Errorf("DeepCopy values = %v, want the provider-resolved value (the pin scopes one operation)", got)
+		}
+	})
+}
+
+// TestWithDeclaredComponents pins the explicit-presence contract: the
+// attachment bit is HasDeclaredComponents, never a slice-length
+// inference — a union that happens to have the same length as the
+// filtered refs is still an attached union.
+func TestWithDeclaredComponents(t *testing.T) {
+	t.Parallel()
+
+	base := &RecipeResult{ComponentRefs: []ComponentRef{{Name: "a"}}}
+	if base.HasDeclaredComponents() {
+		t.Error("HasDeclaredComponents() = true on a result without an attached union")
+	}
+	if got := base.DeclaredComponentRefs(); len(got) != 1 || got[0].Name != "a" {
+		t.Errorf("DeclaredComponentRefs() fallback = %v, want ComponentRefs", got)
+	}
+
+	union := []ComponentRef{{Name: "b"}} // same length as ComponentRefs — the inference trap
+	view := base.WithDeclaredComponents(union)
+	if !view.HasDeclaredComponents() {
+		t.Error("HasDeclaredComponents() = false after WithDeclaredComponents")
+	}
+	if got := view.DeclaredComponentRefs(); len(got) != 1 || got[0].Name != "b" {
+		t.Errorf("DeclaredComponentRefs() = %v, want the attached union", got)
+	}
+	if base.HasDeclaredComponents() {
+		t.Error("WithDeclaredComponents mutated the receiver")
+	}
+
+	var nilResult *RecipeResult
+	if nilResult.HasDeclaredComponents() {
+		t.Error("HasDeclaredComponents() on nil = true")
+	}
+	if nilResult.WithDeclaredComponents(union) != nil {
+		t.Error("WithDeclaredComponents on nil receiver must return nil")
+	}
+	if base.WithDeclaredComponents(nil) != base {
+		t.Error("WithDeclaredComponents(nil) must return the receiver unchanged")
 	}
 }

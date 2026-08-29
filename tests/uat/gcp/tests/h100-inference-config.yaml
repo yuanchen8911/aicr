@@ -66,6 +66,9 @@ spec:
       target: ./bundle
     deployment:
       deployer: helmfile
+      # No NVSentinel override: the gke-default gpuStack profile assigns
+      # labeler.assumeDriverInstalled itself (#2181), so this lane
+      # exercises the recipe supplying the remedy unaided.
     scheduling:
       acceleratedNodeSelector:
         nodeGroup: gpu-worker

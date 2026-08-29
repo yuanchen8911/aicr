@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	ociv1 "github.com/opencontainers/image-spec/specs-go/v1"
@@ -43,6 +44,11 @@ import (
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	apperrors "github.com/NVIDIA/aicr/pkg/errors"
 )
+
+// pushServerTimeout bounds the push exercised against the local httptest
+// registry — a loopback round trip is sub-millisecond, so approaching this
+// bound means the handshake wedged rather than that the test is slow.
+const pushServerTimeout = 5 * time.Second
 
 var checkpointCHelmFiles = []string{
 	"Chart.yaml",
@@ -568,7 +574,18 @@ func TestPackageAndPushHelmChartPathSwapStopsBeforeRegistryIO(t *testing.T) {
 	}
 }
 
-func TestHelmV4_2_3ExplicitVersionPull(t *testing.T) {
+// minimumHelmMajorVersion guards the Helm CLI contract this test exercises:
+// showing and pulling an OCI chart whose Chart.yaml version carries SemVer
+// build metadata, encoded in the Distribution tag as an underscore. The exact
+// patch pin lives in .settings.yaml (single source of truth), so routine
+// dependency bumps need no test edit; a major-version change must re-validate
+// that contract before this floor moves.
+const minimumHelmMajorVersion = 4
+
+// helmPinFromSettings returns the exact testing_tools.helm pin from
+// .settings.yaml, failing closed on an absent, unparsable, or too-old value.
+func helmPinFromSettings(t *testing.T) string {
+	t.Helper()
 	settingsRaw, settingsReadErr := os.ReadFile(filepath.Join("..", "..", ".settings.yaml"))
 	if settingsReadErr != nil {
 		t.Fatalf("read .settings.yaml: %v", settingsReadErr)
@@ -582,9 +599,22 @@ func TestHelmV4_2_3ExplicitVersionPull(t *testing.T) {
 		t.Fatalf("parse .settings.yaml: %v", settingsParseErr)
 	}
 	pin := settings.TestingTools.Helm
-	if pin != "v4.2.3" {
-		t.Fatalf("testing_tools.helm = %q, want v4.2.3", pin)
+	if pin == "" {
+		t.Fatal("testing_tools.helm is not pinned in .settings.yaml")
 	}
+	pinned, pinParseErr := semver.NewVersion(pin)
+	if pinParseErr != nil {
+		t.Fatalf("testing_tools.helm = %q is not a semantic version: %v", pin, pinParseErr)
+	}
+	if pinned.Major() < minimumHelmMajorVersion {
+		t.Fatalf("testing_tools.helm = %q, want major version >= %d",
+			pin, minimumHelmMajorVersion)
+	}
+	return pin
+}
+
+func TestHelmPinnedVersionExplicitVersionPull(t *testing.T) {
+	pin := helmPinFromSettings(t)
 	helmPath, lookupErr := exec.LookPath("helm")
 	if lookupErr != nil {
 		t.Fatalf("helm %s is required: %v", pin, lookupErr)
@@ -889,7 +919,7 @@ func TestPushFrozenDescriptorCancelsAcceptedUploadAndClosesSource(t *testing.T) 
 	accepted := make(chan struct{})
 	putStarted := make(chan struct{})
 	putDone := make(chan error, 1)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), pushServerTimeout)
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodHead:

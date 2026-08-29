@@ -30,7 +30,6 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/checksum"
 	"github.com/NVIDIA/aicr/pkg/bundler/config"
 	"github.com/NVIDIA/aicr/pkg/bundler/result"
-	"github.com/NVIDIA/aicr/pkg/bundler/verifier"
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	appcfg "github.com/NVIDIA/aicr/pkg/config"
 	"github.com/NVIDIA/aicr/pkg/defaults"
@@ -53,10 +52,12 @@ type bundleCmdOptions struct {
 	systemNodeTolerations      []corev1.Toleration
 	acceleratedNodeSelector    map[string]string
 	acceleratedNodeTolerations []corev1.Toleration
+	draEvictionNodeLabel       config.NodeLabel
 	workloadGateTaint          *corev1.Taint
 	workloadSelector           map[string]string
 	estimatedNodeCount         int
 	storageClass               string
+	sharedStorageClass         string
 	targetRevision             string
 
 	// dynamicValues declares value paths provided at install time.
@@ -386,6 +387,9 @@ func parseBundleCmdOptions(cmd *cli.Command, cfg *appcfg.AICRConfig) (*bundleCmd
 	if opts.acceleratedNodeTolerations, err = resolveTolerations(cmd, "accelerated-node-toleration", resolved.AcceleratedNodeTolerations); err != nil {
 		return nil, err
 	}
+	if opts.draEvictionNodeLabel, err = resolveDRAEvictionNodeLabel(cmd, resolved.DRAEvictionNodeLabel); err != nil {
+		return nil, err
+	}
 
 	if opts.workloadGateTaint, err = resolveTaint(cmd, "workload-gate", resolved.WorkloadGate); err != nil {
 		return nil, err
@@ -410,6 +414,22 @@ func parseBundleCmdOptions(cmd *cli.Command, cfg *appcfg.AICRConfig) (*bundleCmd
 		opts.storageClass = sc
 	} else if resolved.StorageClass != "" {
 		opts.storageClass = resolved.StorageClass
+	}
+
+	if cmd.IsSet("shared-storage-class") {
+		sc := strings.TrimSpace(cmd.String("shared-storage-class"))
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"--shared-storage-class cannot be blank when specified")
+		}
+		opts.sharedStorageClass = sc
+	} else if resolved.SharedStorageClass != "" {
+		sc := strings.TrimSpace(resolved.SharedStorageClass)
+		if sc == "" {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				"spec.bundle.scheduling.sharedStorageClass cannot be blank")
+		}
+		opts.sharedStorageClass = sc
 	}
 
 	// Validate any private Sigstore endpoints up front so a malformed
@@ -631,7 +651,8 @@ Argo CD:
 
 Flux:
   - kustomization.yaml: Root Kustomize orchestration
-  - sources/: HelmRepository and GitRepository source CRs
+  - sources/: HelmRepository and GitRepository source CRs (omitted when no
+    component contributes a source, as with --vendor-charts and an OCI output)
   - <component>/helmrelease.yaml: Flux HelmRelease with inline values
   - README.md: Deployment instructions
   - checksums.txt: SHA256 checksums of generated files
@@ -764,6 +785,12 @@ Package with explicit tag (overrides CLI version):
 				Category: catScheduling,
 			},
 			&cli.StringFlag{
+				Name:     "dra-eviction-node-label",
+				Value:    config.DefaultDRAEvictionNodeLabel().String(),
+				Usage:    "Node label coordinating DRA kubelet-plugin eviction with GPU Operator driver upgrades (format: key=value; applied only when both components are enabled)",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
 				Name:     "workload-gate",
 				Usage:    "Taint for nodewright-operator runtime required (format: key=value:effect or key:effect). This is a day 2 option for cluster scaling operations.",
 				Category: catScheduling,
@@ -782,6 +809,11 @@ Package with explicit tag (overrides CLI version):
 			&cli.StringFlag{
 				Name:     "storage-class",
 				Usage:    "Kubernetes StorageClass name to inject into components at bundle time (written to registry-declared storageClassPaths). Overrides any storageClassName set in recipe overlays.",
+				Category: catScheduling,
+			},
+			&cli.StringFlag{
+				Name:     "shared-storage-class",
+				Usage:    "RWX-capable Kubernetes StorageClass name for opt-in shared filesystem PVCs (written to registry-declared sharedStorageClassPaths).",
 				Category: catScheduling,
 			},
 			withCompletions(&cli.StringFlag{
@@ -869,7 +901,8 @@ Package with explicit tag (overrides CLI version):
 			&cli.StringFlag{
 				Name: "certificate-identity-regexp",
 				Usage: `Override the certificate identity pattern for binary attestation verification.
-	Must contain "NVIDIA/aicr". Use for testing with binaries attested by non-release
+	Must begin with "https://github.com/NVIDIA/aicr/" (a leading "^" is allowed) and
+	must not use top-level alternation. Use for testing with binaries attested by non-release
 	workflows (e.g., build-attested.yaml). Not intended for production use.`,
 				Category: catDeployment,
 			},
@@ -1051,7 +1084,7 @@ func runBundleCmdWithDependencies(
 	deps = normalizeBundleCommandDependencies(deps)
 
 	// Validate single-value flags are not duplicated
-	if err := validateSingleValueFlags(cmd, "recipe", "config", "output", "deployer", "repo", "storage-class", "app-name", flagFulcioURL, flagRekorURL, flagSigningKey); err != nil {
+	if err := validateSingleValueFlags(cmd, "recipe", "config", "output", "deployer", "repo", "storage-class", "shared-storage-class", "dra-eviction-node-label", "app-name", flagFulcioURL, flagRekorURL, flagSigningKey); err != nil {
 		return err
 	}
 
@@ -1066,7 +1099,7 @@ func runBundleCmdWithDependencies(
 	// otherwise. The Client owns its DataProvider — LoadRecipe and
 	// MakeBundle thread it through, replacing the old process-global
 	// data provider.
-	client, err := recipeClientFromCmd(cmd, cfg)
+	client, err := recipeClientFromCmd(ctx, cmd, cfg)
 	if err != nil {
 		return err
 	}
@@ -1118,7 +1151,7 @@ func runBundleCmdWithDependencies(
 
 	// Validate custom identity pattern if provided
 	if opts.certificateIdentityRegexp != "" {
-		if validErr := verifier.ValidateIdentityPattern(opts.certificateIdentityRegexp); validErr != nil {
+		if validErr := aicr.ValidateIdentityPattern(opts.certificateIdentityRegexp); validErr != nil {
 			return validErr
 		}
 	}
@@ -1138,10 +1171,12 @@ func runBundleCmdWithDependencies(
 		config.WithSystemNodeTolerations(opts.systemNodeTolerations),
 		config.WithAcceleratedNodeSelector(opts.acceleratedNodeSelector),
 		config.WithAcceleratedNodeTolerations(opts.acceleratedNodeTolerations),
+		config.WithDRAEvictionNodeLabel(opts.draEvictionNodeLabel),
 		config.WithWorkloadGateTaint(opts.workloadGateTaint),
 		config.WithWorkloadSelector(opts.workloadSelector),
 		config.WithEstimatedNodeCount(opts.estimatedNodeCount),
 		config.WithStorageClass(opts.storageClass),
+		config.WithSharedStorageClass(opts.sharedStorageClass),
 		config.WithVendorCharts(opts.vendorCharts),
 		config.WithReadinessHooks(opts.readinessHooks),
 		config.WithSerial(opts.serial),

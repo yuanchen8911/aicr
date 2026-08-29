@@ -65,14 +65,164 @@ case "${mode}" in
         SECTION="operator"
         ;;
     operator-dynamo-no-dgd)
-        # Dynamo operator is installed but no DynamoGraphDeployment exists and the
-        # DGD query itself succeeds: an absent inference workload is an absent
-        # prerequisite (SKIP), not a failure.
+        # Dynamo operator is installed, its webhook DEMONSTRABLY rejects the
+        # probe (the stub returns the webhook-attributed denial — the SKIP
+        # branch sits behind the required webhook gate), but no
+        # DynamoGraphDeployment exists and the DGD query itself succeeds:
+        # an absent inference workload is an absent prerequisite (SKIP),
+        # not a failure.
         kubectl() {
             if [ "${1:-}" = "cluster-info" ]; then
                 return 0
             fi
             case " $* " in
+                *"--dry-run=server"*)
+                    echo 'Error from server (Forbidden): error when creating "STDIN": admission webhook "vdynamographdeployment.kb.io" denied the request: spec.services must have at least one service' >&2
+                    return 1 ;;
+                *"dynamo-platform-dynamo-operator-controller-manager"*) echo "dynamo-operator 1/1" ;;
+                *" dynamographdeployments "*) return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="operator"
+        ;;
+    operator-dynamo-no-dgd-no-webhook)
+        # Operator present, DGD query succeeds with zero rows, and the
+        # webhook probe is ADMITTED (server dry-run succeeds — no denial of
+        # any kind): the webhook gate must FAIL the section before the
+        # absent-DGD SKIP branch can swallow the observed webhook failure.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"--dry-run=server"*)
+                    echo "dynamographdeployment.nvidia.com/webhook-test-invalid created (server dry run)"
+                    return 0 ;;
+                *"dynamo-platform-dynamo-operator-controller-manager"*) echo "dynamo-operator 1/1" ;;
+                *" dynamographdeployments "*) return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="operator"
+        ;;
+    gang-barrier-pass)
+        # Full two-phase gang happy path through the REAL collect_gang:
+        # idle-node pick, blocker staging, occupancy gates at both ends,
+        # binding + two-part gang-evaluation reads, release-phase waits,
+        # and the verdict ladder. The occupancy read is stateful: 0 GPUs
+        # used at pick time, 3 (the blocker) at the post-blocker gate and
+        # the post-window re-check.
+        sleep() { return 0; }
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"get namespace gang-scheduling-test"*)
+                    return 1 ;;
+                *"--field-selector"*)
+                    local n=0
+                    [ -f "${SCRIPT_DIR}/occ-count" ] && IFS= read -r n < "${SCRIPT_DIR}/occ-count"
+                    n=$((n + 1)); printf '%s' "${n}" > "${SCRIPT_DIR}/occ-count"
+                    if [ "${n}" -ge 2 ]; then
+                        echo "Running A 3 I "
+                    fi
+                    return 0 ;;
+                *"PodScheduled"*)
+                    echo "False/Unschedulable"
+                    return 0 ;;
+                *" podgroup gang-test-group "*)
+                    echo "PodSchedulingErrors: Resources were found for 1 pods while 2 are required for gang scheduling. Additional pods cannot be scheduled."
+                    return 0 ;;
+                *"spec.nodeName"*)
+                    return 0 ;;
+                *"containerStatuses"*)
+                    return 0 ;;
+                *"status.phase"*)
+                    if [[ "$*" == *"gang-capacity-blocker"* ]]; then
+                        echo "Running"
+                    else
+                        echo "Succeeded"
+                    fi
+                    return 0 ;;
+                *"nvidia.com/gpu.present"*)
+                    echo "gang-test-node 4 cordoned= ready=True"
+                    return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="gang"
+        ;;
+    operator-kubeflow-webhook-pass)
+        # Exercises the Kubeflow branch of the operator dispatch (every
+        # other operator lane routes to Dynamo): the exact-name webhook
+        # grep for validator.trainjob.trainer.kubeflow.org AND the
+        # readyReplicas >= 1 controller readiness (an HA-scaled 2-replica
+        # controller must not be misread as unready under the stricter
+        # webhook-required verdict).
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"dynamo-platform-dynamo-operator-controller-manager"*)
+                    return 0 ;;
+                *"k8s-nim-operator"*)
+                    return 0 ;;
+                *"readyReplicas"*)
+                    echo "2"
+                    return 0 ;;
+                *"kubeflow-trainer-controller-manager --no-headers"*)
+                    echo "kubeflow-trainer-controller-manager 2/2 2 2 5d"
+                    return 0 ;;
+                *"--dry-run=server"*)
+                    echo 'Error from server (Forbidden): error when creating "STDIN": admission webhook "validator.trainjob.trainer.kubeflow.org" denied the request: specified clusterTrainingRuntime must be created before the TrainJob is created' >&2
+                    return 1 ;;
+                *" get crds "*)
+                    printf '%s\n' "trainjobs.trainer.kubeflow.org" "trainingruntimes.trainer.kubeflow.org" "clustertrainingruntimes.trainer.kubeflow.org"
+                    return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="operator"
+        ;;
+    operator-dynamo-schema-reject)
+        # A schema-shaped rejection (Required value) must land in the
+        # NOT-the-webhook branch and FAIL — the exact regression the
+        # schema-valid probe payloads guard against.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"--dry-run=server"*)
+                    echo 'The DynamoGraphDeployment "webhook-test-invalid" is invalid: spec.services: Required value' >&2
+                    return 1 ;;
+                *"dynamo-platform-dynamo-operator-controller-manager"*) echo "dynamo-operator 1/1" ;;
+                *" dynamographdeployments "*) return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="operator"
+        ;;
+    operator-dynamo-foreign-webhook)
+        # The probe is denied by a DIFFERENT admission webhook (a cluster
+        # policy webhook) — the exact-name gate must classify this as NOT
+        # demonstrating the operator's webhook and FAIL, never PASS or
+        # SKIP. This is the discriminating branch of the name-pinned grep.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"--dry-run=server"*)
+                    # The foreign name deliberately EMBEDS the operator's
+                    # webhook name as a prefix: a naive substring grep would
+                    # match it, so this lane fails if the exact-name
+                    # (quote-anchored) matching is ever loosened.
+                    echo 'Error from server (Forbidden): error when creating "STDIN": admission webhook "vdynamographdeployment.kb.io.evil.example.com" denied the request: denied by cluster policy' >&2
+                    return 1 ;;
                 *"dynamo-platform-dynamo-operator-controller-manager"*) echo "dynamo-operator 1/1" ;;
                 *" dynamographdeployments "*) return 0 ;;
             esac
@@ -97,6 +247,101 @@ case "${mode}" in
         ;;
     autoscaler-absent)
         SECTION="cluster-autoscaling"
+        ;;
+    dynamo-dispatch-list-failed)
+        # Drives the REAL collect_service_metrics dispatcher (no override): the
+        # Dynamo pod list fails while the namespace exists. The dispatcher must
+        # route to the Dynamo collector so the failure surfaces, rather than
+        # falling through to NIM/trainer and emitting unrelated evidence.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"dynamo-component-type=worker"*) return 1 ;;
+                *" get namespace dynamo-workload "*) return 0 ;;
+            esac
+            return 0
+        }
+        SECTION="service-metrics"
+        ;;
+    dynamo-dispatch-both-queries-failed)
+        # Both Dynamo probes fail (cluster-wide read failure: RBAC revoked,
+        # expired credentials, apiserver outage). The namespace state cannot be
+        # classified, so the dispatcher must NOT read that as "no workload" and
+        # fall through to NIM/trainer — it routes to Dynamo, which fails closed.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"dynamo-component-type=worker"*) return 1 ;;
+                *" get namespace dynamo-workload "*)
+                    echo "Error from server (Forbidden): namespaces \"dynamo-workload\" is forbidden" >&2
+                    return 1 ;;
+            esac
+            return 0
+        }
+        SECTION="service-metrics"
+        ;;
+    dynamo-workload-absent)
+        # No worker pods: the section MEASURES an existing workload and must
+        # never deploy one, so an absent workload is an absent prerequisite
+        # (SKIP), not a cue to apply the manifest.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            return 0
+        }
+        collect_service_metrics() {
+            EVIDENCE_FILE="${EVIDENCE_DIR}/ai-service-metrics.md"
+            collect_service_metrics_dynamo
+        }
+        SECTION="service-metrics"
+        ;;
+    dynamo-workload-list-failed)
+        # The pod list fails: a read error must fail closed rather than be
+        # flattened into "no workload present".
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"dynamo-component-type=worker"*) return 1 ;;
+            esac
+            return 0
+        }
+        collect_service_metrics() {
+            EVIDENCE_FILE="${EVIDENCE_DIR}/ai-service-metrics.md"
+            collect_service_metrics_dynamo
+        }
+        SECTION="service-metrics"
+        ;;
+    hpa-scaled-cleanup-ok|hpa-scaled-cleanup-failed)
+        # Both lanes observe a real scale-up (replicas>1 with a current metric),
+        # so hpa_scaled is true and the ONLY difference is whether the test
+        # namespace could be deleted. The section must not report PASS while its
+        # unbounded CUDA workload may still be running, so the cleanup lane has
+        # to flip the verdict to FAIL — and the control lane proves the FAIL is
+        # attributable to cleanup rather than to a stub that never passes.
+        kubectl() {
+            if [ "${1:-}" = "cluster-info" ]; then
+                return 0
+            fi
+            case " $* " in
+                *"averageValue"*) echo "75" ;;
+                *"currentReplicas"*) echo "2" ;;
+            esac
+            return 0
+        }
+        sleep() { return 0; }
+        if [ "${mode}" = "hpa-scaled-cleanup-failed" ]; then
+            cleanup_ns() { return 1; }
+        else
+            cleanup_ns() { return 0; }
+        fi
+        SECTION="hpa"
         ;;
     dynamo-unhealthy)
         kubectl() {
@@ -249,6 +494,55 @@ func TestEvidenceResultPropagatesThroughCollector(t *testing.T) {
 			singleVerdictFile: "robust-operator.md",
 		},
 		{
+			// The central regression case for the webhook-before-SKIP rule:
+			// with no operator-attributed denial, an absent workload DGD
+			// must NOT convert the webhook failure into a non-failing SKIP.
+			name:              "present operator without DGD and without webhook denial fails",
+			mode:              "operator-dynamo-no-dgd-no-webhook",
+			displayName:       "Robust AI Operator",
+			wantStatus:        "FAIL",
+			singleVerdictFile: "robust-operator.md",
+			wantErr:           true,
+		},
+		{
+			// The PR's headline behavioral logic end to end: barrier
+			// staging, both occupancy gates, the two-part gang-evaluation
+			// gate, and joint completion — through the real collect_gang.
+			name:              "gang two-phase barrier passes with full affirmative evidence",
+			mode:              "gang-barrier-pass",
+			displayName:       "Gang Scheduling",
+			wantStatus:        "PASS",
+			singleVerdictFile: "gang-scheduling.md",
+		},
+		{
+			// The Kubeflow dispatch branch: exact-name webhook grep plus
+			// readyReplicas>=1 (HA controller must not read as unready).
+			name:              "kubeflow webhook rejection passes with HA controller",
+			mode:              "operator-kubeflow-webhook-pass",
+			displayName:       "Robust AI Operator",
+			wantStatus:        "PASS",
+			singleVerdictFile: "robust-operator.md",
+		},
+		{
+			// A schema-shaped rejection must not read as a webhook denial.
+			name:              "schema rejection does not demonstrate the operator webhook",
+			mode:              "operator-dynamo-schema-reject",
+			displayName:       "Robust AI Operator",
+			wantStatus:        "FAIL",
+			singleVerdictFile: "robust-operator.md",
+			wantErr:           true,
+		},
+		{
+			// The discriminating branch of the exact-name webhook gate: a
+			// denial from a foreign (policy) webhook must FAIL, not count.
+			name:              "foreign webhook denial does not demonstrate the operator webhook",
+			mode:              "operator-dynamo-foreign-webhook",
+			displayName:       "Robust AI Operator",
+			wantStatus:        "FAIL",
+			singleVerdictFile: "robust-operator.md",
+			wantErr:           true,
+		},
+		{
 			name:              "operator DGD query failure fails closed",
 			mode:              "operator-dynamo-query-failed",
 			displayName:       "Robust AI Operator",
@@ -328,6 +622,58 @@ func TestEvidenceResultPropagatesThroughCollector(t *testing.T) {
 			wantErr:        true,
 		},
 		{
+			name:              "dispatcher routes a failed Dynamo list to the Dynamo collector",
+			mode:              "dynamo-dispatch-list-failed",
+			displayName:       "AI Service Metrics",
+			wantStatus:        "FAIL",
+			wantEvidence:      "the workload state is unknown",
+			singleVerdictFile: "ai-service-metrics.md",
+			wantErr:           true,
+		},
+		{
+			name:              "unclassifiable Dynamo namespace state fails closed",
+			mode:              "dynamo-dispatch-both-queries-failed",
+			displayName:       "AI Service Metrics",
+			wantStatus:        "FAIL",
+			wantEvidence:      "the workload state is unknown",
+			singleVerdictFile: "ai-service-metrics.md",
+			wantErr:           true,
+		},
+		{
+			name:              "absent Dynamo workload skips instead of deploying",
+			mode:              "dynamo-workload-absent",
+			displayName:       "AI Service Metrics",
+			wantStatus:        "SKIP",
+			wantEvidence:      "no running Dynamo workload in dynamo-workload",
+			singleVerdictFile: "ai-service-metrics.md",
+		},
+		{
+			name:              "Dynamo worker pod list failure fails closed",
+			mode:              "dynamo-workload-list-failed",
+			displayName:       "AI Service Metrics",
+			wantStatus:        "FAIL",
+			wantEvidence:      "the workload state is unknown",
+			singleVerdictFile: "ai-service-metrics.md",
+			wantErr:           true,
+		},
+		{
+			name:              "HPA scale-up with successful cleanup is pass",
+			mode:              "hpa-scaled-cleanup-ok",
+			displayName:       "Pod Autoscaling (HPA)",
+			wantStatus:        "PASS",
+			singleVerdictFile: "pod-autoscaling.md",
+			wantErr:           false,
+		},
+		{
+			name:              "HPA scale-up with failed cleanup is fail",
+			mode:              "hpa-scaled-cleanup-failed",
+			displayName:       "Pod Autoscaling (HPA)",
+			wantStatus:        "FAIL",
+			wantEvidence:      "the hpa-test namespace could not be deleted",
+			singleVerdictFile: "pod-autoscaling.md",
+			wantErr:           true,
+		},
+		{
 			name:              "present but unhealthy Dynamo is fail",
 			mode:              "dynamo-unhealthy",
 			displayName:       "AI Service Metrics",
@@ -399,6 +745,26 @@ func TestEvidenceResultPropagatesThroughCollector(t *testing.T) {
 					t.Fatalf("write trainer manifest fixture: %v", err)
 				}
 			}
+			if strings.HasPrefix(tt.mode, "hpa-") {
+				manifestDir := filepath.Join(dir, "manifests")
+				if err := os.MkdirAll(manifestDir, 0o755); err != nil {
+					t.Fatalf("create manifest directory: %v", err)
+				}
+				manifestPath := filepath.Join(manifestDir, "hpa-gpu-test.yaml")
+				if err := os.WriteFile(manifestPath, []byte("---\n"), 0o600); err != nil {
+					t.Fatalf("write HPA manifest fixture: %v", err)
+				}
+			}
+			if strings.HasPrefix(tt.mode, "gang-") {
+				manifestDir := filepath.Join(dir, "manifests")
+				if err := os.MkdirAll(manifestDir, 0o755); err != nil {
+					t.Fatalf("create manifest directory: %v", err)
+				}
+				manifestPath := filepath.Join(manifestDir, "gang-scheduling-test.yaml")
+				if err := os.WriteFile(manifestPath, []byte("# GANG_TEST_NODE placeholder fixture\n---\n"), 0o600); err != nil {
+					t.Fatalf("write gang manifest fixture: %v", err)
+				}
+			}
 			if tt.collectorFails {
 				if err := os.WriteFile(filepath.Join(dir, "collector-fail"), nil, 0o600); err != nil {
 					t.Fatalf("write collector failure marker: %v", err)
@@ -443,7 +809,13 @@ func TestEvidenceResultPropagatesThroughCollector(t *testing.T) {
 				t.Errorf("result = %q, want %q", got, want)
 			}
 			if tt.wantEvidence != "" {
-				evidencePath := filepath.Join(outputDir, "ai-service-metrics.md")
+				// Assert against the artifact the case names, falling back to
+				// the service-metrics file the original lanes all used.
+				evidenceName := tt.singleVerdictFile
+				if evidenceName == "" {
+					evidenceName = "ai-service-metrics.md"
+				}
+				evidencePath := filepath.Join(outputDir, evidenceName)
 				evidence, evidenceErr := os.ReadFile(evidencePath)
 				if evidenceErr != nil {
 					t.Fatalf("read evidence artifact: %v", evidenceErr)
@@ -472,7 +844,7 @@ func TestEvidenceResultPropagatesThroughCollector(t *testing.T) {
 // the parser never fails closed on a healthy check.
 func countColumnZeroVerdicts(evidence string) int {
 	count := 0
-	for _, line := range strings.Split(evidence, "\n") {
+	for line := range strings.SplitSeq(evidence, "\n") {
 		if strings.HasPrefix(line, "**Result:") {
 			count++
 		}

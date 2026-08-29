@@ -15,7 +15,9 @@
 package snapshotter
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -68,7 +70,8 @@ type AgentConfig struct {
 	// NodeSelector for targeting specific nodes
 	NodeSelector map[string]string
 
-	// Tolerations for scheduling on tainted nodes
+	// Tolerations for scheduling on tainted nodes. Nil uses
+	// DefaultTolerations; a non-nil empty slice explicitly disables that default.
 	Tolerations []corev1.Toleration
 
 	// Timeout for waiting for Job completion
@@ -147,24 +150,36 @@ type AgentConfig struct {
 	Limits corev1.ResourceList
 }
 
+// buildAgentConfig projects snapshotter configuration onto the deployer's
+// Job configuration. Keep scheduling defaults at this projection boundary so
+// every snapshot-agent caller gets the same nil-versus-empty behavior.
+func buildAgentConfig(config *AgentConfig, agentOutput string) agent.Config {
+	return agent.Config{
+		Namespace:          config.Namespace,
+		ServiceAccountName: config.ServiceAccountName,
+		JobName:            config.JobName,
+		Image:              config.Image,
+		ImagePullSecrets:   config.ImagePullSecrets,
+		NodeSelector:       config.NodeSelector,
+		Tolerations:        effectiveAgentTolerations(config.Tolerations),
+		Output:             agentOutput,
+		Debug:              config.Debug,
+		Privileged:         config.Privileged,
+		RequireGPU:         config.RequireGPU,
+		RuntimeClassName:   config.RuntimeClassName,
+		MaxNodesPerEntry:   config.MaxNodesPerEntry,
+		OS:                 config.OS,
+		ClusterConfigPath:  config.ClusterConfigPath,
+		DiscoverNetwork:    config.DiscoverNetwork,
+		Requests:           config.Requests,
+		Limits:             config.Limits,
+	}
+}
+
 // deployAndWaitForResult handles the common deploy-wait-retrieve lifecycle for an agent Job.
 // It creates the deployer, deploys RBAC and the Job, streams logs, waits for completion,
 // and retrieves the snapshot data from the result ConfigMap.
 func deployAndWaitForResult(ctx context.Context, clientset k8sclient.Interface, config *AgentConfig, agentOutput string, deliverViaConfigMap bool) ([]byte, error) {
-	// Job mode forwards --cluster-config as an env var into the pod
-	// (AICR_CLUSTER_CONFIG_PATH) without mounting the host file: the
-	// caller's filesystem isn't reachable from inside the Job, and the
-	// in-pod CLI would fail to open the path. Reject the combination
-	// up front instead of producing a confusing failure deep in the
-	// network collector. ConfigMap-backed file forwarding is tracked
-	// as a follow-up; until then --cluster-config is local-mode-only
-	// (AICR_AGENT_MODE=true) and --discover-network is the supported
-	// Job-mode path.
-	if config.ClusterConfigPath != "" {
-		return nil, errors.NewWithContext(errors.ErrCodeInvalidRequest,
-			"--cluster-config is not supported in agent Job mode (the host path is not visible to the in-pod CLI); use --discover-network for live cluster discovery, or run with AICR_AGENT_MODE=true to use --cluster-config locally",
-			map[string]any{"path": config.ClusterConfigPath})
-	}
 	// The pool projection is pure file processing on the caller's host —
 	// project it BEFORE deploying so a bad file fails in milliseconds,
 	// not after a Job round-trip, and merge it into the returned snapshot
@@ -183,26 +198,7 @@ func deployAndWaitForResult(ctx context.Context, clientset k8sclient.Interface, 
 	// name the injected selector (TOCTOU: node may be cordoned after detection).
 	autoInjectedGPUSelector := maybeInjectGPUNodeSelector(ctx, clientset, config)
 
-	agentConfig := agent.Config{
-		Namespace:          config.Namespace,
-		ServiceAccountName: config.ServiceAccountName,
-		JobName:            config.JobName,
-		Image:              config.Image,
-		ImagePullSecrets:   config.ImagePullSecrets,
-		NodeSelector:       config.NodeSelector,
-		Tolerations:        config.Tolerations,
-		Output:             agentOutput,
-		Debug:              config.Debug,
-		Privileged:         config.Privileged,
-		RequireGPU:         config.RequireGPU,
-		RuntimeClassName:   config.RuntimeClassName,
-		MaxNodesPerEntry:   config.MaxNodesPerEntry,
-		OS:                 config.OS,
-		ClusterConfigPath:  config.ClusterConfigPath,
-		DiscoverNetwork:    config.DiscoverNetwork,
-		Requests:           config.Requests,
-		Limits:             config.Limits,
-	}
+	agentConfig := buildAgentConfig(config, agentOutput)
 
 	deployer := agent.NewDeployer(clientset, agentConfig)
 
@@ -251,9 +247,7 @@ func deployAndWaitForResult(ctx context.Context, clientset k8sclient.Interface, 
 		logWG.Wait()
 	}()
 
-	logWG.Add(1)
-	go func() {
-		defer logWG.Done()
+	logWG.Go(func() {
 		if podErr := deployer.WaitForPodReady(logCtx, defaults.K8sPodReadyTimeout); podErr != nil {
 			// Only suppress logging when the parent context has been
 			// canceled (expected during cleanup). Genuine failures
@@ -273,7 +267,7 @@ func deployAndWaitForResult(ctx context.Context, clientset k8sclient.Interface, 
 					"error", streamErr)
 			}
 		}
-	}()
+	})
 
 	if waitErr := deployer.WaitForCompletion(ctx, timeout); waitErr != nil {
 		if logs, logErr := deployer.GetPodLogs(ctx); logErr == nil && logs != "" {
@@ -281,18 +275,24 @@ func deployAndWaitForResult(ctx context.Context, clientset k8sclient.Interface, 
 			fmt.Fprintln(logWriter(), logs)
 			fmt.Fprintln(logWriter(), "--- end logs ---")
 		}
+		isTransient := errors.IsTransient(waitErr)
 		msg := "job failed"
 		if autoInjectedGPUSelector {
 			msg = "job failed (auto-injected node selector nvidia.com/gpu.present=true — " +
-				"if no GPU nodes are schedulable, target a GPU node explicitly, e.g. " +
-				"--node-selector kubernetes.io/hostname=<gpu-node> " +
-				"(repeat the flag per key=value), or pass --require-gpu to schedule onto " +
-				"a node advertising the nvidia.com/gpu resource)"
+				"verify matching GPU nodes are Ready and schedulable; if tolerations were " +
+				"explicitly cleared or replaced, pass a matching --toleration " +
+				"key=value:effect. To override placement, pass --node-selector " +
+				"kubernetes.io/hostname=<gpu-node>; --require-gpu selects a node " +
+				"advertising the nvidia.com/gpu resource)"
+		} else if isTransient {
+			msg = "job failed (verify target nodes are Ready and schedulable; if " +
+				"tolerations were explicitly cleared or replaced, pass a matching " +
+				"--toleration key=value:effect)"
 		}
 		// A wait that exceeded the deadline (pending pod, image pull, no schedulable
 		// node) is transient and retryable — classify it as ErrCodeTimeout rather
 		// than masking it as a deterministic ErrCodeInternal failure.
-		if errors.IsTransient(waitErr) {
+		if isTransient {
 			return nil, errors.Wrap(errors.ErrCodeTimeout, msg, waitErr)
 		}
 		return nil, errors.Wrap(errors.ErrCodeInternal, msg, waitErr)
@@ -413,36 +413,325 @@ func getKubeClient(kubeconfig string) (k8sclient.Interface, error) {
 	return clientset, nil
 }
 
-// DeployAndGetSnapshot deploys an agent to capture a snapshot and returns the Snapshot struct.
-// This is used by commands that need to capture a snapshot but also process the data
-// (e.g., validate command that needs to run validation on the captured snapshot).
-func DeployAndGetSnapshot(ctx context.Context, config *AgentConfig) (*Snapshot, error) {
+// DeployAndCollect deploys the agent Job, waits for it, and returns both the
+// parsed Snapshot and the RAW bytes the agent emitted. It is the single
+// deploy-and-retrieve implementation behind every caller — the aicr.Client
+// facade's CollectSnapshot (and therefore `aicr snapshot` and `aicr validate`)
+// and NodeSnapshotter.measureWithAgent.
+//
+// # Why both return values
+//
+// The parsed *Snapshot is what consumers reason about; the raw bytes are what
+// gets written out. They are NOT interchangeable: re-serializing the typed
+// struct drops any field a newer agent image emitted that this binary's
+// Snapshot type does not know about. Callers that persist the snapshot must
+// deliver the raw bytes (see DeliverSnapshot) so `aicr snapshot` output stays
+// byte-identical to what the agent produced.
+//
+// # Where the agent writes
+//
+// The Job always stages its result in a ConfigMap. When config.Output is a
+// cm:// URI that ConfigMap IS the user's destination, so the Job writes there
+// directly; otherwise the Job writes to an internal ConfigMap in
+// config.Namespace and the caller delivers the returned bytes.
+//
+// # Fail-before-mutate
+//
+// Every input that can be rejected without contacting the cluster is checked
+// up front — before the Kubernetes client is even built, so a rejection is
+// never masked by a kubeconfig error and never leaves RBAC or a Job behind
+// (with Cleanup false, the zero value, they would persist). That covers a
+// malformed cm:// Output, an empty Namespace, and a Job-mode
+// ClusterConfigPath.
+//
+// The *Snapshot return has no consumer inside this package —
+// measureWithAgent only delivers the bytes — but it is the value
+// aicr.Client.CollectSnapshot hands to SDK callers and to `aicr validate`,
+// hence the unparam exemption below. Keep the rationale in prose: gofmt moves
+// //nolint (a directive-shaped comment) to the end of the doc block, so
+// continuation lines written under it get hoisted above and orphaned.
+//
+//nolint:unparam // *Snapshot is consumed across the package boundary; see above.
+func DeployAndCollect(ctx context.Context, config *AgentConfig) (*Snapshot, []byte, error) {
 	if config == nil {
-		return nil, errors.New(errors.ErrCodeInvalidRequest, "agent config is required")
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest, "agent config is required")
+	}
+
+	// Job mode forwards --cluster-config as an env var into the pod
+	// (AICR_CLUSTER_CONFIG_PATH) without mounting the host file: the
+	// caller's filesystem isn't reachable from inside the Job, and the
+	// in-pod CLI would fail to open the path. Reject the combination
+	// up front instead of producing a confusing failure deep in the
+	// network collector. ConfigMap-backed file forwarding is tracked
+	// as a follow-up; until then --cluster-config is local-mode-only
+	// (AICR_AGENT_MODE=true) and --discover-network is the supported
+	// Job-mode path.
+	if config.ClusterConfigPath != "" {
+		return nil, nil, errors.NewWithContext(errors.ErrCodeInvalidRequest,
+			"--cluster-config is not supported in agent Job mode (the host path is not visible to the in-pod CLI); use --discover-network for live cluster discovery, or run with AICR_AGENT_MODE=true to use --cluster-config locally",
+			map[string]any{"path": config.ClusterConfigPath})
+	}
+
+	// The Job, its RBAC, and the internal result ConfigMap all live in
+	// config.Namespace. Empty (or whitespace) would build the invalid URI
+	// "cm:///aicr-snapshot", which only fails when it is finally parsed —
+	// after RBAC and the Job exist. The CLI always supplies a default, so
+	// this is the SDK-caller path.
+	if strings.TrimSpace(config.Namespace) == "" {
+		return nil, nil, errors.New(errors.ErrCodeInvalidRequest,
+			"Namespace is required: it is where the agent Job, its RBAC, and the result ConfigMap are created")
+	}
+
+	// Resolve (and validate) the Job's ConfigMap target before any cluster
+	// access: a malformed cm:// Output must not cost the caller a deployed
+	// Job and a cluster-admin binding.
+	agentOutput, deliverViaConfigMap, err := agentConfigMapTarget(config)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	slog.Debug("starting agent deployment for snapshot capture")
 
 	clientset, err := getKubeClient(config.Kubeconfig)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	agentOutput := fmt.Sprintf("%s%s/aicr-snapshot", serializer.ConfigMapURIScheme, config.Namespace)
-
-	// SDK path: the consumer uses the returned Snapshot; the ConfigMap is internal.
-	snapshotData, err := deployAndWaitForResult(ctx, clientset, config, agentOutput, false)
+	snapshotData, err := deployAndWaitForResult(ctx, clientset, config, agentOutput, deliverViaConfigMap)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var snap Snapshot
 	if err := yaml.Unmarshal(snapshotData, &snap); err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse snapshot data", err)
+		return nil, nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse snapshot data", err)
 	}
 
 	warnOnGPUPlacementMismatch(&snap)
 
+	return &snap, snapshotData, nil
+}
+
+// agentConfigMapTarget resolves where the agent Job stages its result and
+// whether that ConfigMap is the user's delivery vehicle.
+//
+// The Job always writes to a ConfigMap. When config.Output is a cm:// URI the
+// user asked for that exact ConfigMap, so the Job targets it directly and
+// deliverViaConfigMap is true — which makes a failed AKS-pool-merge rewrite
+// fatal rather than a warning, because the bytes the user will read live
+// there. Any other Output (file, stdout, template, or unset) stages to an
+// internal ConfigMap in config.Namespace that the caller never sees.
+//
+// A cm:// Output is fully parsed here, not merely prefix-matched. The
+// namespace/name only has to be well-formed for the in-pod writer much later,
+// so a typo like "cm://aicr-snapshot" (no namespace) would otherwise surface
+// as a Job failure — after RBAC and the Job exist, and with Cleanup false
+// (the zero value) they stay behind. Returns ErrCodeInvalidRequest instead.
+func agentConfigMapTarget(config *AgentConfig) (uri string, deliverViaConfigMap bool, err error) {
+	if strings.HasPrefix(config.Output, serializer.ConfigMapURIScheme) {
+		if _, _, parseErr := pod.ParseConfigMapURI(config.Output); parseErr != nil {
+			// Wrap with the same code rather than PropagateOrWrap: the inner
+			// error says "invalid configmap URI", which does not tell the
+			// caller WHICH input was wrong. Naming the field is the point.
+			return "", false, errors.Wrap(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("invalid ConfigMap output URI %q (expected cm://namespace/name)", config.Output),
+				parseErr)
+		}
+		return config.Output, true, nil
+	}
+	return fmt.Sprintf("%s%s/aicr-snapshot", serializer.ConfigMapURIScheme, config.Namespace), false, nil
+}
+
+// SnapshotDelivery describes where DeliverSnapshot writes captured bytes.
+// Mirrors the delivery-relevant subset of AgentConfig so callers that already
+// hold one can forward it, and callers that hold only bytes (an SDK consumer
+// with a Snapshot.Raw) can construct one directly.
+type SnapshotDelivery struct {
+	// Output is the destination: empty, "-", or the stdout URI for stdout;
+	// a cm://namespace/name URI for a ConfigMap; any other value is a file
+	// path.
+	Output string
+
+	// TemplatePath, when set, renders the snapshot through a Go template
+	// instead of copying bytes. Takes precedence over the Output scheme —
+	// Output then names the rendered report's destination.
+	TemplatePath string
+
+	// Kubeconfig is the path used to reach the cluster for a cm:// Output.
+	// Empty means in-cluster or the standard discovery chain. Ignored for
+	// every other destination.
+	Kubeconfig string
+
+	// Format is the rendering the caller asked for. The zero value and
+	// serializer.FormatYAML both deliver the agent's bytes verbatim to
+	// stdout and file destinations; JSON and table re-render the document
+	// (see renderSnapshotFormat). A cm:// destination always re-serializes,
+	// whatever the format — see the ConfigMap section on DeliverSnapshot.
+	// Ignored when TemplatePath is set, since a template supplies its own
+	// rendering.
+	Format serializer.Format
+}
+
+// DeliverSnapshot writes captured snapshot bytes to the user's destination:
+// a Go template render when TemplatePath is set, otherwise stdout (Output
+// empty, "-", or the stdout URI), a ConfigMap (cm://namespace/name), or a
+// file.
+//
+// data must be the RAW bytes from DeployAndCollect, not a re-serialization of
+// the parsed Snapshot — see DeployAndCollect for why. Stdout and file
+// destinations copy those bytes when Format is YAML (or unset). Three modes
+// necessarily parse the document instead: a template, which exposes Snapshot
+// fields to the template, a non-YAML Format, and any cm:// destination.
+//
+// # ConfigMap destinations
+//
+// A cm:// Output is WRITTEN here, not assumed. When the snapshot came from
+// DeployAndCollect with the same URI as AgentConfig.Output the agent Job
+// already staged those bytes, so this apply is redundant but idempotent —
+// and it is what makes the function total: a caller that collected to the
+// default internal ConfigMap and then delivers to cm://ns/name gets the
+// artifact it asked for instead of a silent no-op. Failures surface; a
+// destination the caller named is not something to log and skip past.
+//
+// A ConfigMap is a structured resource, not a byte sink: the writer derives
+// the snapshot.<ext> data key, the format and timestamp entries, and the
+// resource labels from the parsed document. So this destination re-serializes
+// even for YAML — deterministically, via serializer.MarshalYAMLDeterministic,
+// and through a generic map so no unmodeled field is lost. Only the exact
+// bytes are not preserved. A caller that needs byte-identical YAML should
+// deliver to a file or stdout.
+func DeliverSnapshot(ctx context.Context, data []byte, dest SnapshotDelivery) error {
+	if dest.TemplatePath != "" {
+		return deliverWithTemplate(ctx, data, dest.TemplatePath, dest.Output)
+	}
+
+	// Resolve up front so every destination rejects the same set of
+	// formats. It matters most for the ConfigMap branch: serializer's
+	// ConfigMap writer coerces an unrecognized format to JSON, so without
+	// this a cm:// destination would quietly accept what stdout and file
+	// delivery reject.
+	format, err := resolveDeliveryFormat(dest.Format)
+	if err != nil {
+		return err
+	}
+
+	// A ConfigMap carries its format in the resource itself — the data key
+	// is snapshot.<ext> alongside a "format" entry, which is what the
+	// reader in pkg/serializer keys off — so the ConfigMap writer does the
+	// rendering rather than this function.
+	if strings.HasPrefix(dest.Output, serializer.ConfigMapURIScheme) {
+		if writeErr := writeSnapshotConfigMap(ctx, dest.Output, dest.Kubeconfig, data, format); writeErr != nil {
+			return writeErr
+		}
+		slog.Info("snapshot saved to ConfigMap",
+			slog.String("uri", dest.Output),
+			slog.String("format", string(format)))
+		return nil
+	}
+
+	rendered, err := renderSnapshotFormat(ctx, data, format)
+	if err != nil {
+		return err
+	}
+
+	if dest.Output == "" || dest.Output == "-" || dest.Output == serializer.StdoutURI {
+		// Exactly the rendered bytes, no added terminator: stdout is a
+		// delivery destination like any other, so `aicr snapshot >
+		// snapshot.yaml` has to hash the same as `-o snapshot.yaml`.
+		// Every rendering already ends in a newline — the agent's
+		// document because it comes from MarshalYAMLDeterministic, JSON
+		// and table because renderSnapshotFormat terminates them — so
+		// this does not leave a terminal prompt dangling. A short write
+		// or broken pipe must surface, not silently drop the snapshot.
+		if _, err := os.Stdout.Write(rendered); err != nil {
+			return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot to stdout", err)
+		}
+		return nil
+	}
+
+	if err := serializer.WriteToFile(dest.Output, rendered); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot to file", err)
+	}
+	slog.Info("snapshot saved to file",
+		slog.String("path", dest.Output),
+		slog.String("format", string(format)))
+
+	return nil
+}
+
+// resolveDeliveryFormat resolves the delivery format and rejects anything
+// unsupported. The zero value is YAML: delivery predates
+// SnapshotDelivery.Format, so an SDK caller that never sets it must keep
+// getting the agent's YAML bytes.
+func resolveDeliveryFormat(format serializer.Format) (serializer.Format, error) {
+	if format == "" {
+		return serializer.FormatYAML, nil
+	}
+	if format.IsUnknown() {
+		return "", errors.NewWithContext(errors.ErrCodeInvalidRequest,
+			"unsupported snapshot output format",
+			map[string]any{"format": string(format), "supported": serializer.SupportedFormats()})
+	}
+	return format, nil
+}
+
+// renderSnapshotFormat converts the agent's raw YAML document into an already
+// resolved format, for stdout and file destinations.
+//
+// YAML returns data untouched: those bytes are byte-identical to what the
+// agent emitted, including fields this binary's Snapshot type does not model.
+// JSON re-encodes through a generic map for the same reason — a typed round
+// trip would drop those fields, and a JSON document with the same keys is
+// what `aicr diff --target snapshot.json` and jq consumers expect. Table is a
+// human rendering that goes through the typed struct, so it is the one format
+// that is lossy by construction; it matches what in-pod (local) collection
+// emits for the same flag.
+func renderSnapshotFormat(ctx context.Context, data []byte, format serializer.Format) ([]byte, error) {
+	switch format {
+	case serializer.FormatYAML:
+		return data, nil
+
+	case serializer.FormatJSON:
+		var doc map[string]any
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse snapshot for JSON output", err)
+		}
+		// json.Marshal sorts map keys, so the rendering is deterministic
+		// for a given document.
+		out, err := json.MarshalIndent(doc, "", "  ")
+		if err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to render snapshot as JSON", err)
+		}
+		return append(out, '\n'), nil
+
+	case serializer.FormatTable:
+		snap, err := parseSnapshotDocument(data, "table")
+		if err != nil {
+			return nil, err
+		}
+		var buf bytes.Buffer
+		if err := serializer.NewWriter(serializer.FormatTable, &buf).Serialize(ctx, snap); err != nil {
+			return nil, errors.Wrap(errors.ErrCodeInternal, "failed to render snapshot as a table", err)
+		}
+		return buf.Bytes(), nil
+
+	default:
+		// Unreachable via DeliverSnapshot, which resolves first; kept so a
+		// future caller cannot skip the check and fall through to YAML.
+		return nil, errors.NewWithContext(errors.ErrCodeInvalidRequest,
+			"unsupported snapshot output format",
+			map[string]any{"format": string(format), "supported": serializer.SupportedFormats()})
+	}
+}
+
+// parseSnapshotDocument unmarshals an agent document into this binary's
+// Snapshot type for the delivery modes that cannot copy bytes.
+func parseSnapshotDocument(data []byte, mode string) (*Snapshot, error) {
+	var snap Snapshot
+	if err := yaml.Unmarshal(data, &snap); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			fmt.Sprintf("failed to parse snapshot for %s output", mode), err)
+	}
 	return &snap, nil
 }
 
@@ -463,7 +752,7 @@ func ParseResourceList(spec string) (corev1.ResourceList, error) {
 		return nil, nil
 	}
 	result := corev1.ResourceList{}
-	for _, raw := range strings.Split(spec, ",") {
+	for raw := range strings.SplitSeq(spec, ",") {
 		entry := strings.TrimSpace(raw)
 		if entry == "" {
 			continue
@@ -526,6 +815,15 @@ func DefaultTolerations() []corev1.Toleration {
 			Operator: corev1.TolerationOpExists,
 		},
 	}
+}
+
+// effectiveAgentTolerations applies the snapshot agent's scheduling default
+// without collapsing an explicit empty override into that default.
+func effectiveAgentTolerations(tolerations []corev1.Toleration) []corev1.Toleration {
+	if tolerations == nil {
+		return DefaultTolerations()
+	}
+	return tolerations
 }
 
 func validateTaintEffect(effect corev1.TaintEffect) error {
@@ -645,74 +943,31 @@ func ParseTaint(taintStr string) (*corev1.Taint, error) {
 	return taint, nil
 }
 
-// measureWithAgent deploys a Kubernetes Job to capture snapshot on cluster nodes.
+// measureWithAgent deploys a Kubernetes Job to capture snapshot on cluster
+// nodes and writes the result to the user's destination. It is the
+// deploy-then-deliver composition of DeployAndCollect and DeliverSnapshot,
+// which is also what the aicr.Client facade path runs — so both spellings
+// emit the same bytes by construction.
+//
+// One behavior converged when the two paths merged: a snapshot document this
+// binary cannot unmarshal is now an error. Previously this path parsed
+// best-effort (skipping only the GPU-placement warning) and delivered the
+// bytes anyway, while the SDK path already failed. Strict is the correct
+// side to converge on — a document `aicr snapshot` cannot parse is one
+// `aicr validate` and `aicr recipe --snapshot` would reject too, so writing
+// it out and exiting 0 reports a success the artifact cannot back.
 func (n *NodeSnapshotter) measureWithAgent(ctx context.Context) error {
-	slog.Debug("starting agent deployment")
-
-	clientset, err := getKubeClient(n.AgentConfig.Kubeconfig)
+	_, snapshotData, err := DeployAndCollect(ctx, n.AgentConfig)
 	if err != nil {
 		return err
 	}
-
-	// The user's final output destination (file, stdout, or ConfigMap)
-	finalOutput := n.AgentConfig.Output
-
-	// Agent Job always writes to a ConfigMap internally.
-	// If user specified a ConfigMap URI, use that; otherwise use a default ConfigMap.
-	agentOutput := fmt.Sprintf("%s%s/aicr-snapshot", serializer.ConfigMapURIScheme, n.AgentConfig.Namespace)
-	deliverViaConfigMap := strings.HasPrefix(finalOutput, serializer.ConfigMapURIScheme)
-	if deliverViaConfigMap {
-		// User explicitly wants ConfigMap output, use their URI
-		agentOutput = finalOutput
-	}
-
-	snapshotData, err := deployAndWaitForResult(ctx, clientset, n.AgentConfig, agentOutput, deliverViaConfigMap)
-	if err != nil {
-		return err
-	}
-
-	// Post-collection safety net: warn if no GPU data but cluster shows GPU nodes.
-	// Unmarshal into a local Snapshot for the check only; output path uses raw bytes.
-	var snapForCheck Snapshot
-	if unmarshalErr := yaml.Unmarshal(snapshotData, &snapForCheck); unmarshalErr == nil {
-		warnOnGPUPlacementMismatch(&snapForCheck)
-	}
-
-	// If template is specified, process the snapshot through the template
-	if n.AgentConfig.TemplatePath != "" {
-		return n.processWithTemplate(ctx, snapshotData, finalOutput)
-	}
-
-	// Write snapshot to final destination
-	switch {
-	case finalOutput == "" || finalOutput == "-" || finalOutput == serializer.StdoutURI:
-		// Output snapshot data to stdout for consumption by caller. A short write
-		// or broken pipe must surface, not silently drop the snapshot.
-		if _, err := os.Stdout.Write(snapshotData); err != nil {
-			return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot to stdout", err)
-		}
-		if _, err := os.Stdout.Write([]byte("\n")); err != nil {
-			return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot to stdout", err)
-		}
-	case strings.HasPrefix(finalOutput, serializer.ConfigMapURIScheme):
-		// Written by the Job; when --aks-gpu-pools was supplied,
-		// deployAndWaitForResult has already rewritten it with the
-		// merged bytes.
-		slog.Info("snapshot saved to ConfigMap", slog.String("uri", finalOutput))
-	default:
-		// Write to file
-		if err := serializer.WriteToFile(finalOutput, snapshotData); err != nil {
-			return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot to file", err)
-		}
-		slog.Info("snapshot saved to file", slog.String("path", finalOutput))
-	}
-
-	return nil
+	return DeliverSnapshot(ctx, snapshotData, SnapshotDelivery{
+		Output:       n.AgentConfig.Output,
+		TemplatePath: n.AgentConfig.TemplatePath,
+		Kubeconfig:   n.AgentConfig.Kubeconfig,
+	})
 }
 
-// rewriteSnapshotConfigMap re-serializes merged snapshot bytes into the
-// user-requested ConfigMap destination, replacing the pre-merge content the
-// agent Job stored there.
 // rewriteMergedSnapshotConfigMap applies the merged snapshot bytes back to
 // the result ConfigMap and encodes the delivery contract: when the ConfigMap
 // is the user's delivery vehicle (cm:// output) a rewrite failure fails the
@@ -720,7 +975,11 @@ func (n *NodeSnapshotter) measureWithAgent(ctx context.Context) error {
 // carry the merged reading, and a transient Apply failure on the internal
 // hygiene rewrite must not discard an already-captured snapshot.
 func rewriteMergedSnapshotConfigMap(ctx context.Context, uri, kubeconfig string, snapshotData []byte, deliverViaConfigMap bool) error {
-	err := rewriteSnapshotConfigMap(ctx, uri, kubeconfig, snapshotData)
+	// YAML regardless of the caller's --format: this ConfigMap is the
+	// agent-to-controller staging vehicle, and pkg/k8s/agent's GetSnapshot
+	// reads its snapshot.yaml key. When the user asked for a cm://
+	// destination in another format, DeliverSnapshot re-applies it below.
+	err := writeSnapshotConfigMap(ctx, uri, kubeconfig, snapshotData, serializer.FormatYAML)
 	if err == nil {
 		return nil
 	}
@@ -733,24 +992,53 @@ func rewriteMergedSnapshotConfigMap(ctx context.Context, uri, kubeconfig string,
 	return nil
 }
 
-func rewriteSnapshotConfigMap(ctx context.Context, uri, kubeconfig string, snapshotData []byte) error {
+// writeSnapshotConfigMap applies snapshot bytes to a cm://namespace/name
+// destination in the requested format, replacing whatever is there. Shared by
+// DeliverSnapshot (the caller's chosen destination) and the AKS-pool merge
+// rewrite (replacing the pre-merge content the agent Job stored), which pins
+// YAML: pkg/k8s/agent reads the staging ConfigMap's snapshot.yaml key.
+//
+// The format is resolved here as well as in DeliverSnapshot, because the
+// ConfigMap writer coerces an unrecognized format to JSON — an unsupported
+// format must fail, not change the artifact's encoding.
+func writeSnapshotConfigMap(ctx context.Context, uri, kubeconfig string, snapshotData []byte, format serializer.Format) error {
 	namespace, name, err := pod.ParseConfigMapURI(uri)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInvalidRequest, "failed to parse snapshot ConfigMap URI", err)
 	}
-	// Generic-map round trip, same reason as mergeAKSGPUPools: the typed
-	// Snapshot struct would drop fields a newer agent image emitted. The
-	// rawSnapshotDoc wrapper keeps the ConfigMap's kind/version labels
-	// populated from the document header.
-	var doc map[string]any
-	if err := yaml.Unmarshal(snapshotData, &doc); err != nil {
-		return errors.Wrap(errors.ErrCodeInternal, "failed to parse merged snapshot for ConfigMap rewrite", err)
+	format, err = resolveDeliveryFormat(format)
+	if err != nil {
+		return err
 	}
-	writer := serializer.NewConfigMapWriterWithKubeconfig(namespace, name, kubeconfig, serializer.FormatYAML)
-	if err := writer.Serialize(ctx, rawSnapshotDoc{doc: doc}); err != nil {
-		return errors.Wrap(errors.ErrCodeInternal, "failed to rewrite snapshot ConfigMap with AKS GPU pools merge", err)
+	payload, err := configMapPayload(snapshotData, format)
+	if err != nil {
+		return err
+	}
+	writer := serializer.NewConfigMapWriterWithKubeconfig(namespace, name, kubeconfig, format)
+	if err := writer.Serialize(ctx, payload); err != nil {
+		return errors.Wrap(errors.ErrCodeInternal, "failed to write snapshot ConfigMap", err)
 	}
 	return nil
+}
+
+// configMapPayload picks what the ConfigMap writer serializes.
+//
+// YAML and JSON go through the generic-map wrapper, same reason as
+// mergeAKSGPUPools: the typed Snapshot struct would drop fields a newer agent
+// image emitted, and rawSnapshotDoc still exposes the kind/version the writer
+// puts on the ConfigMap's labels. A table is a flattened FIELD/VALUE view the
+// writer derives by reflecting over exported fields, which a generic map
+// collapses into a single row — so that mode hands over the typed struct and
+// accepts the lossy round trip.
+func configMapPayload(snapshotData []byte, format serializer.Format) (any, error) {
+	if format == serializer.FormatTable {
+		return parseSnapshotDocument(snapshotData, "table")
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(snapshotData, &doc); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse snapshot for ConfigMap write", err)
+	}
+	return rawSnapshotDoc{doc: doc}, nil
 }
 
 // rawSnapshotDoc lets a generic snapshot document flow through serializers
@@ -763,6 +1051,16 @@ type rawSnapshotDoc struct {
 
 //nolint:unparam // the (any, error) shape is yaml.Marshaler's fixed contract
 func (r rawSnapshotDoc) MarshalYAML() (any, error) { return r.doc, nil }
+
+// MarshalJSON keeps the no-field-loss guarantee on the JSON path: without it
+// the wrapper has no exported fields and would serialize as "{}".
+func (r rawSnapshotDoc) MarshalJSON() ([]byte, error) {
+	out, err := json.Marshal(r.doc)
+	if err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to serialize snapshot document as JSON", err)
+	}
+	return out, nil
+}
 
 func (r rawSnapshotDoc) GetKind() header.Kind {
 	kind, _ := r.doc["kind"].(string)
@@ -780,8 +1078,10 @@ func (r rawSnapshotDoc) GetMetadata() map[string]string {
 	return out
 }
 
-// processWithTemplate processes snapshot data through a Go template.
-func (n *NodeSnapshotter) processWithTemplate(ctx context.Context, snapshotData []byte, output string) (err error) {
+// deliverWithTemplate renders snapshot data through a Go template. Unlike the
+// other delivery modes this one must parse the document, because the template
+// addresses the Snapshot struct's fields.
+func deliverWithTemplate(ctx context.Context, snapshotData []byte, templatePath, output string) (err error) {
 	// Unmarshal YAML to Snapshot struct
 	var snap Snapshot
 	if err = yaml.Unmarshal(snapshotData, &snap); err != nil {
@@ -789,7 +1089,7 @@ func (n *NodeSnapshotter) processWithTemplate(ctx context.Context, snapshotData 
 	}
 
 	// Create template writer
-	tw, err := serializer.NewTemplateFileWriter(n.AgentConfig.TemplatePath, output)
+	tw, err := serializer.NewTemplateFileWriter(templatePath, output)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to create template writer", err)
 	}

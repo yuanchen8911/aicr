@@ -131,3 +131,14 @@ compute:
             labels:
               nodeGroup: gpu-worker
               dedicated: user-workload
+              # NO gke-no-default-nvidia-gpu-device-plugin label: on GKE the
+              # managed driver install (gpu-driver-version=DEFAULT) is
+              # finalized by an init container of the SAME DaemonSet the
+              # opt-out label disables, so a labeled fresh pool comes up
+              # driverless (staged installer, no kernel module — run
+              # 30930940652). The pool matches the gpuStack profile's
+              # gke-default default (#1761 PR 3), whose constraint requires
+              # the label ABSENT on every GPU node; the label belongs only
+              # to the bundle-installer value, paired with a label-surviving
+              # driver path (gpu-driver-version=disabled + the bundle's
+              # gcp-driver-installer DaemonSet).

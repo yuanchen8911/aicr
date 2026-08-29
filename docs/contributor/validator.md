@@ -10,7 +10,7 @@ contributor view for all four.
 | [**Constraint**](#constraints-declarative) (declarative) | `aicr validate` against a snapshot | Recipe overlay `validation:` block | `pkg/constraints` evaluator (in-process) |
 | [**Container-per-validator check**](#container-per-validator-checks) | `aicr validate` against a live cluster | `validators/<phase>/` + `recipes/validators/catalog.yaml` | One K8s Job per check |
 | [**Component validation**](#component-validations-bundle-time) (bundle-time) | `aicr bundle` | `pkg/bundler/validations/checks.go` + `registry.yaml` `validations:` | In-process Go `ValidationFunc` |
-| [**Chainsaw health check**](#chainsaw-health-checks) | Two surfaces with distinct runtimes: `make check-health` post-deploy locally (shells out to the `chainsaw` CLI installed on the developer's machine), AND `aicr validate --phase deployment` in-cluster (executes the Test format in-process via `validators/chainsaw/inprocess.go` — no external binary in the deployment validator image) | `recipes/checks/<name>/health-check.yaml` | Chainsaw YAML (Test format on both surfaces; raw K8s YAML asserts use the chainsaw Go library inside `assertRawResources`) |
+| [**Chainsaw health check**](#chainsaw-health-checks) | Two surfaces with distinct runtimes: `make check-health` post-deploy locally (shells out to the `chainsaw` CLI installed on the developer's machine), AND `aicr validate --phase deployment` in-cluster (executes the Test format in-process via `pkg/chainsaw/inprocess.go` — no external binary in the deployment validator image) | `recipes/checks/<name>/health-check.yaml` | Chainsaw YAML (Test format on both surfaces; raw K8s YAML asserts use the chainsaw Go library inside `assertRawResources`) |
 
 Rule of thumb: declarative constraint against a snapshot value → surface 1.
 Active probe of a live cluster → surface 2 or 4. Pre-deployment sanity
@@ -44,9 +44,36 @@ spec:
           value: ">= 450"            # GB/s
 ```
 
-Top-level `constraints` are evaluated as a **pre-flight gate** before
-phase checks run; phase-specific `constraints` are evaluated against
-each container check's reported metrics.
+**Declared checks are resolved fail-closed.** Before the cluster is
+prepared or any Job runs, `Validator.preflightDeclaredChecks`
+(`pkg/validator/validator.go`) rejects the run with `ErrCodeInvalidRequest`
+if any declared check name does not resolve to exactly one catalog validator
+in its declared phase — a name matching nothing (typo or a check missing from
+the loaded, possibly `--data`, catalog), a name that exists only under a
+different phase (`nccl-all-reduce-bw` declared under `deployment`), or a name
+declared more than once in one phase's `checks` list. All offenders across
+every requested phase are aggregated into a single error. This closes the
+fail-open path where an all-unmatched phase silently filtered to zero tests →
+`skipped` → nonblocking, letting `aicr validate --fail-on-error` exit `0` on a
+recipe whose required gate the catalog cannot supply
+([#2121](https://github.com/NVIDIA/aicr/issues/2121)). The gate runs in
+`--no-cluster` mode too, so typos are caught in offline recipe validation.
+There is no opt-out: a declared name that resolves nowhere is always an
+authoring error. A check that is *legitimately* not applicable at runtime
+reports its own `skip` sentinel from inside the container — it is still
+declared and still resolves to a catalog entry.
+
+Top-level `constraints` — and any declared under
+`validation.readiness.constraints` — are evaluated as a **pre-flight
+gate** before phase checks run; other phases' `constraints` are
+evaluated against each container check's reported metrics. Readiness
+placement matters for gates that must not participate in
+generation-time overlay filtering. (No shipped overlay currently
+declares one: the GKE device-plugin ownership check, issue #1755,
+briefly lived here before moving into the GKE `gpuStack` profile's
+per-value constraints, which are verified at snapshot-based generation
+(criteria-only generation has no snapshot evaluator and defers entirely
+to the pre-flight) AND re-evaluated by the same readiness pre-flight.)
 
 **Supported operators** (`pkg/constraints/constraint.go`):
 
@@ -67,6 +94,16 @@ falls back to string comparison.
 an error (not `false`) when a value claimed to be a version fails to
 parse — callers in `pkg/validator/validator.go::checkReadiness` treat
 parse errors as `ErrCodeInvalidRequest`, fail-closed.
+
+**One name bypasses the scalar flow entirely:** the node-set form
+`NodeTopology.gpu-nodes.label` ([#1755](https://github.com/NVIDIA/aicr/issues/1755))
+is dispatched by exact name in `constraints.Evaluate` *before*
+`ParseConstraintPath`, uses its own value grammar
+(`<label-key>=<value>` / `!<label-key>`, validated with the Kubernetes
+label validators), and quantifies the predicate over the GPU-node set
+synthesized from `NodeTopology.label` readings instead of comparing a
+single reading. See `pkg/constraints/gpu_nodes.go` for its fail-closed
+rules (truncation, empty universe, malformed or ambiguous encodings).
 
 **Adding a new operator:**
 
@@ -196,6 +233,66 @@ validators.Run(map[string]validators.CheckFunc{
 | **stderr** | Streamed live to the user — use `slog.*` |
 | `/dev/termination-log` | Failure reason (≤ 4096 bytes), written on `return error` |
 | **stdout sentinel lines** | Structured/side-channel data — see [Stdout sentinels](#stdout-sentinels) |
+
+### Capability applicability contract
+
+A capability-gated conformance/performance check probes a live prerequisite
+(a Deployment, CRD, served API group, or non-empty list) before it runs, and
+turns that probe outcome into a verdict via `Capability.Require`
+(`validators/applicability.go`). A `Skip` (exit 2) is a claim that the
+capability is genuinely **inapplicable** — not a way to paper over a missing
+prerequisite or an infrastructure error. The dividing line is whether the
+resolved recipe *declares* the component that supplies the capability:
+`RecipeDeclares(ctx, component)` reports true only when that componentRef is
+present **and** enabled in `ctx.ValidationInput`.
+
+`Require(ctx, probeErr, present)` resolves the fate from the probe outcome.
+`present` is consulted only on a clean read (`probeErr == nil`) — e.g. a `List`
+that returned zero items or a discovery call that did not serve the expected
+group. Probe errors are classified by `classifyCapabilityProbeError`:
+
+| Probe outcome | recipe DECLARES | recipe does NOT declare |
+|---------------|-----------------|-------------------------|
+| clean read, present | `nil` (proceed) | `nil` (proceed) |
+| clean read, absent / empty | **FAIL** (`ErrCodeNotFound`) | **Skip** |
+| probe err: `NotFound` (incl. group-not-served) | **FAIL** (`ErrCodeNotFound`) | **Skip** |
+| probe err: `Forbidden` / `Unauthorized` (401/403) | **FAIL** (`ErrCodeUnauthorized`) — always | **FAIL** (`ErrCodeUnauthorized`) — always |
+| probe err: timeout / deadline | **FAIL** (`ErrCodeTimeout`) — always | **FAIL** (`ErrCodeTimeout`) — always |
+| probe err: transport (503 / conn reset / refused / HTTP2 lost) | **FAIL** (`ErrCodeUnavailable`) — always | **FAIL** (`ErrCodeUnavailable`) — always |
+| probe err: other / aggregated API discovery | **FAIL** (`ErrCodeInternal`) — always | **FAIL** (`ErrCodeInternal`) — always |
+
+**Infrastructure errors never Skip**, even when the recipe does not declare the
+component: a missing RBAC grant, an apiserver timeout, a dropped connection, or
+an aggregated discovery failure is not evidence that the capability is
+inapplicable — it is evidence the validator *could not tell*, which must block
+the gate. Only a clean `NotFound` / empty result on a **non-declared**
+capability is Skip-eligible. (A `Forbidden` on a declared dependency maps to
+`ErrCodeUnauthorized` rather than `ErrCodeInternal` precisely so operators read
+"the validator cannot see it — grant it RBAC," not a blanket internal error.)
+
+**Collection/list probes use `RequireList`.** When the probe is a `List` whose
+*empty result* (not an error) is what signals inapplicability — e.g.
+`detectPlatform` reading `Nodes().List` to classify the cloud — the caller passes
+the List error through `Capability.RequireList(err)` instead of `Require`. A List
+*error* is never Skip-eligible: even the rare `NotFound` shape on a collection
+endpoint is an apiserver/aggregation-layer anomaly, not the clean absence of a
+single object, so every List error blocks with a classified code and never a
+Skip. The empty-result inapplicability case is handled by the caller
+(`len(items) == 0`), keeping `Require`'s Skip path off the error branch entirely.
+
+**#1327 standalone boundary.** A standalone validator run carries no recipe
+context: `pkg/validator/v1.ToValidationInput` leaves `ComponentRefs` empty, so
+`RecipeDeclares` returns false (it is nil-safe on a nil `Context` or nil
+`ValidationInput`). On that path a clean-absent probe still `Skip`s, which
+preserves the capability-driven automatic selection that #1327 introduced.
+Fail-closed fires **only once the recipe actually declares** the dependency —
+declaration is what converts "inapplicable, so Skip" into "promised but missing,
+so fail."
+
+This closes the #2122 false-PASS: before this contract, a recipe that declared a
+capability whose prerequisite was absent — or whose probe hit an auth/timeout/
+transport/discovery error — reported `passed` (via a Skip that read as
+non-blocking), letting a broken or unauthorized cluster clear conformance.
 
 ### Stdout sentinels
 
@@ -467,10 +564,10 @@ return; this is one of the two CLAUDE.md-sanctioned uses of `Background()`.
 
 ### Pre-flight gates are fail-closed
 
-`pkg/validator/validator.go::checkReadiness` evaluates top-level
-`validation.constraints` *before* any phase runs. A parse error or a
-failing constraint returns `ErrCodeInvalidRequest` and aborts the
-entire run. **Do not** `slog.Warn; continue` on an evaluator
+`pkg/validator/validator.go::checkReadiness` evaluates the recipe's
+top-level `constraints` plus any `validation.readiness.constraints`
+*before* any phase runs. A parse error or a failing constraint returns
+`ErrCodeInvalidRequest` and aborts the entire run. **Do not** `slog.Warn; continue` on an evaluator
 error — that masquerades a broken validation YAML as a passing
 constraint, which is an explicit anti-pattern in CLAUDE.md.
 
@@ -514,6 +611,11 @@ tagged with its cordon state, and:
    schedulable count: it is `0` on the all-cordoned and busy-skip
    paths (nothing was attempted yet) and the successful-node count on
    the failure path (a partial pass is not conflated with a full one).
+   Exception: when the recipe declares `Deployment.gpu-driver.version`,
+   those same all-cordoned and busy paths (and the no-GPU-nodes path)
+   fail closed instead of Skip — a declared host-driver floor that
+   cannot be measured must not PASS (#1995). Skip remains only when
+   the floor constraint is absent.
    The `RESULT:` prefix is `pkg/validator/validator.go`'s
    `resultSummaryPrefix` convention: the validator runtime echoes the
    trailing text of any such stdout line into live CLI output via
@@ -525,16 +627,52 @@ tagged with its cordon state, and:
    `RESULT:` prefix makes the coverage figure visible during a live
    `aicr validate` run regardless of redaction, but it is not
    guaranteed to survive into the artifact a downstream consumer
-   verifies by default. See #1951 for carrying this kind of outcome
-   data in a structured field that survives redaction instead.
+   verifies by default. That is why the same counts are ALSO emitted
+   through `validators.EmitExtra` (#1951) — see **Structured coverage
+   survives redaction** below.
 
-This pattern is not yet applied everywhere it could be. Cluster-aggregate
-checks that assert on an operator's aggregate status
-(`gpu-operator-health`) are unaffected — DaemonSet operands ignore
-cordons — but `expected-resources`' `rdmaFabricProbe` is itself
-node-scoped (it calls `helper.FindSchedulableGpuNodes` to build its
-RDMA-capable cohort) and has the same undisclosed narrowing; it has not
-been updated to this pattern. See #1952.
+`expected-resources`' `rdmaFabricProbeCoverage` is itself node-scoped and now
+follows this pattern too (#1952). It enumerates every GPU node via
+`helper.FindGpuNodes`, validates only the schedulable Mellanox
+RDMA-capable cohort for uniform allocatable fabric, but discloses each
+cordoned RDMA-capable node explicitly (`<node>: skipped (cordoned)`),
+counts it in `nodesTotal`, and never narrows the printed total. Because
+the probe is re-run on every poll iteration
+(`verifyRDMAFabricReady`/`pollUntilStable`), the stdout
+enumeration/`RESULT:` line is printed **exactly once at the settled
+terminal outcome** (ready or fail-closed), never per tick. The structured
+Extra is emitted twice: an **eager floor** on the first observation that
+enumerates any RDMA-candidate node (with `nodesValidated=0` — nothing is
+certified mid-poll) and again at the terminal outcome.
+`parseExtraSentinels` keeps the last valid sentinel, so the terminal emit
+wins on a clean exit; the floor exists only so a cordoned-node narrowing
+still reaches the signed bundle if the Job's `activeDeadlineSeconds`
+SIGKILLs the process at the no-margin poll budget before the terminal emit
+runs (#1952). The gate stays fail-closed: "could not observe the fabric"
+reports `0` validated and never reads as ready.
+
+Unlike `check-nvidia-smi`, the RDMA gate never *skips* — it either
+certifies the cohort or fails closed — so it mints no `skipReason`
+enum. Its coverage rides the existing `nodesValidated`/`nodesTotal`
+allowlist keys unchanged (see below), so the redaction
+`PolicyVersion` stays `v2`.
+
+Cluster-aggregate checks that assert on an operator's aggregate status
+(`gpu-operator-health`) remain unaffected — DaemonSet operands ignore
+cordons.
+
+**Structured coverage survives redaction.** The `RESULT:` stdout line
+is echoed to the live CLI but is stripped from a signed bundle by the
+default (`minimal`) redaction policy (`pkg/evidence/redact`), so both
+`check-nvidia-smi` and the RDMA gate ALSO emit the coverage through
+`validators.EmitExtra` as low-cardinality counts
+(`nodesValidated`/`nodesTotal`) or a closed-set `skipReason` code. Those
+keys are the only ones that clear the fail-closed `ctrfExtraAllowlist`
+(a value that structurally looks like a node name or IP is dropped even
+under an allowed key), so a signed bundle records reduced coverage —
+e.g. a cordoned RDMA node narrowing the fabric cohort — without shipping
+any operator-identifying text. Node names appear only in the redacted
+stdout enumeration, never in the Extra channel. See #1951/#1952.
 
 For *deliberate*, durable exclusion of a node from GPU service (as
 opposed to transient cordon-for-maintenance), use the GPU Operator's
@@ -919,13 +1057,72 @@ The same assertion file now powers TWO surfaces:
    loaded into `ComponentRef.HealthCheckAsserts` during recipe
    resolution (PR #1219) and executed by the deployment validator's
    chainsaw runner (PR #1220). Since #1236 the runner is **pure Go**:
-   `validators/chainsaw/inprocess.go` unmarshals the
+   `pkg/chainsaw/inprocess.go` unmarshals the
    `chainsaw.kyverno.io/v1alpha1` Test, walks `spec.steps[].try[]`, and
    dispatches `assert` / `error` to kyverno-json's `checks.Check` engine
    against live cluster state. No external binary is shipped in the
    deployment validator image. CLI output is source-tagged `[chainsaw]`
    vs `[expectedResources]` so operators can disambiguate when both
    paths report on the same component.
+
+Only surface 1 still needs the `chainsaw` binary, and only on the
+developer's machine — that is why `.settings.yaml` keeps the
+`testing_tools.chainsaw` pin and `tools/update-chainsaw-checksums`.
+
+The **readiness gate** (`cmd/gate`, image `ghcr.io/nvidia/aicr-gate`,
+emitted by `aicr bundle --readiness-hooks`) is a third consumer of the
+same executor. It shelled out to an embedded `chainsaw` binary until
+PR #2038 removed it; that binary was the gate image's only source of
+HIGH CVEs and upstream ships no release that fixes them. It calls `chainsaw.Run`
+against a dynamic client built from the Job's read-only ServiceAccount,
+so `pkg/chainsaw` is the single assertion engine for validator and gate
+alike. The gate's `--namespace` flag survives as the default namespace
+for resource blocks that omit one (`defaultNamespaceFetcher` in
+`pkg/chainsawgate/runner`), preserving what `chainsaw --namespace` did.
+
+A Test that declares no `assert`/`error` operation is rejected rather
+than passing vacuously (#2040); a check that is intentionally a no-op —
+today the three `*-ocp-olm` components, whose readiness is enforced by
+the bundler's `--readiness-hooks` gate instead — must say so with the
+`aicr/no-op-check: "true"` annotation on the Test.
+
+Three sibling shapes are rejected for the same reason — each one would
+otherwise report a component healthy without having evaluated what it
+claims to (#2051):
+
+- **Empty content.** A blank, whitespace-only, or comments-and-`---`-only
+  entry has no Test to carry the no-op annotation, and used to reach
+  `assertRawResources` and pass on zero documents.
+- **A mixed stream.** Once any document is a chainsaw Test the whole
+  stream routes to the in-process executor, and nothing else reads it, so
+  a non-Test document alongside it was evaluated by no path at all. Only
+  Test documents may share a stream; a trailing `---`, a comment-only
+  document, and an explicit `null` are punctuation, not content.
+- **Both `assert` and `error` on one operation.** Chainsaw evaluates one
+  action per operation and the executor reaches `assert` first, so the
+  negative check silently never ran. Split them into separate `try`
+  entries.
+
+**Indeterminate is not a verdict.** The gate reports `Unknown`, not
+`Fail`, when a component's state was never established — a discovery
+outage, an apiserver 5xx, a forbidden read. Those surface as
+`ErrCodeUnavailable`, which `pkg/chainsaw` never treats as terminal, so
+it retries for the whole budget and can only surface it once the budget
+runs out. Exit codes are unchanged (`Fail` and `Unknown` gate
+identically), but the distinction points the operator at a broken
+cluster instead of a broken component.
+
+A no-match from the RESTMapper is held to the same standard: it resolves
+to `ErrCodeNotFound` — the immediate-pass path for a negative `error:`
+assertion — only when the retry ran against discovery performed after the
+lookup began *and* the kind's own API group was fully enumerated.
+client-go drops `ErrGroupDiscoveryFailed` whenever partial results exist,
+so a kind in an unreachable group arrives as a bare `NoKindMatchError`;
+`resolveMapping` consults the same cached discovery client the mapper
+resolves through to tell the two apart. The scope is deliberately one
+group: real clusters routinely carry a broken aggregated APIService, and
+treating any partial failure as global would strand every negative
+assertion.
 
 **Registration.** A component opts in by declaring
 `healthCheck.assertFile` in `recipes/registry.yaml`:
@@ -972,12 +1169,12 @@ for the full operator list.
 `assert` and `error` operations. The deployment validator Job runs
 under a ServiceAccount bound to cluster-admin, so registry content is
 restricted at runtime to read-only Chainsaw operations
-(`validators/chainsaw/allowlist.go`). Any other operation (`script`,
+(`pkg/chainsaw/allowlist.go`). Any other operation (`script`,
 `apply`, `create`, `delete`, `patch`, `update`, `wait`, `command`,
 `sleep`, `podLogs`, `events`, `describe`, `get`) is rejected with
-`ErrCodeInvalidRequest`. PR #1223 will add the same enforcement at
-lint time so violations are caught before they ever reach the
-validator.
+`ErrCodeInvalidRequest`, as is an operation that sets both `assert` and
+`error`. PR #1223 will add the same enforcement at lint time so
+violations are caught before they ever reach the validator.
 
 **Value-gate awareness (#1844).** A registry assert file is static — it
 cannot see the component's effective Helm values. That is a problem for a
@@ -1037,13 +1234,27 @@ make validate-local RECIPE=recipe.yaml     # full pipeline in Kind
 
 During `aicr validate --phase deployment`, registry health checks in
 `recipes/checks/<component>/health-check.yaml` run in-process inside
-the `expected-resources` check (`validators/chainsaw/inprocess.go`).
+the `expected-resources` check (`pkg/chainsaw/inprocess.go`).
 
 A Test's `spec.timeouts.assert` is the **whole-Test budget** — one
 deadline shared across every step and retry. Slurm's
 [`health-check.yaml`](https://github.com/NVIDIA/aicr/blob/main/recipes/checks/slinky-slurm/health-check.yaml)
 uses `assert: 7m` so workload-readiness steps can converge before the
 pod-phase guard runs.
+
+The authored value can only **shorten** the caller's budget, never
+extend it: the effective deadline is `min(spec.timeouts.assert,
+caller budget)`. The caller budget is `defaults.ChainsawAssertTimeout`
+for the deployment validator and the gate's `--timeout`
+(`defaults.ReadinessGateExecTimeout`, 2m) for a readiness Job. This
+restores what the removed chainsaw-exec path enforced by wrapping the
+subprocess in an independent outer `context.WithTimeout`; running
+in-process, the authored value had been substituting for the caller
+budget outright, letting registry- or integrator-authored content
+overrun `--timeout` by any factor it chose. No in-tree check changes
+behavior — every authored value is at or below its caller's budget —
+but a readiness test copied from a validator check (`assert: 5m`) is
+now capped at the gate's 2m per evaluation rather than overrunning it.
 
 The `expected-resources` catalog timeout (8m in
 `recipes/validators/catalog.yaml`) is the **outer** envelope. It must
@@ -1060,6 +1271,12 @@ assert budget (`TestExpectedResourcesCatalogEnvelope` guards this).
 `pkg/constraints` is shared by surface 1, surface 2's recipe
 constraints, and the readiness pre-flight gate. The evaluation flow:
 
+0. **Name dispatch.** `constraints.Evaluate` first matches the
+   constraint name against the node-set form
+   `NodeTopology.gpu-nodes.label`
+   ([#1755](https://github.com/NVIDIA/aicr/issues/1755)), which has its
+   own value grammar and evaluator and never reaches the steps below.
+   Every other name proceeds through the scalar flow.
 1. **Parse.** `ParseConstraintExpression(expr)` strips whitespace,
    finds the **longest** matching operator prefix (so `>=` wins over
    `>`), splits into `{Operator, Value}`. Empty value → `ErrCodeInvalidRequest`.

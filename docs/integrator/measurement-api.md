@@ -300,6 +300,101 @@ The constraint path is `K8s.aks-gpu-pools.gpu-driver` in profile value
 constraints; `K8s.aks-gpu-pools.gpu-pool-count` and
 `K8s.aks-gpu-pools.gpu-pools` use the same non-item path form.
 
+## NodeTopology shape
+
+`TypeNodeTopology` is a cluster-wide aggregate: one reading per distinct taint
+and per distinct label across all nodes, plus a `summary` of the counts. The
+`taint` and `label` subtypes carry every reading twice — as `items` (lossless)
+and as the legacy folded `data` map.
+
+```yaml
+type: NodeTopology
+subtypes:
+  - subtype: summary
+    data: {node-count: 8, taint-count: 1, label-count: 3}
+  - subtype: label
+    items:
+      # The folded key is this reading's alone, so the names are not repeated.
+      - context:
+          key: nvidia.com/gpu.product
+          value: NVIDIA-H100-80GB-HBM3
+        data:
+          node-count: 4
+          node-list-ref: nvidia.com/gpu.product
+          truncated: true
+      # Two readings fold onto "zone.us-west" — the label "zone" with value
+      # "us-west", and a label literally named "zone.us-west" — so neither can
+      # reference it and both carry their own names.
+      - context: {key: zone, value: us-west}
+        data: {node-count: 1, node-list: gpu-node-01, truncated: false}
+      - context: {key: zone.us-west, value: "true"}
+        data: {node-count: 2, node-list: "gpu-node-01,gpu-node-02", truncated: false}
+    data:
+      nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3|gpu-node-01,gpu-node-02 (+2 more)
+      zone.us-west: true|gpu-node-01,gpu-node-02
+```
+
+| Field | Where | Required | Meaning |
+|---|---|---|---|
+| `key` | context | yes | taint or label key, verbatim |
+| `value` | context | no | taint or label value; may be empty |
+| `effect` | context | taints only | `NoSchedule`, `PreferNoSchedule`, `NoExecute` |
+| `node-count` | data | yes | nodes carrying the reading, counted **before** truncation |
+| `node-list` | data | one of these | node names, sorted and comma-joined, capped by `--max-nodes-per-entry` |
+| `node-list-ref` | data | one of these | the `data` key holding this reading's names |
+| `truncated` | data | yes | whether the cap dropped names from the node list |
+
+An item that omits a required field is rejected.
+
+**Membership has exactly one source.** An item carries `node-list` or
+`node-list-ref`, never both and never neither — node lists dominate snapshot
+size, so a reading whose folded key describes it alone points at that entry
+rather than repeating the names. A reference is honored only when it names the
+key this reading folds onto *and* no other reading folds onto that key;
+anything else would resolve to a different reading's nodes. Where two readings
+collide on one key, both carry their own names, because the shared entry can
+describe only one of them and which one is not predictable.
+
+The count and the list must agree:
+
+- `truncated` is `true` exactly when the node list ends with `(+N more)`
+- `node-count` equals the names in the list plus `N` (with `N` zero when complete)
+
+A count that disagrees is rejected in both directions: too low understates the
+cluster, too high lets a consumer read a partial list as a complete one. A
+marker whose `N` is unusable is rejected rather than read as absent.
+
+`effect` is not checked against the three values listed above, so a snapshot
+from a newer Kubernetes stays readable.
+
+Consumers do not implement any of this: `topology.LabelReadings` and
+`TaintReadings` resolve references and validate them, and return readings whose
+`Nodes` are populated either way.
+
+`key`, `effect`, and `value` identify a reading, so they live in `context`;
+node membership is counted, so it lives in `data`. Items are sorted by
+(`key`, `value`) for labels and (`key`, `effect`, `value`) for taints, because
+`pkg/diff` compares items positionally. `summary.taint-count` and
+`summary.label-count` count items, not `data` keys.
+
+`data` is retained byte-identical to earlier releases and stays lossy: a label
+key carrying multiple values is folded to `<key>.<value>`, which collides with
+a label literally named that and drops one reading. Consumers read `items` and
+fall back to `data` only for older snapshots — `topology.LabelReadings` /
+`TaintReadings` do exactly that, and `HasLosslessReadings` reports which form a
+subtype carries. Adding `items` beside `data` is additive-only, so the snapshot
+`apiVersion` is unchanged ([ADR-011](../design/011-artifact-apiversion-policy.md) §2).
+
+`data` cannot be slimmed within `v1alpha2`: binaries predating `items` read it
+directly, and ADR-011 requires its encoding and semantics to stay as published.
+That is why membership is cross-referenced rather than dropped. The next
+snapshot `apiVersion` removes `data`, at which point items become
+self-contained and `node-list-ref` is no longer emitted — the decoder keeps
+reading it for as long as `v1alpha2` snapshots are accepted.
+
+Minimal evidence keeps `NodeTopology.summary` and drops `taint` and `label`;
+redaction never carries `items` across the publication boundary.
+
 ## NetworkTopology shape
 
 `TypeNetworkTopology` describes one hardware group's network layout (PFs,
@@ -410,6 +505,65 @@ Key resolution inside the chosen `ItemEntry`:
 - `Data` is consulted first (returns `Reading.String()`).
 - `Context` is consulted next (returns the string directly).
 - Missing key returns `ErrCodeNotFound`.
+
+### Addressable paths and the catalog
+
+`pkg/measurement/catalog.go` is the authority for which constraint paths are
+*addressable* — which `{Type, Subtype, Key}` triples a supported producer can
+emit and a path form can name — and `measurement.ValidatePath` is the check.
+Recipe loading applies it to every constraint name, so a path no producer could
+ever satisfy fails at load rather than degrading to `ErrCodeNotFound` at
+evaluation time ([#1783](https://github.com/NVIDIA/aicr/issues/1783)).
+
+Addressability is a static contract, not a claim about any snapshot. A path
+`ValidatePath` accepts can still return `ErrCodeNotFound` from extraction when
+the reading is genuinely absent — a cluster with no GPU pools emits no
+`K8s.aks-gpu-pools.gpu-driver` — and that remains the designed
+graceful-exclusion signal.
+
+The catalog models two independent address spaces per subtype, because
+extraction reads them from different places:
+
+| Space | Path form | Source |
+|-------|-----------|--------|
+| Scalar | `{Type}.{Subtype}.{Key}` | `Subtype.Data` |
+| Item | `{Type}.{Subtype}[<selector>].{Key}` | `ItemEntry.Data`, then `ItemEntry.Context` |
+
+**Where the subtype ends is Type-dependent.** `{Type}.{Subtype}.{Key}` is
+ambiguous when both parts may contain dots, so the catalog resolves it:
+
+| Type | Split | Rationale |
+|------|-------|-----------|
+| `SystemD` | last dot | the subtype IS a unit name (`containerd.service`); D-Bus property keys carry no dot |
+| everything else | first dot | subtype names carry no dot, so dotted *keys* resolve — `OS.sysctl./proc/sys/kernel/osrelease`, `NodeTopology.label.nvidia.com/gpu.present` |
+
+The bracket form needs no rule: `[` delimits the subtype explicitly.
+
+Consequences worth stating explicitly:
+
+- **`Subtype.Context` is never addressable.** It is emitted and it appears in
+  the snapshot, but no path form reads it, so the catalog deliberately omits
+  those keys. `NetworkTopology.identity.linkType` is rejected.
+- A subtype with an empty scalar space (e.g. `pfs`) rejects selector-free
+  paths; a subtype with no items rejects selector paths.
+- A predicate key is validated against the same item space as the result key,
+  since `itemMatchesPredicate` and the key lookup read the same fields.
+- Each space is either a closed key set or open (producer-defined). Open spaces
+  cover `/etc/os-release` fields, sysctl paths, image names, node label/taint
+  keys, and systemd unit names.
+
+**What a producer change requires here depends on the space it touches:**
+
+| Producer change | Catalog change |
+|-----------------|----------------|
+| New subtype | Required — an unlisted subtype fails at load unless its Type is open-subtype |
+| New key in a **closed** space | Required — an unlisted key fails at load |
+| New key in an **open** space | None — open spaces already accept producer-defined keys |
+| Space becomes addressable a new way (items added to a scalar-only subtype, subtype names start carrying dots) | Required — the addressing rules change |
+
+Omitting a required entry does not weaken a check; it makes a legitimate
+constraint path fail at load for whoever first writes it. When a key space is
+not provably fixed, declare it open rather than guessing a closed set.
 
 ## Stability contract
 

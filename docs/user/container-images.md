@@ -38,13 +38,16 @@ _Rendering fidelity:_ `catalog-parity: charts are rendered with the shared recip
 | cert-manager | helm | jetstack/cert-manager | v1.20.2 | 4 |
 | dynamo-platform | helm | dynamo-platform | 1.4.1 | 1 |
 | gatekeeper | helm | gatekeeper/gatekeeper | 3.22.2 | 3 |
+| gcp-driver-installer | manifest | — | — | 3 |
 | gke-nccl-tcpxo | manifest | — | — | 4 |
 | gpu-operator | helm | nvidia/gpu-operator | v26.3.3 | 15 |
 | gpu-operator-ocp | manifest | — | — | 0 |
 | gpu-operator-ocp-olm | manifest | — | — | 0 |
 | grove | helm | grove-charts | v0.1.0-alpha.8 | 1 |
+| k8s-aibom | helm | k8s-aibom | 1.3.0 | 1 |
 | k8s-ephemeral-storage-metrics | helm | k8s-ephemeral-storage-metrics/k8s-ephemeral-storage-metrics | 1.19.2 | 1 |
 | k8s-nim-operator | helm | k8s-nim-operator | 3.1.0 | 1 |
+| k8s-nim-operator-ocp | helm | k8s-nim-operator | 3.1.0 | 1 |
 | kai-scheduler | helm | kai-scheduler | v0.14.1 | 11 |
 | kube-prometheus-stack | helm | prometheus-community/kube-prometheus-stack | 84.4.0 | 8 |
 | kubeflow-trainer | helm | kubeflow-trainer | 2.2.0 | 3 |
@@ -66,7 +69,7 @@ _Rendering fidelity:_ `catalog-parity: charts are rendered with the shared recip
 | slinky-slurm | helm | slurm | 1.2.0 | 5 |
 | slinky-slurm-operator | helm | slurm-operator | 1.2.0 | 2 |
 | slinky-slurm-operator-crds | helm | slurm-operator-crds | 1.2.0 | 0 |
-| slinky-topograph | helm | topograph/topograph | 0.5.0 | 1 |
+| slinky-topograph | helm | topograph/topograph | 1.0.0 | 1 |
 | slurm-accounting-mariadb | helm | mariadb-cluster | 26.6.0 | 0 |
 
 ## Version variants
@@ -105,6 +108,14 @@ _No images extracted._
 - `quay.io/jetstack/cert-manager-startupapicheck:v1.20.2`
 - `quay.io/jetstack/cert-manager-webhook:v1.20.2`
 
+### cert-manager-ocp
+
+_No images extracted._
+
+### cert-manager-ocp-olm
+
+_No images extracted._
+
 ### dynamo-platform
 
 - `nvcr.io/nvidia/ai-dynamo/kubernetes-operator:1.4.1`
@@ -115,16 +126,22 @@ _No images extracted._
 - `openpolicyagent/gatekeeper-crds:v3.22.2`
 - `openpolicyagent/gatekeeper:v3.22.2`
 
+### gcp-driver-installer
+
+- `cos-nvidia-installer:fixed`
+- `gcr.io/gke-release/nvidia-partition-gpu@sha256:e226275da6c45816959fe43cde907ee9a85c6a2aa8a429418a4cadef8ecdb86a`
+- `gke.gcr.io/pause:3.8@sha256:880e63f94b145e46f1b1082bb71b85e21f16b99b180b9996407d61240ceb9830`
+
 ### gke-nccl-tcpxo
 
 - `gcr.io/gke-release/nri-device-injector:1.0.25-gke.6@sha256:7704e2bd74b8edbb76b6913c7904cc2362f1fa887c4d4aba7b19778ea353537c`
 - `gke.gcr.io/pause:3.8@sha256:880e63f94b145e46f1b1082bb71b85e21f16b99b180b9996407d61240ceb9830`
-- `ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb`
+- `ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b`
 - `us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/nccl-plugin-gpudirecttcpx-dev:v1.0.15@sha256:4c9f0de3f39455a2ea35e844e0fc92564ca5629f6b03250fde40e8160719dae4`
 
 ### gpu-operator
 
-- `docker.io/library/busybox:1.38.0@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d`
+- `docker.io/library/busybox:1.38.0@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616`
 - `nvcr.io/nvidia/cloud-native/dcgm:4.5.2-1-ubuntu22.04`
 - `nvcr.io/nvidia/cloud-native/gdrdrv:v2.5.2`
 - `nvcr.io/nvidia/cloud-native/k8s-cc-manager:v0.4.0`
@@ -152,11 +169,19 @@ _No images extracted._
 
 - `ghcr.io/ai-dynamo/grove/grove-operator:v0.1.0-alpha.8`
 
+### k8s-aibom
+
+- `ghcr.io/googlecloudplatform/k8s-aibom@sha256:f8e48d4edc44e6ee8e40a2ac6c5f60b190aa18d411a75702dc5798a77a039e8d`
+
 ### k8s-ephemeral-storage-metrics
 
 - `ghcr.io/jmcgrath207/k8s-ephemeral-storage-metrics:1.19.2`
 
 ### k8s-nim-operator
+
+- `nvcr.io/nvidia/cloud-native/k8s-nim-operator:v3.1.0`
+
+### k8s-nim-operator-ocp
 
 - `nvcr.io/nvidia/cloud-native/k8s-nim-operator:v3.1.0`
 
@@ -205,7 +230,7 @@ _No images extracted._
 
 ### network-operator
 
-- `docker.io/library/busybox:1.38.0@sha256:fd8d9aa63ba2f0982b5304e1ee8d3b90a210bc1ffb5314d980eb6962f1a9715d`
+- `docker.io/library/busybox:1.38.0@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616`
 - `nvcr.io/nvidia/cloud-native/network-operator:v26.4.1`
 - `nvcr.io/nvidia/doca/doca_telemetry:1.22.5-doca3.1.0-host`
 - `nvcr.io/nvidia/mellanox/doca-driver:doca3.2.0-25.10-1.2.8.0-2`
@@ -249,20 +274,28 @@ _No images extracted._
 
 - `registry.k8s.io/dra-driver-nvidia/dra-driver-nvidia-gpu:v0.4.1`
 
+### nvidia-dra-driver-gpu-ocp
+
+- `registry.k8s.io/dra-driver-nvidia/dra-driver-nvidia-gpu:v0.4.1`
+
 ### nvsentinel
 
-- `ghcr.io/nvidia/nvsentinel/gpu-health-monitor:v1.9.0-dcgm-3.x`
-- `ghcr.io/nvidia/nvsentinel/gpu-health-monitor:v1.9.0-dcgm-4.x`
-- `ghcr.io/nvidia/nvsentinel/labeler:v1.9.0`
-- `ghcr.io/nvidia/nvsentinel/metadata-collector:v1.9.0`
-- `ghcr.io/nvidia/nvsentinel/platform-connectors:v1.9.0`
-- `ghcr.io/nvidia/nvsentinel/syslog-health-monitor:v1.9.0`
+- `ghcr.io/nvidia/nvsentinel/gpu-health-monitor:v1.20.0-dcgm-3.x`
+- `ghcr.io/nvidia/nvsentinel/gpu-health-monitor:v1.20.0-dcgm-4.x`
+- `ghcr.io/nvidia/nvsentinel/labeler:v1.20.0`
+- `ghcr.io/nvidia/nvsentinel/metadata-collector:v1.20.0`
+- `ghcr.io/nvidia/nvsentinel/platform-connectors:v1.20.0`
+- `ghcr.io/nvidia/nvsentinel/syslog-health-monitor:v1.20.0`
 
 ### prometheus-adapter
 
 > Warning: [INTERNAL] helm template failed: signal: killed
 
 _No images extracted._
+
+### prometheus-adapter-ocp
+
+- `registry.k8s.io/prometheus-adapter/prometheus-adapter:v0.12.0`
 
 ### prometheus-operator-crds
 
@@ -287,7 +320,7 @@ _No images extracted._
 
 ### slinky-topograph
 
-- `ghcr.io/nvidia/topograph:v0.5.0`
+- `ghcr.io/nvidia/topograph:v1.0.0`
 
 ### slurm-accounting-mariadb
 
@@ -311,6 +344,10 @@ _No images extracted._
 ### Explicit vs. implicit images
 
 AICR pins some images directly in this repository — in `recipes/components/<name>/values.yaml` or in embedded Kubernetes manifests under `recipes/components/<name>/manifests/`. Those are the **explicit** images. Everything else comes from upstream Helm charts that AICR consumes without overriding their image references; those are the **implicit** images. The per-component image counts in the table above reflect the union of both.
+
+**OLM-managed components are a third, uninventoried category.** `cert-manager-ocp`, `cert-manager-ocp-olm`, `gpu-operator-ocp`, `gpu-operator-ocp-olm`, `network-operator-ocp`, `network-operator-ocp-olm`, `nfd-ocp`, and `nfd-ocp-olm` install their operator and operand images by resolving a ClusterServiceVersion (CSV) through the Red Hat OperatorHub catalog at install time — not from a local `values.yaml` or vendored manifest. This BOM cannot enumerate those images: they aren't declared anywhere in this repository, and the actual image digests are pinned by whichever CSV version OLM resolves from the subscribed channel on the target cluster. The `0`-image rows for these components in the table above reflect that gap, not an empty deployment.
+
+Air-gapped OpenShift deployments must separately mirror the relevant Red Hat certified-operator catalog (`redhat-operators`) alongside the images this BOM does track. See the [OpenShift documentation on mirroring Operator catalogs](https://docs.openshift.com/container-platform/latest/operators/admin/olm-restricted-networks.html) and this repo's [air-gap mirroring guide](https://github.com/NVIDIA/aicr/issues/743) for the OLM-specific mirroring workflow.
 
 The trade-off is intentional. Pinning an image gives reproducibility; deferring to the upstream chart lets security patches flow without an AICR release. The split is policy, not oversight — see the [supply chain epic](https://github.com/NVIDIA/aicr/issues/739) for how each component's policy is being made explicit.
 

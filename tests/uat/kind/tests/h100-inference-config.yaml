@@ -57,6 +57,11 @@ spec:
       target: ./bundle
     deployment:
       deployer: helmfile
+      # No NVSentinel override: the kind overlay assigns
+      # labeler.assumeDriverInstalled itself (#2181), so this lane exercises
+      # the recipe supplying the remedy unaided. Kind is host-installed via
+      # nvkind (driver.enabled=false), so no driver pod exists for the
+      # labeler to observe and the value is required.
     scheduling:
       acceleratedNodeTolerations:
         - nvidia.com/gpu=present:NoSchedule

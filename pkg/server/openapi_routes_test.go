@@ -1,0 +1,382 @@
+// Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// REST is one of the four surfaces ROADMAP §1 freezes at v1, and
+// api/aicr/v1/server.yaml is its declared contract. Until this file, nothing in
+// the tree read that spec for routing purposes: no workflow, no Makefile target,
+// and no tool validated it, diffed it, or checked it against the handlers. The
+// published contract and the running server were free to drift, and did — #1943
+// had to retroactively align the spec with what the handler actually accepted.
+//
+// These tests close the routing half of that gap (issue #2112). They are
+// deliberately derived from the spec rather than from a hand-maintained list:
+// TestRouteConfiguration in serve_test.go already pins the six application
+// routes by hand, which catches a deleted route but cannot catch a route the
+// spec promises and the server never registers.
+//
+// Scope: paths and methods only. Request and response *shapes* are covered by
+// the contract tests in openapi_sync_test.go, and the breaking-change diff gate
+// against a committed baseline is the remaining part of #2112 — that baseline
+// cannot be captured until #2417 removes the alpha apiVersion enum values, or
+// it would fail on its own planned removal.
+
+const specRelPath = "../../api/aicr/v1/server.yaml"
+
+// httpMethods are the operation keys OpenAPI allows under a path item. Anything
+// else at that level (parameters, summary, servers, $ref) is not an operation.
+var httpMethods = map[string]bool{
+	"get": true, "put": true, "post": true, "delete": true,
+	"options": true, "head": true, "patch": true, "trace": true,
+}
+
+// specOperations returns the spec's declared path -> sorted uppercase methods.
+func specOperations(t *testing.T) map[string][]string {
+	t.Helper()
+
+	data, err := os.ReadFile(filepath.Clean(specRelPath))
+	if err != nil {
+		t.Fatalf("read spec %q: %v", specRelPath, err)
+	}
+
+	var spec struct {
+		Paths map[string]map[string]yaml.Node `yaml:"paths"`
+	}
+	if err := yaml.Unmarshal(data, &spec); err != nil {
+		t.Fatalf("parse spec: %v", err)
+	}
+	if len(spec.Paths) == 0 {
+		t.Fatal("spec declares no paths; the parse shape is wrong and every " +
+			"assertion below would pass vacuously")
+	}
+
+	ops := make(map[string][]string, len(spec.Paths))
+	for path, item := range spec.Paths {
+		var methods []string
+		for key := range item {
+			if httpMethods[strings.ToLower(key)] {
+				methods = append(methods, strings.ToUpper(key))
+			}
+		}
+		sort.Strings(methods)
+		ops[path] = methods
+	}
+	return ops
+}
+
+// newSpecTestServer builds a server wired exactly as Serve wires it, with rate
+// limiting effectively disabled.
+//
+// The method tests below send many requests through one server. At the default
+// limit they would start collecting 429s, and a 429 is neither the 405 nor the
+// not-405 those tests assert — the suite would report contract violations that
+// are really throttling. Raising the limit keeps the assertions about methods.
+func newSpecTestServer(t *testing.T) *Server {
+	t.Helper()
+
+	cfg := parseConfig()
+	cfg.Handlers = newRoutes(newTestHandler(t, nil), newTestBundleHandler(t))
+	cfg.RateLimit = 1e6
+	cfg.RateLimitBurst = 1e6
+	return New(withConfig(cfg))
+}
+
+// registeredPaths returns every path the server actually serves.
+//
+// The set comes from Server.routePaths, recorded as New registers each pattern
+// via s.handle. That covers cooperating registrations only — a raw
+// mux.HandleFunc would be served and never recorded — so the invariant is
+// enforced separately at the source by TestMuxRegistrationsGoThroughHandle. Two earlier revisions of
+// this helper were wrong in exactly that way: reading newRoutes alone missed the
+// root "/" handler installed by configureRootHandler, and the hand-maintained
+// systemRoutes list that replaced it would have missed any future route wired
+// directly in New -- which is where the system endpoints already live.
+func registeredPaths(t *testing.T) map[string]bool {
+	t.Helper()
+
+	s := newSpecTestServer(t)
+	if len(s.routePaths) == 0 {
+		t.Fatal("server recorded no routes; every assertion below would pass vacuously")
+	}
+
+	paths := make(map[string]bool, len(s.routePaths))
+	for _, path := range s.routePaths {
+		paths[path] = true
+	}
+	return paths
+}
+
+// probeMethods is every method the spec's own operation vocabulary allows, so a
+// path that quietly answers OPTIONS or HEAD cannot escape the undeclared-method
+// check by being outside a hand-picked probe list.
+func probeMethods() []string {
+	methods := make([]string, 0, len(httpMethods))
+	for m := range httpMethods {
+		methods = append(methods, strings.ToUpper(m))
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+// TestOpenAPISpecPathsMatchRegisteredRoutes asserts the published contract and
+// the running server describe the same set of paths, in both directions.
+//
+// A spec path with no route is a promise the server does not keep: a client
+// generated from the spec gets a 404 on an endpoint the contract advertises. A
+// route missing from the spec is an undocumented public endpoint that the
+// forthcoming breaking-change gate would never protect, because a gate cannot
+// diff what the baseline never contained.
+func TestOpenAPISpecPathsMatchRegisteredRoutes(t *testing.T) {
+	ops := specOperations(t)
+	registered := registeredPaths(t)
+
+	var promisedButNotRouted, routedButNotDocumented []string
+
+	for path := range ops {
+		if !registered[path] {
+			promisedButNotRouted = append(promisedButNotRouted, path)
+		}
+	}
+	for path := range registered {
+		if _, ok := ops[path]; !ok {
+			routedButNotDocumented = append(routedButNotDocumented, path)
+		}
+	}
+	sort.Strings(promisedButNotRouted)
+	sort.Strings(routedButNotDocumented)
+
+	for _, path := range promisedButNotRouted {
+		t.Errorf("api/aicr/v1/server.yaml declares %q but pkg/server registers no "+
+			"such route; a client generated from the spec would get a 404", path)
+	}
+	for _, path := range routedButNotDocumented {
+		t.Errorf("pkg/server serves %q but api/aicr/v1/server.yaml does not declare "+
+			"it; an undocumented endpoint cannot be protected by the REST "+
+			"breaking-change gate", path)
+	}
+}
+
+// TestOpenAPIDeclaredMethodsAreNotRejected asserts no method the spec declares
+// is refused as unsupported by the handler behind that path.
+//
+// The oracle is deliberately narrow, and the name says so rather than promising
+// more: it checks only that the response is not 405. A documented operation may
+// legitimately answer 400 for a request this test does not populate, and one
+// that 500s still passes here. Asserting success codes would turn this into a
+// fixture treadmill for every endpoint's required inputs, which is a different
+// test with a different maintenance cost.
+func TestOpenAPIDeclaredMethodsAreNotRejected(t *testing.T) {
+	ops := specOperations(t)
+	// Drive the assembled mux, not the bare handler map. /, /health, /ready and
+	// /metrics are registered outside newRoutes, so a handler-map loop skips the
+	// four routes most likely to be forgotten.
+	mux := newSpecTestServer(t).httpServer.Handler
+
+	paths := make([]string, 0, len(ops))
+	for path := range ops {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		if len(ops[path]) == 0 {
+			t.Errorf("spec path %q declares no HTTP operations", path)
+			continue
+		}
+
+		for _, method := range ops[path] {
+			t.Run(method+" "+path, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+
+				if rec.Code == http.StatusMethodNotAllowed {
+					t.Errorf("spec declares %s %s but the server answers 405; "+
+						"the published contract advertises an operation the "+
+						"server rejects", method, path)
+				}
+			})
+		}
+	}
+}
+
+// TestOpenAPIUndeclaredMethodsAreRejected asserts the contract is not narrower
+// than the server: a method the spec omits must not quietly work.
+//
+// This is the direction that rots silently. An endpoint that accepts POST while
+// the spec documents only GET is an undocumented, ungated public operation, and
+// nothing else in the tree would notice.
+//
+// A deviation this pins, deliberately: HEAD is rejected on /health, /ready, and
+// the v1/v2 endpoints, because their handlers gate on r.Method != GET. RFC 9110
+// §9.1 makes GET and HEAD mandatory for a general-purpose server, so that is a
+// standing wart — pre-existing, not introduced here, and left alone rather than
+// widened as a side effect of a conformance test. /metrics is the exception: it
+// accepted HEAD before this gate existed, so it declares head: and readOnly
+// honors it. If the others are aligned later, declare head: for them too rather
+// than deleting this assertion.
+func TestOpenAPIUndeclaredMethodsAreRejected(t *testing.T) {
+	ops := specOperations(t)
+	mux := newSpecTestServer(t).httpServer.Handler
+
+	// Every public route, not just the application ones: /health, /ready and
+	// /metrics are registered straight onto the mux, and an undeclared method
+	// quietly working there is exactly as much of an ungated operation.
+	registered := registeredPaths(t)
+	paths := make([]string, 0, len(registered))
+	for path := range registered {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+
+	for _, path := range paths {
+		declared := make(map[string]bool, len(ops[path]))
+		for _, m := range ops[path] {
+			declared[m] = true
+		}
+
+		for _, method := range probeMethods() {
+			if declared[method] {
+				continue
+			}
+			t.Run(method+" "+path, func(t *testing.T) {
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+
+				if rec.Code != http.StatusMethodNotAllowed {
+					t.Errorf("%s %s is not declared in api/aicr/v1/server.yaml but "+
+						"the server answered %d instead of 405; either document "+
+						"the operation or reject it", method, path, rec.Code)
+				}
+			})
+		}
+	}
+}
+
+// TestMetricsMethodRejectionIsStructured pins the 405 body shape on /metrics.
+//
+// An earlier revision used http.Error, which writes a bare string, while the
+// seven other 405 sites in this package — including handleHealth and
+// handleReady, registered on the same mux — return the structured envelope.
+// A client parsing the error for one system endpoint would have received JSON
+// from /health and plain text from /metrics for the identical condition.
+func TestMetricsMethodRejectionIsStructured(t *testing.T) {
+	mux := newSpecTestServer(t).httpServer.Handler
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodDelete, "/metrics", nil))
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want JSON to match the other 405 sites", ct)
+	}
+	if allow := rec.Header().Get("Allow"); !strings.Contains(allow, http.MethodGet) ||
+		!strings.Contains(allow, http.MethodHead) {
+
+		t.Errorf("Allow = %q, want it to advertise GET and HEAD", allow)
+	}
+
+	// HEAD must reach promhttp rather than being refused (RFC 9110 §9.1).
+	headRec := httptest.NewRecorder()
+	mux.ServeHTTP(headRec, httptest.NewRequest(http.MethodHead, "/metrics", nil))
+	if headRec.Code != http.StatusOK {
+		t.Errorf("HEAD /metrics = %d, want 200", headRec.Code)
+	}
+}
+
+// TestMuxRegistrationsGoThroughHandle is what actually closes the gap that
+// Server.routePaths only appears to close.
+//
+// routePaths records a pattern when it is registered *via s.handle*. A raw
+// mux.HandleFunc("/debug", ...) written directly in New bypasses the recording,
+// so the route is served, absent from routePaths, and therefore invisible to
+// all three conformance tests above — the exact scenario those tests exist to
+// catch. An earlier revision of this file claimed the route set "cannot drift";
+// that claim was only true for registrations that already cooperated, and the
+// mutation used to check it went through s.handle, so it proved the recording
+// path worked rather than that the bypass was caught.
+//
+// Go's http.ServeMux exposes no way to enumerate its patterns, so the invariant
+// cannot be verified at runtime. It is enforced at the source instead: every
+// mux.Handle / mux.HandleFunc call site must live inside the handle helper.
+func TestMuxRegistrationsGoThroughHandle(t *testing.T) {
+	t.Parallel()
+
+	const src = "server.go"
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", src, err)
+	}
+
+	// Locate the helper's body so call sites inside it can be excluded.
+	var helperStart, helperEnd token.Pos
+	ast.Inspect(file, func(n ast.Node) bool {
+		fn, ok := n.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != "handle" || fn.Recv == nil {
+			return true
+		}
+		helperStart, helperEnd = fn.Pos(), fn.End()
+		return false
+	})
+	if !helperStart.IsValid() {
+		t.Fatal("could not find func (s *Server) handle; this test cannot enforce its invariant")
+	}
+
+	var offenders []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || (sel.Sel.Name != "Handle" && sel.Sel.Name != "HandleFunc") {
+			return true
+		}
+		recv, ok := sel.X.(*ast.Ident)
+		if !ok || recv.Name != "mux" {
+			return true
+		}
+		if call.Pos() >= helperStart && call.Pos() < helperEnd {
+			return true // the one legitimate site
+		}
+		offenders = append(offenders,
+			fmt.Sprintf("%s: mux.%s", fset.Position(call.Pos()), sel.Sel.Name))
+		return true
+	})
+
+	for _, o := range offenders {
+		t.Errorf("%s registers a route without going through s.handle, so it is "+
+			"absent from Server.routePaths and invisible to the OpenAPI route "+
+			"conformance tests; use s.handle(mux, pattern, handler) instead", o)
+	}
+}

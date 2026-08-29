@@ -29,6 +29,7 @@ import (
 
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
 	"gopkg.in/yaml.v3"
 )
 
@@ -220,19 +221,29 @@ func buildMetadataStore(ctx context.Context, provider DataProvider) (*MetadataSt
 			if readErr != nil {
 				return aicrerrors.Wrap(aicrerrors.ErrCodeInternal, fmt.Sprintf("failed to read mixin %s", path), readErr)
 			}
+			var mixinHeader RecipeMetadataHeader
+			if parseErr := yaml.Unmarshal(content, &mixinHeader); parseErr != nil {
+				return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
+					fmt.Sprintf("failed to parse mixin header %s", path), parseErr)
+			}
+			if headerErr := validateRecipeMixinCatalogHeader(
+				mixinHeader.Kind, mixinHeader.APIVersion, path,
+			); headerErr != nil {
+				return headerErr
+			}
 			var mixin RecipeMixin
 			decoder := yaml.NewDecoder(bytes.NewReader(content))
 			decoder.KnownFields(true)
 			if parseErr := decoder.Decode(&mixin); parseErr != nil {
 				return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf("failed to parse mixin %s (unknown fields are not allowed)", path), parseErr)
 			}
-			if mixin.Kind != RecipeMixinKind {
-				return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-					fmt.Sprintf("mixin file %s has wrong kind %q, expected %q", path, mixin.Kind, RecipeMixinKind))
-			}
 			if _, exists := store.Mixins[mixin.Metadata.Name]; exists {
 				return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 					fmt.Sprintf("duplicate mixin name %q in %s", mixin.Metadata.Name, path))
+			}
+			if pathErr := validateConstraintPaths(
+				mixin.Spec.Constraints, path, locSpecConstraints); pathErr != nil {
+				return pathErr
 			}
 			store.Mixins[mixin.Metadata.Name] = &mixin
 			slog.Debug("loaded mixin", "name", mixin.Metadata.Name, "path", path)
@@ -270,28 +281,24 @@ func buildMetadataStore(ctx context.Context, provider DataProvider) (*MetadataSt
 		if parseErr := yaml.Unmarshal(content, &metadataHeader); parseErr != nil {
 			return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, fmt.Sprintf("failed to parse header for %s", path), parseErr)
 		}
-		if metadataHeader.APIVersion == RecipeProfileAPIVersion &&
-			metadataHeader.Kind != RecipeMetadataKind {
-
-			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-				fmt.Sprintf("profile catalog file %s requires kind %q, got %q",
-					path, RecipeMetadataKind, metadataHeader.Kind))
+		isRecipeMetadata, profileVersion, headerErr := classifyRecipeMetadataCatalogHeader(
+			&metadataHeader, path,
+		)
+		if headerErr != nil {
+			return headerErr
 		}
-		// Skip files with a different kind (e.g., ValidatorCatalog) only
-		// after the profile apiVersion has been gated. A misspelled kind on a
-		// v1alpha3 profile overlay must not silently remove the declaration.
-		if metadataHeader.Kind != "" && metadataHeader.Kind != RecipeMetadataKind {
+		if !isRecipeMetadata {
 			slog.Debug("skipping non-recipe YAML", "path", path, "kind", metadataHeader.Kind)
 			return nil
 		}
 
 		var metadata RecipeMetadata
-		if metadataHeader.APIVersion == RecipeProfileAPIVersion {
+		if profileVersion {
 			decoder := yaml.NewDecoder(bytes.NewReader(content))
 			decoder.KnownFields(true)
 			if parseErr := decoder.Decode(&metadata); parseErr != nil {
 				return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
-					fmt.Sprintf("failed to parse %s as strict %s RecipeMetadata", path, RecipeProfileAPIVersion),
+					fmt.Sprintf("failed to parse %s as strict %s RecipeMetadata", path, metadataHeader.APIVersion),
 					parseErr)
 			}
 			var trailing any
@@ -311,9 +318,17 @@ func buildMetadataStore(ctx context.Context, provider DataProvider) (*MetadataSt
 			return aicrerrors.PropagateOrWrap(profileErr, aicrerrors.ErrCodeInvalidRequest,
 				fmt.Sprintf("invalid profile declaration in %s", path))
 		}
-		if metadata.APIVersion == RecipeProfileAPIVersion && metadata.Metadata.Name == "" {
+		if profileVersion && metadata.Metadata.Name == "" {
 			return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 				fmt.Sprintf("profile RecipeMetadata %s requires metadata.name", path))
+		}
+
+		// Reject non-addressable constraint measurement paths before this file
+		// joins the store (#1783). Returning here also keeps the staged
+		// criteria registry transactional: the seedCriteriaRegistry commit
+		// loop below the walk never runs.
+		if pathErr := validateSpecConstraintPaths(&metadata.Spec, path); pathErr != nil {
+			return pathErr
 		}
 
 		// Categorize as base or overlay
@@ -323,6 +338,22 @@ func buildMetadataStore(ctx context.Context, provider DataProvider) (*MetadataSt
 		} else {
 			store.Overlays[metadata.Metadata.Name] = &metadata
 			store.OverlaySources[metadata.Metadata.Name] = provider.Source(path)
+			// Fail closed when an external overlay gates on nodes: nodes no
+			// longer participates in Criteria.Matches() (#1781), so the
+			// overlay would silently match every query and override configs
+			// it was never intended to reach. This fires at catalog load time
+			// (not request time) and surfaces as ErrCodeInvalidRequest so
+			// callers can distinguish it from internal errors. Operators must
+			// either remove criteria.nodes from their overlay or strip it to zero.
+			isExternal := provider.Source(path) == CatalogSourceExternal
+			hasNodes := metadata.Spec.Criteria != nil && metadata.Spec.Criteria.Nodes != 0
+			if isExternal && hasNodes {
+				return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+					fmt.Sprintf("external overlay %q sets criteria.nodes=%d which is no longer used for overlay selection (#1781): "+
+						"nodes is metadata-only and the overlay would silently match every query; "+
+						"remove or zero criteria.nodes in your --data catalog",
+						metadata.Metadata.Name, metadata.Spec.Criteria.Nodes))
+			}
 			// Stage this overlay's criteria for registration; the
 			// actual call to seedCriteriaRegistry is deferred until
 			// after every overlay parses cleanly, the base recipe is
@@ -371,6 +402,59 @@ func buildMetadataStore(ctx context.Context, provider DataProvider) (*MetadataSt
 	}
 
 	return store, nil
+}
+
+func validateRecipeMixinCatalogHeader(kind, apiVersion, path string) error {
+	if kind != RecipeMixinKind {
+		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("mixin file %s has kind %q, expected %q; use a RecipeMixin document compatible with this aicr release",
+				path, kind, RecipeMixinKind))
+	}
+	if !header.IsSupportedAuthoringAPIVersion(apiVersion) {
+		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("mixin file %s has apiVersion %q, expected %q or %q for %s; update the catalog header for this aicr release",
+				path, apiVersion, RecipeMetadataAPIVersion, header.GroupVersionV1Beta1, RecipeMixinKind))
+	}
+	return nil
+}
+
+func classifyRecipeMetadataCatalogHeader(
+	metadata *RecipeMetadataHeader,
+	path string,
+) (bool, bool, error) {
+
+	if metadata.Kind != RecipeMetadataKind {
+		if isKnownNonMetadataAICRKind(metadata.Kind) {
+			return false, false, nil
+		}
+		if strings.HasPrefix(metadata.APIVersion, header.APIGroup+"/") {
+			return false, false, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+				fmt.Sprintf("AICR catalog file %s has kind %q, expected %q; fix the wire kind or move the unrelated document outside the recipe catalog",
+					path, metadata.Kind, RecipeMetadataKind))
+		}
+		return false, false, nil
+	}
+
+	profileVersion := header.IsSupportedProfileAPIVersion(metadata.APIVersion)
+	if !profileVersion && !header.IsSupportedAuthoringAPIVersion(metadata.APIVersion) {
+		return false, false, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+			fmt.Sprintf("RecipeMetadata file %s has apiVersion %q, expected %q, %q, %q, or %q; update the catalog header for this aicr release",
+				path, metadata.APIVersion, RecipeMetadataAPIVersion, header.GroupVersionV1Beta1,
+				RecipeProfileAPIVersion, header.GroupVersionV1Beta2))
+	}
+	return true, profileVersion, nil
+}
+
+func isKnownNonMetadataAICRKind(kind string) bool {
+	switch kind {
+	case "AICRConfig", "BundleProvenance", ComponentRegistryKind,
+		RecipeCriteriaKind, RecipeMixinKind, RecipeResultKind,
+		string(header.KindRecipe), string(header.KindSnapshot):
+
+		return true
+	default:
+		return false
+	}
 }
 
 // EvictCachedStore drops the cached MetadataStore for the supplied provider.
@@ -503,88 +587,6 @@ func (s *MetadataStore) resolveInheritanceChain(recipeName string) ([]*RecipeMet
 	}
 
 	return chain, nil
-}
-
-// availableOSForCriteria returns the distinct, sorted OS values from overlays
-// that would match the given criteria if an appropriate OS were supplied.
-// It tests each OS-gated overlay by temporarily setting the query's OS to the
-// overlay's required OS value and running a full Criteria.Matches check, so
-// only overlays that satisfy all other criteria dimensions (accelerator, intent,
-// service, …) contribute. An empty slice means no OS-gated overlays would
-// match, so requiring --os would be unhelpful.
-func (s *MetadataStore) availableOSForCriteria(criteria *Criteria) []string {
-	seen := make(map[string]struct{})
-	for _, overlay := range s.Overlays {
-		c := overlay.Spec.Criteria
-		if c == nil {
-			continue
-		}
-		if c.OS == "" || c.OS == CriteriaOSAny {
-			continue // not OS-gated
-		}
-		// Would this overlay match if the query carried its required OS?
-		queryCopy := *criteria
-		queryCopy.OS = c.OS
-		if c.Matches(&queryCopy) {
-			seen[string(c.OS)] = struct{}{}
-		}
-	}
-	result := make([]string, 0, len(seen))
-	for v := range seen {
-		result = append(result, v)
-	}
-	sort.Strings(result)
-	return result
-}
-
-// requireOSIfNeeded is the joint service+accelerator OS gate. It is NOT
-// subsumed by verifyCriteriaCoverage: coverage permits service and
-// accelerator to be honored by separate overlays, while this guard demands
-// one overlay carry both before the OS-agnostic tier is considered served
-// (see issue #1542, design 4.1). Both checks run; this guard first.
-//
-// requireOSIfNeeded returns ErrCodeInvalidRequest when the caller requested a
-// specific service+accelerator combination without specifying an OS, and no
-// OS-agnostic overlay exists for that exact combination while OS-gated overlays
-// do. The check matches on both service AND accelerator so that a generic service
-// overlay (e.g. oke.yaml with no accelerator) does not suppress the error for an
-// accelerator-specific request (e.g. service=oke accelerator=l40s).
-func (s *MetadataStore) requireOSIfNeeded(criteria *Criteria, overlays []*RecipeMetadata) error {
-	if criteria.Service == CriteriaServiceAny || criteria.Service == "" {
-		return nil
-	}
-	if criteria.OS != CriteriaOSAny && criteria.OS != "" {
-		return nil
-	}
-	accel := criteria.Accelerator
-	if accel == CriteriaAcceleratorAny {
-		accel = ""
-	}
-	// If any matched overlay covers this exact service+accelerator combination,
-	// the caller gets at least the OS-agnostic tier — no error.
-	for _, o := range overlays {
-		if o.Spec.Criteria == nil {
-			continue
-		}
-		c := o.Spec.Criteria
-		if c.Service != criteria.Service {
-			continue
-		}
-		overlayAccel := c.Accelerator
-		if overlayAccel == CriteriaAcceleratorAny {
-			overlayAccel = ""
-		}
-		if overlayAccel != accel {
-			continue
-		}
-		return nil // service+accelerator-specific overlay matched — no error
-	}
-	if available := s.availableOSForCriteria(criteria); len(available) > 0 {
-		return aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-			fmt.Sprintf("service '%s' has no OS-agnostic recipe for accelerator '%s'; specify an OS (valid: %s)",
-				criteria.Service, accel, strings.Join(available, ", ")))
-	}
-	return nil
 }
 
 // FindMatchingOverlays finds all overlays that match the given criteria and
@@ -1015,7 +1017,7 @@ func finalizeRecipeResult(provider DataProvider, criteria *Criteria, mergedSpec 
 
 	result := &RecipeResult{
 		Kind:            RecipeResultKind,
-		APIVersion:      RecipeAPIVersion,
+		APIVersion:      RecipeResultAPIVersion,
 		Criteria:        criteria,
 		Constraints:     mergedSpec.Constraints,
 		ComponentRefs:   mergedSpec.ComponentRefs,
@@ -1073,10 +1075,6 @@ func (s *MetadataStore) BuildRecipeResultWithProfile(ctx context.Context, criter
 	}
 
 	overlays := s.FindMatchingOverlays(criteria)
-
-	if err := s.requireOSIfNeeded(criteria, overlays); err != nil {
-		return nil, err
-	}
 	effectiveProfile, err := s.resolveProfileDeclaration(overlays)
 	if err != nil {
 		return nil, err
@@ -1167,10 +1165,6 @@ func (s *MetadataStore) BuildRecipeResultWithEvaluatorAndProfile(
 
 	// Find matching overlays and filter by constraint evaluation
 	overlays := s.FindMatchingOverlays(criteria)
-
-	if err := s.requireOSIfNeeded(criteria, overlays); err != nil {
-		return nil, err
-	}
 	effectiveProfile, err := s.resolveProfileDeclaration(overlays)
 	if err != nil {
 		return nil, err

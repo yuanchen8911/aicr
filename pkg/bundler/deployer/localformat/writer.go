@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -77,9 +78,8 @@ type Options struct {
 	Components []Component // ordered per DeploymentOrder
 	// ComponentPreManifests maps component name → manifest path → rendered
 	// bytes for manifests that should apply BEFORE each component's primary
-	// chart. Populated from ComponentRef.PreManifestFiles. The writer does
-	// not yet emit pre-phase folders — Task 4 wires the pre-injection
-	// branch; for now the map is threaded through but unread.
+	// chart. Populated from ComponentRef.PreManifestFiles. Entries that all
+	// render empty are omitted instead of producing a no-op pre chart.
 	ComponentPreManifests map[string]map[string][]byte
 	// ComponentPostManifests maps component name → manifest path → rendered
 	// bytes for manifests that should apply AFTER each component's primary
@@ -100,11 +100,12 @@ type Options struct {
 
 	// VendorCharts pulls upstream Helm chart bytes into each Helm-typed
 	// component's folder at bundle time. When set, every Helm component
-	// emits a single wrapped folder with charts/<chart>-<version>.tgz +
-	// wrapper Chart.yaml + (for mixed components) post-install-hook
-	// templates. Mixed components no longer split into primary + -post.
-	// Off by default — non-vendored bundles preserve the upstream
-	// CVE-yank fail-loud signal.
+	// emits a wrapped folder with charts/<chart>-<version>.tgz + wrapper
+	// Chart.yaml. Mixed components still emit a separate <name>-post
+	// release for recipe-side manifests (#1835) — the same tracked-release
+	// shape as the non-vendored path — rather than embedding them as
+	// helm.sh/hook templates in the primary. Off by default — non-vendored
+	// bundles preserve the upstream CVE-yank fail-loud signal.
 	VendorCharts bool
 
 	// Puller fetches upstream chart bytes when VendorCharts is set. nil
@@ -132,6 +133,45 @@ func renderInputFor(c Component) manifest.RenderInput {
 		ChartVersion:  deployer.NormalizeVersionWithDefault(c.Version),
 		Values:        c.Values,
 	}
+}
+
+func filterEmptyPreManifests(
+	ctx context.Context,
+	components []Component,
+	preManifests map[string]map[string][]byte,
+) (map[string]map[string][]byte, error) {
+
+	filtered := make(map[string]map[string][]byte, len(preManifests))
+	for _, component := range components {
+		manifests := preManifests[component.Name]
+		if len(manifests) == 0 {
+			continue
+		}
+		paths := make([]string, 0, len(manifests))
+		for path := range manifests {
+			paths = append(paths, path)
+		}
+		sort.Strings(paths)
+
+		kept := make(map[string][]byte, len(manifests))
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled", err)
+			}
+			rendered, err := manifest.Render(manifests[path], renderInputFor(component))
+			if err != nil {
+				return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal,
+					fmt.Sprintf("render pre-manifest %s for %s", path, component.Name))
+			}
+			if hasYAMLObjects(rendered) {
+				kept[path] = manifests[path]
+			}
+		}
+		if len(kept) > 0 {
+			filtered[component.Name] = kept
+		}
+	}
+	return filtered, nil
 }
 
 // injectionPhase selects whether injectAuxiliaryFolder reads pre- or
@@ -193,8 +233,9 @@ func (opts *Options) injectAuxiliaryFolder(idx int, c Component, phase injection
 		return nil, err
 	}
 	// Mark the post wrapper so deployers can key manifest-specific
-	// behavior off the folder shape (see Folder.CarriesPostManifests);
-	// the vendored writer sets the same marker on its collapsed folder.
+	// behavior off the folder shape (see Folder.CarriesPostManifests).
+	// Vendored and non-vendored mixed components share this injected
+	// -post folder (#1835); a primary never carries post manifests.
 	f.CarriesPostManifests = phase == phasePost
 	return &f, nil
 }
@@ -217,6 +258,12 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 	if err := ctx.Err(); err != nil {
 		return WriteResult{}, errors.Wrap(errors.ErrCodeTimeout, "context cancelled", err)
 	}
+	filteredPreManifests, err := filterEmptyPreManifests(ctx, opts.Components, opts.ComponentPreManifests)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	opts.ComponentPreManifests = filteredPreManifests
+
 	// Fail fast if the layout's three-digit prefix can't accommodate the
 	// number of NNN-* folders this bundle will actually emit. Compute
 	// the count using the same pre/primary/post emission rules the main
@@ -231,16 +278,16 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 		}
 		folderCount++ // primary
 		// Post-injection conditions mirror the per-component branch
-		// below: skipped under VendorCharts (mixed collapses into the
-		// primary), and only meaningful for mixed components (helm
-		// repository + raw manifests). Manifest-only and kustomize
-		// primaries never inject a -post folder.
-		if !opts.VendorCharts && c.Repository != "" && len(opts.ComponentPostManifests[c.Name]) > 0 {
+		// below: only meaningful for mixed components (helm repository +
+		// raw manifests), in both vendored and non-vendored mode (#1835).
+		// Manifest-only and kustomize primaries never inject a -post
+		// folder.
+		if c.Repository != "" && len(opts.ComponentPostManifests[c.Name]) > 0 {
 			folderCount++ // <name>-post
 		}
 		// Readiness gate folder applies to every component kind (it runs
 		// after the primary regardless of upstream/local/vendored), so it
-		// is not gated on Repository/VendorCharts like the -post folder.
+		// is not gated on Repository like the -post folder.
 		if len(opts.ComponentReadiness[c.Name]) > 0 {
 			folderCount++ // <name>-readiness
 		}
@@ -266,10 +313,10 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 	// declares both a component "foo" with pre/post manifests and a
 	// separate component "foo-pre" or "foo-post", the injection rule
 	// would synthesize a second folder/release that collides with the
-	// explicitly-declared one. The post check is skipped under
-	// VendorCharts because vendored mode collapses mixed components
-	// into a single folder and never injects -post; pre injection still
-	// runs in vendored mode (pre folders are independent of the chart).
+	// explicitly-declared one. Both checks run in vendored mode too:
+	// pre folders are independent of the chart, and vendored mixed
+	// components inject the same -post release as the non-vendored
+	// path (#1835).
 	declared := make(map[string]struct{}, len(opts.Components))
 	for _, c := range opts.Components {
 		declared[c.Name] = struct{}{}
@@ -317,17 +364,13 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 		// is already globally reserved above, so a clash here is unreachable in
 		// practice; the check stays as defense-in-depth for the gate-bearing
 		// case. Checked for every component kind (unlike -post, readiness is not
-		// gated on Repository/VendorCharts), so it sits before the VendorCharts
-		// short-circuit below.
+		// gated on Repository).
 		if len(opts.ComponentReadiness[c.Name]) > 0 {
 			if _, clash := declared[c.Name+"-readiness"]; clash {
 				return WriteResult{}, errors.New(errors.ErrCodeInvalidRequest,
 					fmt.Sprintf("component %q has a readiness gate and would inject %q-readiness, but a component named %q-readiness is already declared in the recipe — rename one to avoid collision",
 						c.Name, c.Name, c.Name))
 			}
-		}
-		if opts.VendorCharts {
-			continue // post-injection skipped under VendorCharts
 		}
 		if len(opts.ComponentPostManifests[c.Name]) == 0 {
 			continue
@@ -379,14 +422,17 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 
 		dir := fmt.Sprintf("%03d-%s", idx, c.Name)
 
-		// Vendored Helm path: one wrapped folder per Helm-typed component
-		// regardless of mixed/pure. Kustomize and manifest-only fall
-		// through to the existing classify() path even with VendorCharts
-		// on, because they are already local after #662.
+		// Vendored Helm path: the primary wraps the upstream chart bytes.
+		// Mixed components still emit a separate <name>-post release
+		// below — the same shape as the non-vendored path (#1835) — so
+		// recipe-side manifests are tracked release members with
+		// three-way-merge upgrade and uninstall semantics instead of
+		// fire-and-forget helm.sh/hook resources. Kustomize and
+		// manifest-only fall through to the existing classify() path even
+		// with VendorCharts on, because they are already local after #662.
 		if opts.VendorCharts && shouldVendor(c) {
 			f, rec, err := writeVendoredHelmFolder(
-				ctx, opts.OutputDir, dir, idx, c,
-				opts.ComponentPostManifests[c.Name], puller,
+				ctx, opts.OutputDir, dir, idx, c, puller,
 			)
 			if err != nil {
 				return WriteResult{}, err
@@ -397,9 +443,23 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 				"index", idx, "dir", dir, "parent", c.Name,
 				"chart", rec.Chart, "version", rec.Version, "sha256", rec.SHA256)
 			idx++
+
+			// Post-injection: recipe-side manifests as a tracked -post
+			// release installed after the vendored subchart, so manifests
+			// referencing the chart's CRDs apply once those CRDs exist.
+			if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePost); err != nil {
+				return WriteResult{}, err
+			} else if pf != nil {
+				folders = append(folders, *pf)
+				slog.Info("wrote local chart folder",
+					"index", idx, "dir", pf.Dir,
+					"kind", KindLocalHelm.String(), "parent", c.Name)
+				idx++
+			}
+
 			// Readiness gate applies to vendored components too — emit it
-			// after the wrapped chart so the gate Job runs once the
-			// vendored release has installed.
+			// after the wrapped chart (and any -post release) so the gate
+			// Job runs once the vendored release has installed.
 			if rf, err := opts.injectAuxiliaryFolder(idx, c, phaseReadiness); err != nil {
 				return WriteResult{}, err
 			} else if rf != nil {
@@ -611,7 +671,7 @@ func pruneStaleFolders(outputDir string) error {
 			continue
 		}
 		ok := true
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if name[i] < '0' || name[i] > '9' {
 				ok = false
 				break

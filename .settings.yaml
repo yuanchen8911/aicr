@@ -19,38 +19,55 @@
 # Build Tools
 build_tools:
   # renovate: datasource=github-releases depName=goreleaser/goreleaser depType=build_tools
-  goreleaser: 'v2.17.0'
+  goreleaser: 'v2.18.0'
   # renovate: datasource=github-releases depName=ko-build/ko depType=build_tools
   ko: 'v0.19.1'
   # renovate: datasource=github-releases depName=google/go-containerregistry depType=build_tools
-  crane: 'v0.21.7'
+  crane: 'v0.21.9'
   # renovate: datasource=github-releases depName=orhun/git-cliff depType=build_tools
   git_cliff: '2.13.1'
 
 # Linting
 linting:
+  # renovate: datasource=go depName=golang.org/x/exp depType=linting
+  apidiff: 'v0.0.0-20260824195058-e88cd73687aa'
   # renovate: datasource=github-releases depName=golangci/golangci-lint depType=linting
-  golangci_lint: 'v2.12.2'
+  golangci_lint: 'v2.13.1'
   # renovate: datasource=pypi depName=yamllint depType=linting
   yamllint: '1.38.0'
   # renovate: datasource=github-releases depName=google/addlicense depType=linting
   addlicense: 'v1.2.0'
   # renovate: datasource=github-releases depName=google/go-licenses depType=linting
   go_licenses: 'v2.0.1'
+  # MDX toolchain for tools/check-docs-mdx-parse (the parser-level docs gate) is
+  # owned by tools/mdx/package.json + package-lock.json, not listed here. The
+  # lockfile freezes the full transitive tree, which a version string cannot;
+  # this gate decides which docs merge, so its verdict must be reproducible.
+  # Renovate updates it natively via the npm manager. Same single-source-of-truth
+  # split as the Go toolchain living in .go-version.
 
 # Security Tools
 security_tools:
   # renovate: datasource=github-releases depName=anchore/grype depType=security_tools
-  grype: 'v0.116.0'
+  grype: 'v0.117.0'
   # renovate: datasource=github-releases depName=sigstore/cosign depType=security_tools
-  cosign: 'v3.1.2'
+  cosign: 'v3.1.3'
   # renovate: datasource=github-releases depName=anchore/syft depType=security_tools
-  syft: 'v1.49.0'
+  syft: 'v1.51.0'
+  # renovate: datasource=github-releases depName=oras-project/oras depType=security_tools
+  # Attaches the aiperf-bench third-party source archive as an OCI 1.1 referrer
+  # (tools/generate-aiperf-source). Cosign cannot attach arbitrary artifacts, so
+  # this is a separate dependency from the signing/attestation path.
+  #
+  # Stored WITHOUT the leading 'v', unlike cosign/syft/grype above:
+  # oras-project/setup-oras looks the version up against bare release keys and
+  # throws on 'v1.3.3'. tools/setup-tools re-adds the prefix for the download URL.
+  oras: '1.3.3'
 
 # E2E Testing Tools
 testing_tools:
   # renovate: datasource=github-releases depName=kubernetes/kubernetes depType=testing_tools
-  kubectl: 'v1.36.3'
+  kubectl: 'v1.36.4'
   # kubelogin: Entra exec-plugin for AKS kubeconfigs, installed by uat-azure.yaml
   # via `az aks install-cli` (which defaults to latest without an explicit pin).
   # renovate: datasource=github-releases depName=Azure/kubelogin depType=testing_tools
@@ -62,20 +79,35 @@ testing_tools:
   # renovate: datasource=github-releases depName=tilt-dev/ctlptl depType=testing_tools
   ctlptl: '0.9.4'
   # renovate: datasource=github-releases depName=tilt-dev/tilt depType=testing_tools
-  tilt: '0.37.5'
+  tilt: '0.37.7'
+  # Keep in step with sigs.k8s.io/controller-runtime in go.mod: setup-envtest is
+  # released from that repo under the tools/setup-envtest/vX.Y.Z tag series, and
+  # the envtest control-plane binaries it fetches are matched to the
+  # controller-runtime the tests link against.
+  # renovate: datasource=go depName=sigs.k8s.io/controller-runtime/tools/setup-envtest depType=testing_tools
+  setup_envtest: 'v0.24.1'
   # renovate: datasource=github-releases depName=helm/helm depType=testing_tools
-  helm: 'v4.2.3'
+  helm: 'v4.2.4'
   # renovate: datasource=github-releases depName=databus23/helm-diff depType=testing_tools
-  helm_diff: 'v3.15.10'
+  helm_diff: 'v3.15.11'
+  # helm_diff_checksums are refreshed automatically by tools/update-helm-diff-checksums
+  # via Renovate postUpgradeTasks whenever the helm-diff version above is bumped.
+  # The darwin_* keys name GOOS (matching the sibling blocks); upstream labels
+  # those release assets "macos".
+  helm_diff_checksums:
+    linux_amd64: 'ed54aa5a14a51a6e44cf8ab6020aaa9e56779b4d33bc2adf07abea6b240a5e7c'
+    linux_arm64: '1c38c487ec348fe5ef2b10c61deddff79f0fa5bfbab762b302874578e6dc2d2c'
+    darwin_amd64: '833e1054d0cfe28bbd6f2edc4c1d5b786968b7732f8df6fe99b67c3bf12bf7bb'
+    darwin_arm64: 'ba489cc4a5998ad259fbc18c454f2319da26ba4c8f469e7acb587a07e61072cd'
   # renovate: datasource=github-releases depName=helmfile/helmfile depType=testing_tools
-  helmfile: 'v1.7.1'
+  helmfile: 'v1.7.4'
   # helmfile_checksums are refreshed automatically by tools/update-helmfile-checksums
   # via Renovate postUpgradeTasks whenever the helmfile version above is bumped.
   helmfile_checksums:
-    linux_amd64: 'd84a8e5ffdbfd66f1bfb4b11967b9d2981d8515c7d6e312ee0cd89b613c8b352'
-    linux_arm64: 'c957e2a07469b535b427e9838e6edd30202366bd5a06e0aa3aaa6f562deeb29e'
-    darwin_amd64: 'af46902ff69e9df2cb6bff69d3aa1fd7e8ffa357a3a4c889257a7bd40e27c01a'
-    darwin_arm64: '96588f4f413ef5d4a3709013a52de73b41a845e6cf83c7ba9bab3266c8225730'
+    linux_amd64: 'f96ef0a015df06b29d7f38bf0ca08821018ae25eb96bf2c7abd3affa1b84e112'
+    linux_arm64: '0292f57a4638a21e775b0ce8bde37ee3fdd65dbbdbe0e5b9a06718f1dd04c7fa'
+    darwin_amd64: '7a0951fcc5bb991d7ea3a0c80e35754eb3981dcadba19795edbec7cba2518ae2'
+    darwin_arm64: 'e1490d371fecc1f2d9aae914ef34058f3cb2363c9ee63350b37a85c3994d71d9'
   # renovate: datasource=github-releases depName=kubernetes-sigs/kwok depType=testing_tools
   kwok: 'v0.8.0'
   # renovate: datasource=github-releases depName=kyverno/chainsaw depType=testing_tools
@@ -88,24 +120,24 @@ testing_tools:
     darwin_amd64: 'ddb56002ff8c6265f55ec40c82eb0ef0dddec5127dd12d4fc5e7953453481f4b'
     darwin_arm64: '502bef17dd822217e82590e9ccf01c1e26a56b3fa34a835789b9af73e82a169a'
   # renovate: datasource=github-releases depName=mikefarah/yq depType=testing_tools
-  yq: 'v4.53.3'
+  yq: 'v4.53.6'
   # AWS CLI used by the KMS e2e to provision keys against the MiniStack emulator.
   # renovate: datasource=pypi depName=awscli depType=testing_tools
-  awscli: '1.45.57'
+  awscli: '1.46.0'
   # MiniStack: MIT-licensed, token-free AWS emulator (https://ministack.org) used
   # by the KMS e2e in place of LocalStack, whose latest/stable images now refuse
   # to boot without a paid license token. Pinned (never :latest) for reproducibility.
   # Run with USE_SSL=1: sigstore's awskms signer hardcodes https://, so the e2e
   # serves TLS with a mkcert cert (see mkcert below).
   # renovate: datasource=docker depName=ministackorg/ministack depType=testing_tools
-  ministack_image: 'ministackorg/ministack:1.4.7'
+  ministack_image: 'ministackorg/ministack:1.5.0'
   # OpenBAO: the Linux Foundation Apache-2.0 fork of HashiCorp Vault, used by the
   # Vault KMS e2e to exercise the hashivault:// signing/verification path against
   # a real Transit secrets engine. API-identical to Vault; the sigstore hashivault
   # provider drives it over plain HTTP in dev mode (no TLS needed). Pinned (never
   # :latest) for reproducibility.
   # renovate: datasource=docker depName=openbao/openbao depType=testing_tools
-  openbao_image: 'openbao/openbao:2.6.1'
+  openbao_image: 'openbao/openbao:2.6.2'
   # mkcert issues a trusted localhost cert for MiniStack's TLS and installs its CA
   # into the system trust store, so the Go AWS SDK accepts the awskms:// endpoint.
   # renovate: datasource=github-releases depName=FiloSottile/mkcert depType=testing_tools
@@ -116,7 +148,7 @@ testing_tools:
     linux_amd64: '6d31c65b03972c6dc4a14ab429f2928300518b26503f58723e532d1b0a3bbb52'
     linux_arm64: 'b98f2cc69fd9147fe4d405d859c57504571adec0d3611c3eefd04107c7ac00d0'
   # renovate: datasource=github-releases depName=kubernetes-sigs/karpenter depType=testing_tools
-  karpenter: 'v1.14.0'
+  karpenter: 'v1.14.1'
   # In-cluster OCI registry for KWOK deployer-matrix CI (issue #843).
   # Pulled from ECR Public (AWS's first-party mirror of Docker official
   # images): anonymous Docker Hub pulls rate-limit on shared CI runners
@@ -138,7 +170,7 @@ testing_tools:
   # kustomize-controller and helm-controller are the only controllers the
   # bundle consumes (OCIRepository -> Kustomization -> HelmRelease).
   # renovate: datasource=github-releases depName=fluxcd/flux2 depType=testing_tools
-  flux_version: 'v2.9.3'
+  flux_version: 'v2.9.4'
   # In-cluster Git server for the KWOK flux-git deployer lane (issue #963).
   # Rootless variant so the admin-user bootstrap can `kubectl exec gitea
   # admin user create` directly without su gymnastics.
@@ -146,11 +178,11 @@ testing_tools:
   # Docker Hub pulls rate-limit on shared CI runners. Do not regress to a
   # Docker Hub pin on bump.
   # renovate: datasource=docker depName=docker.gitea.com/gitea depType=testing_tools
-  gitea_image: 'docker.gitea.com/gitea:1.26.4-rootless'
+  gitea_image: 'docker.gitea.com/gitea:1.27.0-rootless'
   # renovate: datasource=github-releases depName=hauler-dev/hauler depType=testing_tools
-  hauler: 'v2.0.2'
+  hauler: 'v2.0.3'
   # renovate: datasource=github-releases depName=zarf-dev/zarf depType=testing_tools
-  zarf: 'v0.82.0'
+  zarf: 'v0.84.0'
 # Quality Thresholds
 quality:
   coverage_threshold: '80'

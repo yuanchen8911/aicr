@@ -182,14 +182,26 @@ func CheckClusterAutoscaling(ctx *validators.Context) error {
 				fmt.Sprintf("Created namespace=%s deployment=%s hpa=%s for nodePool=%s",
 					report.Namespace, report.DeploymentName, report.HPAName, report.NodePoolName))
 			recordRawTextArtifact(ctx, "Cluster Autoscaling Behavioral Test",
-				"kubectl get hpa && kubectl get nodes && kubectl get pods",
+				fmt.Sprintf("kubectl get hpa -n %s && kubectl get nodes && kubectl get pods -n %s",
+					report.Namespace, report.Namespace),
 				fmt.Sprintf("NodePool:              %s\nNamespace:             %s\nHPA desired/current:   %d/%d\nKarpenter nodes:       baseline=%d observed=%d\nScheduled pods:        %d/%d",
 					report.NodePoolName, report.Namespace, report.HPADesiredReplicas,
 					report.HPACurrentReplicas, report.BaselineNodeCount, report.ObservedNodeCount,
 					report.ScheduledPodCount, report.ObservedPodCount))
+			// The behavioral validation's deferred cleanup has already run by the
+			// time this executes, but a returning Delete call only means the
+			// request was accepted — the namespace terminates asynchronously.
+			// The artifact therefore records that deletion was requested, never
+			// that it completed; a rejected request is reported by the warning
+			// cleanup logs.
 			recordRawTextArtifact(ctx, "Delete test namespace",
-				"kubectl delete namespace cluster-auto-test-<id> --ignore-not-found",
-				fmt.Sprintf("Deleted namespace %s after cluster autoscaling test.", report.Namespace))
+				fmt.Sprintf("kubectl delete namespace %s --ignore-not-found", report.Namespace),
+				fmt.Sprintf("Deletion of namespace %s was requested after the cluster autoscaling test; "+
+					"the namespace terminates asynchronously and this artifact does not confirm it. "+
+					"If the request failed, the check logs a warning naming the namespace. "+
+					"Find leftovers from earlier runs with: "+
+					"kubectl get namespaces -o name | grep %s",
+					report.Namespace, clusterAutoTestPrefix))
 			return nil
 		}
 		slog.Debug("behavioral validation failed for NodePool",
@@ -235,8 +247,14 @@ func validateClusterAutoscaling(ctx context.Context, clientset kubernetes.Interf
 		slog.Debug("cleaning up cluster autoscaling test namespace", "namespace", nsName)
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), defaults.K8sCleanupTimeout)
 		defer cleanupCancel()
-		_ = k8s.IgnoreNotFound(clientset.CoreV1().Namespaces().Delete(
-			cleanupCtx, nsName, metav1.DeleteOptions{}))
+		// Surface a failed delete: silently discarding it leaves the namespace
+		// (and anything still running in it) behind with no operator-visible
+		// signal, while the recorded artifact describes a cleanup that ran.
+		if err := k8s.IgnoreNotFound(clientset.CoreV1().Namespaces().Delete(
+			cleanupCtx, nsName, metav1.DeleteOptions{})); err != nil {
+			slog.Warn("failed to delete cluster autoscaling test namespace; delete it manually",
+				"namespace", nsName, "error", err)
+		}
 	}()
 
 	// Baseline: count existing Karpenter nodes for this pool before creating test resources.
@@ -461,28 +479,51 @@ func findKarpenterDeployment(ctx *validators.Context) (*appsv1.Deployment, strin
 	return deploy, deploy.Namespace, nil
 }
 
-// detectPlatform returns "eks", "gke", or "" based on the first node's providerID.
-func detectPlatform(ctx *validators.Context) string {
+// detectPlatform returns "eks", "gke", or "" based on the first node's
+// providerID. A genuinely empty node list (Kind CI, KWOK) or an unrecognized
+// providerID yields ("", nil): the caller treats that as a legitimately
+// inapplicable Skip.
+//
+// A Nodes().List ERROR (RBAC denial, apiserver timeout, transport failure) is
+// NOT evidence that the platform is unrecognized (#2122). Flattening it to ""
+// would reach checkPlatformAutoscaling's default branch and masquerade as an
+// inapplicable Skip — the exact #2122 false-PASS. Instead it must fail closed
+// with a classified pkg/errors code. Classification is delegated to the shared
+// capability classifier via Capability.RequireList, which — unlike Require —
+// never treats a List error as Skip-eligible: even the (rare) NotFound shape on
+// a collection endpoint is an apiserver/aggregation anomaly, so every List error
+// blocks (Forbidden→Unauthorized, deadline→Timeout, transport→Unavailable, else
+// Internal) and never a Skip. Only a genuinely empty result (below) is
+// inapplicable.
+func detectPlatform(ctx *validators.Context) (string, error) {
 	nodes, err := ctx.Clientset.CoreV1().Nodes().List(ctx.Ctx, metav1.ListOptions{
 		Limit: 1,
 	})
-	if err != nil || len(nodes.Items) == 0 {
-		return ""
+	if err != nil {
+		return "", validators.Capability{Subject: "cluster nodes"}.RequireList(err)
+	}
+	if len(nodes.Items) == 0 {
+		return "", nil
 	}
 	pid := nodes.Items[0].Spec.ProviderID
 	if strings.HasPrefix(pid, "aws://") {
-		return "eks"
+		return "eks", nil
 	}
 	if strings.HasPrefix(pid, "gce://") {
-		return "gke"
+		return "gke", nil
 	}
-	return ""
+	return "", nil
 }
 
 // checkPlatformAutoscaling validates cluster autoscaling when Karpenter is absent.
 // Falls back to EKS node group or GKE cluster autoscaler validation.
 func checkPlatformAutoscaling(ctx *validators.Context) error {
-	platform := detectPlatform(ctx)
+	platform, err := detectPlatform(ctx)
+	if err != nil {
+		// A node-list infrastructure error (RBAC/timeout/transport) must block
+		// the gate rather than fall through to the unrecognized-platform Skip.
+		return err
+	}
 	slog.Info("Karpenter not found, falling back to platform autoscaling", "platform", platform)
 
 	switch platform {

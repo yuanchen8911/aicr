@@ -37,7 +37,7 @@ BOM_OUT_DIR=/tmp/aicr-bom make bom
 Direct invocation:
 
 ```bash
-GOFLAGS="-mod=vendor" go run ./tools/bom -repo-root . -out-dir /tmp/bom
+go run ./tools/bom -repo-root . -out-dir /tmp/bom
 ```
 
 Flags:
@@ -49,6 +49,8 @@ Flags:
 | `-aicr-version` | `dev` | AICR version embedded in the BOM |
 | `-skip-helm` | `false` | Skip `helm template` rendering |
 | `-strict` | `false` | Fail on unpinned charts or render errors |
+| `-deterministic` | `false` | Suppress per-run metadata (timestamps, version churn) in Markdown for committable artifacts |
+| `-no-title` | `false` | Omit the H1 title so the body can be embedded as a section |
 
 ## Output schema
 

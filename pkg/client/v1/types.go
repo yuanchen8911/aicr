@@ -77,6 +77,16 @@ type Snapshot struct {
 	Kind       string
 	CapturedAt time.Time
 
+	// Raw is the exact YAML document the collection agent emitted, set by
+	// Client.CollectSnapshot and empty on snapshots obtained any other way
+	// (WrapSnapshot, a hand-constructed Snapshot).
+	//
+	// Persist THESE bytes rather than re-serializing the parsed snapshot: a
+	// newer agent image can emit fields this binary's Snapshot type does not
+	// model, and a typed round trip silently drops them. `aicr snapshot`
+	// writes Raw for exactly that reason.
+	Raw []byte
+
 	// internal holds the upstream pkg/snapshotter.Snapshot so the
 	// facade can re-pass the snapshot to ValidateState without
 	// reserializing. Tests that construct &Snapshot{} have internal == nil;
@@ -85,11 +95,32 @@ type Snapshot struct {
 	internal *snapshotter.Snapshot
 }
 
+// Unwrap returns the underlying pkg/snapshotter.Snapshot — the inverse of
+// WrapSnapshot, and the analog of RecipeResult.Resolved(). In-tree callers
+// (the CLI's validate path) use it to reach measurement-level detail the
+// facade's public fields intentionally do not project.
+//
+// A Snapshot constructed outside the facade (no internal payload) yields a
+// minimal pkg/snapshotter.Snapshot rebuilt from the public fields, so callers
+// never have to nil-check the result of a non-nil receiver. Returns nil for a
+// nil receiver. The returned pointer is the facade's own — treat it as
+// read-only.
+func (s *Snapshot) Unwrap() *snapshotter.Snapshot {
+	return toInternalSnapshot(s)
+}
+
 // AgentConfig is the deployment-time configuration for the snapshot-
 // collection Job passed to Client.CollectSnapshot. Facade-owned;
 // field-for-field mirror of pkg/snapshotter.AgentConfig. Tolerations
 // keep k8s.io/api/core/v1.Toleration since kubernetes/api is itself
-// stable.
+// stable. Nil Tolerations use a tolerate-all default; a non-nil empty
+// slice explicitly disables that default.
+//
+// The mirror is enforced, not conventional: TestAgentConfigMirrorsInternal
+// fails when either struct gains, drops, or retypes a field, and every
+// in-tree snapshot Job (`aicr snapshot`, `aicr validate`) is deployed through
+// this type — so an unplumbed field is a test failure rather than a silent
+// zero value.
 type AgentConfig struct {
 	Kubeconfig         string
 	Namespace          string
@@ -101,7 +132,6 @@ type AgentConfig struct {
 	Tolerations        []corev1.Toleration
 	Timeout            time.Duration
 	Cleanup            bool
-	Output             string
 	Debug              bool
 	Privileged         bool
 	RequireGPU         bool
@@ -111,6 +141,31 @@ type AgentConfig struct {
 	OS                 string
 	Requests           corev1.ResourceList
 	Limits             corev1.ResourceList
+
+	// Output selects where the agent Job stages its result. A cm://namespace/name
+	// URI makes that ConfigMap the delivery vehicle — the Job writes there and
+	// CollectSnapshot leaves it in place. A malformed cm:// URI is rejected
+	// with ErrCodeInvalidRequest before any cluster access, so a typo never
+	// costs a deployed Job. Any other value (including empty) stages to an
+	// internal ConfigMap in Namespace; delivering the snapshot to a file,
+	// stdout, or a template is then the caller's job — pass Snapshot.Raw to
+	// snapshotter.DeliverSnapshot.
+	Output string
+
+	// ClusterConfigPath asks the in-pod network collector to ingest a
+	// pre-existing k8s-launch-kit (l8k) cluster-config.yaml at this path.
+	// The path must resolve INSIDE the agent pod, which the Job does not yet
+	// mount — so CollectSnapshot rejects a non-empty value with
+	// ErrCodeInvalidRequest. Use DiscoverNetwork for live discovery from a
+	// Job. Local (in-pod) collection honors the file, but that path is
+	// outside the facade; see Client.CollectSnapshot.
+	ClusterConfigPath string
+
+	// DiscoverNetwork enables the in-pod network collector's live l8k
+	// discovery. Discovery is NOT read-only — it writes
+	// nvidia.kubernetes-launch-kit.* node labels and patches NicClusterPolicy
+	// via server-side-apply, so the agent's RBAC must allow those writes.
+	DiscoverNetwork bool
 
 	// AKSGPUPoolsPath points at an operator-supplied
 	// `az aks nodepool list -o json` dump on the machine running this
@@ -272,9 +327,30 @@ type RecipeRequest struct {
 type RecipeResolveOption func(*recipeResolveConfig)
 
 type recipeResolveConfig struct {
-	profile           string
-	accountingMode    *recipe.AccountingMode
-	accountingModeErr error
+	profile              string
+	accountingMode       *recipe.AccountingMode
+	runtimeInventoryMode *recipe.RuntimeInventoryMode
+
+	// relaxDerived records that WithSnapshotCriteriaRelaxation was passed.
+	// Kept separate from stated because an empty stated set is meaningful
+	// (every dimension derived, all relaxable) and must not read as "option
+	// absent".
+	relaxDerived bool
+	stated       statedDimensionSet
+
+	// optErr holds the first validation failure from any option. Options are
+	// applied in a loop with no error return, so a bad argument is recorded
+	// here and surfaced by resolveRecipeConfig before the resolve runs.
+	optErr error
+}
+
+// recordOptErr keeps the first option validation failure. Later failures are
+// dropped so the reported error names the argument the caller should fix first
+// rather than whichever option happened to be applied last.
+func (cfg *recipeResolveConfig) recordOptErr(err error) {
+	if cfg.optErr == nil {
+		cfg.optErr = err
+	}
 }
 
 // WithProfile selects a name=value configuration profile for a criteria- or
@@ -293,10 +369,30 @@ func WithAccountingMode(mode string) RecipeResolveOption {
 	return func(cfg *recipeResolveConfig) {
 		parsed, err := recipe.ParseAccountingMode(mode)
 		if err != nil {
-			cfg.accountingModeErr = err
+			cfg.recordOptErr(err)
 			return
 		}
 		cfg.accountingMode = &parsed
+	}
+}
+
+// WithRuntimeInventoryMode selects whether the runtime AI inventory component
+// is installed by a criteria- or snapshot-based resolve call. It is valid only
+// when the resolved recipe declares that component; an empty or invalid mode is
+// rejected when the resolve call runs. Omit this option to keep the recipe's
+// own declaration.
+//
+// Unlike a bundle-time value override, the selection is recorded in the emitted
+// recipe and removes the component's health check along with the component,
+// which is the contract ADR-019 requires for stock adoption.
+func WithRuntimeInventoryMode(mode string) RecipeResolveOption {
+	return func(cfg *recipeResolveConfig) {
+		parsed, err := recipe.ParseRuntimeInventoryMode(mode)
+		if err != nil {
+			cfg.recordOptErr(err)
+			return
+		}
+		cfg.runtimeInventoryMode = &parsed
 	}
 }
 
@@ -326,6 +422,24 @@ type RecipeResult struct {
 	// SelectedProfile is present when the resolved composition declares a
 	// configuration profile.
 	SelectedProfile *SelectedProfile
+
+	// RelaxedDimensions lists the criteria dimensions cleared by
+	// WithSnapshotCriteriaRelaxation because no applied overlay
+	// distinguished the derived value, in the order the coverage failure
+	// reported them. A non-empty value means the resolved recipe is BROADER
+	// than the criteria originally requested.
+	//
+	// It is non-empty only when the first attempt failed coverage on derived
+	// dimensions AND the retry succeeded. Every other outcome — the option was
+	// not passed, the first attempt succeeded, relaxation was refused, or the
+	// retry itself failed — leaves it empty or returns no RecipeResult at all.
+	// So this field reports what a successful resolve gave up; it is never how
+	// a caller detects a failure, which is always the returned error.
+	//
+	// The CLI surfaces the same fact as a slog.Warn per dimension; this is
+	// the programmatic form, for callers that need to branch on it or report
+	// it to their own users.
+	RelaxedDimensions []CriteriaDimension
 
 	// internal holds the upstream pkg/recipe.RecipeResult so
 	// BundleComponents can call its GetValuesForComponent /
@@ -362,10 +476,14 @@ type SelectedProfile struct {
 	// Value is the selected value within that declaration.
 	Value string
 
-	// Advertiser is reserved for the future GKE allocation-policy
-	// extension and is always empty in this version — a declaration
-	// carrying one is rejected at catalog load, so no result reaches a
-	// caller with it set. Do not branch on it.
+	// Advertiser declares that a platform-managed component outside the
+	// recipe advertises nvidia.com/gpu (ADR-015 GKE allocation-policy
+	// amendment). It is "external" on selections whose advertiser is
+	// platform-owned — e.g. GKE's managed device plugin on the gpuStack
+	// gke-default value (the GKE default) — and empty when no external
+	// advertiser is declared: the recipe's own components then determine
+	// advertisement (the GPU operator's device plugin, or DRA
+	// resources.gpus.enabled). "external" is the only non-empty value.
 	Advertiser string
 
 	// OwnedPaths maps each locked component to its sorted dotted value

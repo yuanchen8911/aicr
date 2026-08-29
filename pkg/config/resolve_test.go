@@ -238,10 +238,12 @@ func TestBundleResolve_AllFieldsPopulated(t *testing.T) {
 			SystemNodeTolerations:      []string{"sys-only=yes:NoSchedule"},
 			AcceleratedNodeSelector:    map[string]string{"gpu": "true"},
 			AcceleratedNodeTolerations: []string{"gpu-only=yes:NoSchedule"},
+			DRAEvictionNodeLabel:       "example.com/dra-ready=enabled",
 			WorkloadGate:               "k=v:NoSchedule",
 			WorkloadSelector:           map[string]string{"workload": "true"},
 			Nodes:                      8,
 			StorageClass:               "fast-ssd",
+			SharedStorageClass:         "shared-rwx",
 		},
 		Attestation: &config.AttestationSpec{
 			Enabled:                   true,
@@ -290,6 +292,9 @@ func TestBundleResolve_AllFieldsPopulated(t *testing.T) {
 	if len(got.AcceleratedNodeTolerations) != 1 {
 		t.Errorf("AcceleratedNodeTolerations count: got %d", len(got.AcceleratedNodeTolerations))
 	}
+	if got.DRAEvictionNodeLabel == nil || got.DRAEvictionNodeLabel.String() != "example.com/dra-ready=enabled" {
+		t.Errorf("DRAEvictionNodeLabel: got %+v", got.DRAEvictionNodeLabel)
+	}
 	if got.WorkloadGate == nil || got.WorkloadGate.Key != "k" {
 		t.Errorf("WorkloadGate: got %+v", got.WorkloadGate)
 	}
@@ -301,6 +306,9 @@ func TestBundleResolve_AllFieldsPopulated(t *testing.T) {
 	}
 	if got.StorageClass != "fast-ssd" {
 		t.Errorf("StorageClass: got %q", got.StorageClass)
+	}
+	if got.SharedStorageClass != "shared-rwx" {
+		t.Errorf("SharedStorageClass: got %q", got.SharedStorageClass)
 	}
 	if !got.Attest || got.CertIDRegexp != ".+" || !got.OIDCDeviceFlow {
 		t.Errorf("Attestation fields: got attest=%v cert=%q oidc=%v",
@@ -504,6 +512,13 @@ func TestBundleResolve_InvalidValues(t *testing.T) {
 				Scheduling: &config.SchedulingSpec{WorkloadGate: "no-effect"},
 			},
 			wantSub: "spec.bundle.scheduling.workloadGate",
+		},
+		{
+			name: "invalid DRA eviction node label",
+			spec: &config.BundleSpec{
+				Scheduling: &config.SchedulingSpec{DRAEvictionNodeLabel: "not-a-key-value-label"},
+			},
+			wantSub: "invalid node label",
 		},
 		{
 			name: "invalid output target",

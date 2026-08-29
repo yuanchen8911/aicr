@@ -25,6 +25,7 @@ import (
 
 	k8scollector "github.com/NVIDIA/aicr/pkg/collector/k8s"
 	"github.com/NVIDIA/aicr/pkg/measurement"
+	"github.com/NVIDIA/aicr/pkg/serializer"
 )
 
 func writePoolsFile(t *testing.T, content string) string {
@@ -205,14 +206,14 @@ measurements:
 	}
 }
 
-// TestRewriteSnapshotConfigMapRejectsBadInput pins the guard branches; the
+// TestWriteSnapshotConfigMapRejectsBadInput pins the guard branches; the
 // live write path requires a cluster and is covered by e2e.
-func TestRewriteSnapshotConfigMapRejectsBadInput(t *testing.T) {
-	if err := rewriteSnapshotConfigMap(t.Context(), "not-a-cm-uri", "", []byte("{}")); err == nil {
-		t.Fatal("rewriteSnapshotConfigMap(bad URI) = nil, want error")
+func TestWriteSnapshotConfigMapRejectsBadInput(t *testing.T) {
+	if err := writeSnapshotConfigMap(t.Context(), "not-a-cm-uri", "", []byte("{}"), serializer.FormatYAML); err == nil {
+		t.Fatal("writeSnapshotConfigMap(bad URI) = nil, want error")
 	}
-	if err := rewriteSnapshotConfigMap(t.Context(), "cm://ns/name", "", []byte("{not yaml")); err == nil {
-		t.Fatal("rewriteSnapshotConfigMap(garbage snapshot) = nil, want parse error")
+	if err := writeSnapshotConfigMap(t.Context(), "cm://ns/name", "", []byte("{not yaml"), serializer.FormatYAML); err == nil {
+		t.Fatal("writeSnapshotConfigMap(garbage snapshot) = nil, want parse error")
 	}
 }
 

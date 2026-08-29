@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -50,6 +51,16 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
 )
+
+// endpointReadySuccessTimeout bounds the success-path readiness probe so a
+// regression that breaks the accept condition fails in milliseconds rather
+// than blocking up to defaults.InferenceHealthTimeout.
+const endpointReadySuccessTimeout = 250 * time.Millisecond
+
+// endpointReadyFailureTimeout is the deliberately tiny deadline for the
+// never-ready case: the expiry is the behavior under test, so it must stay far
+// below defaults.InferenceHealthTimeout.
+const endpointReadyFailureTimeout = 50 * time.Millisecond
 
 func TestHasDynamoPlatform(t *testing.T) {
 	tests := []struct {
@@ -290,8 +301,33 @@ func TestParseAIPerfOutput(t *testing.T) {
 			wantTTFT:       84.1,
 		},
 		{
+			// Shape emitted by aiperf_entrypoint.py: benchmark chatter, then
+			// sentinel, then the exported JSON, then sentinel. Sentinel lookup
+			// is substring-based, so the parser also tolerates the closing
+			// sentinel sharing a line with the JSON's final brace — the
+			// wrapper's newline guard is for log readability, not parseability.
+			// TestAIPerfEntrypointFramingFeedsParser asserts the real bytes;
+			// this case keeps the parser covered without python3 on PATH.
+			name: "wrapper framing with no trailing newline in export",
+			logs: "stub-aiperf: progress chatter\nstub-aiperf: done\n" +
+				aiperfResultSentinel + "\n" + validJSON + "\n" + aiperfResultSentinel + "\n",
+			wantThroughput: 5667.5,
+			wantTTFT:       84.1,
+		},
+		{
+			// The guard-absent shape, proving the claim above rather than
+			// asserting it in a comment: the closing sentinel glued to the
+			// final brace still parses.
+			name:           "closing sentinel glued to the JSON's final brace",
+			logs:           aiperfResultSentinel + "\n" + validJSON + aiperfResultSentinel + "\n",
+			wantThroughput: 5667.5,
+			wantTTFT:       84.1,
+		},
+		{
+			// A failed benchmark exits non-zero before the wrapper emits any
+			// sentinel, so the logs carry only diagnostics.
 			name:          "missing start sentinel — benchmark failed",
-			logs:          "pip install failed: unable to reach PyPI\n",
+			logs:          "aiperf-entrypoint: aiperf exited 7\n",
 			wantErrSubstr: "sentinel",
 		},
 		{
@@ -339,21 +375,21 @@ func TestIsDynamoDeploymentReady(t *testing.T) {
 	// status.components entries (each entry is a field->count map, e.g.
 	// {"replicas": 8, "readyReplicas": 8}).
 	dgd := func(state string, spec map[string]int64, status map[string]map[string]int64) *unstructured.Unstructured {
-		specComponents := make([]interface{}, 0, len(spec))
+		specComponents := make([]any, 0, len(spec))
 		for name, r := range spec {
-			specComponents = append(specComponents, map[string]interface{}{keyName: name, "replicas": r})
+			specComponents = append(specComponents, map[string]any{keyName: name, "replicas": r})
 		}
-		statusComponents := map[string]interface{}{}
+		statusComponents := map[string]any{}
 		for name, fields := range status {
-			m := map[string]interface{}{}
+			m := map[string]any{}
 			for k, v := range fields {
 				m[k] = v
 			}
 			statusComponents[name] = m
 		}
-		return &unstructured.Unstructured{Object: map[string]interface{}{
-			"spec":   map[string]interface{}{"components": specComponents},
-			"status": map[string]interface{}{"state": state, "components": statusComponents},
+		return &unstructured.Unstructured{Object: map[string]any{
+			"spec":   map[string]any{"components": specComponents},
+			"status": map[string]any{"state": state, "components": statusComponents},
 		}}
 	}
 	tests := []struct {
@@ -364,7 +400,7 @@ func TestIsDynamoDeploymentReady(t *testing.T) {
 		{name: "nil object", input: nil, want: false},
 		{
 			name:  "no status",
-			input: &unstructured.Unstructured{Object: map[string]interface{}{"spec": map[string]interface{}{}}},
+			input: &unstructured.Unstructured{Object: map[string]any{"spec": map[string]any{}}},
 			want:  false,
 		},
 		{
@@ -409,14 +445,14 @@ func TestIsDynamoDeploymentReady(t *testing.T) {
 		{
 			// spec replicas omitted → defaults to 1; one ready replica satisfies it.
 			name: "spec replicas omitted defaults to 1",
-			input: &unstructured.Unstructured{Object: map[string]interface{}{
-				"spec": map[string]interface{}{"components": []interface{}{
-					map[string]interface{}{keyName: "VllmDecodeWorker"}, // no replicas field
+			input: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{"components": []any{
+					map[string]any{keyName: "VllmDecodeWorker"}, // no replicas field
 				}},
-				"status": map[string]interface{}{
+				"status": map[string]any{
 					"state": "successful",
-					"components": map[string]interface{}{
-						"VllmDecodeWorker": map[string]interface{}{"replicas": int64(1), "readyReplicas": int64(1)},
+					"components": map[string]any{
+						"VllmDecodeWorker": map[string]any{"replicas": int64(1), "readyReplicas": int64(1)},
 					},
 				},
 			}},
@@ -425,14 +461,14 @@ func TestIsDynamoDeploymentReady(t *testing.T) {
 		{
 			// Present-but-wrong-typed spec replicas must fail closed, not default to 1.
 			name: "spec replicas wrong type fails closed",
-			input: &unstructured.Unstructured{Object: map[string]interface{}{
-				"spec": map[string]interface{}{"components": []interface{}{
-					map[string]interface{}{keyName: "VllmDecodeWorker", "replicas": "eight"},
+			input: &unstructured.Unstructured{Object: map[string]any{
+				"spec": map[string]any{"components": []any{
+					map[string]any{keyName: "VllmDecodeWorker", "replicas": "eight"},
 				}},
-				"status": map[string]interface{}{
+				"status": map[string]any{
 					"state": "successful",
-					"components": map[string]interface{}{
-						"VllmDecodeWorker": map[string]interface{}{"replicas": int64(8), "readyReplicas": int64(8)},
+					"components": map[string]any{
+						"VllmDecodeWorker": map[string]any{"replicas": int64(8), "readyReplicas": int64(8)},
 					},
 				},
 			}},
@@ -451,28 +487,28 @@ func TestIsDynamoDeploymentReady(t *testing.T) {
 func TestApplyInferenceWorkerScheduling(t *testing.T) {
 	// Minimal DynamoGraphDeployment skeleton matching testdata/inference/dynamo-deployment.yaml structure.
 	newObj := func() *unstructured.Unstructured {
-		return &unstructured.Unstructured{Object: map[string]interface{}{
+		return &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "nvidia.com/v1beta1",
 			"kind":       "DynamoGraphDeployment",
-			"spec": map[string]interface{}{
-				"components": []interface{}{
-					map[string]interface{}{
+			"spec": map[string]any{
+				"components": []any{
+					map[string]any{
 						keyName:    "Frontend",
 						"type":     "frontend",
 						"replicas": int64(1),
-						"podTemplate": map[string]interface{}{
-							"spec": map[string]interface{}{
-								"containers": []interface{}{map[string]interface{}{keyName: mainContainerName}},
+						"podTemplate": map[string]any{
+							"spec": map[string]any{
+								"containers": []any{map[string]any{keyName: mainContainerName}},
 							},
 						},
 					},
-					map[string]interface{}{
+					map[string]any{
 						keyName:    "VllmDecodeWorker",
 						"type":     "worker",
 						"replicas": int64(4),
-						"podTemplate": map[string]interface{}{
-							"spec": map[string]interface{}{
-								"containers": []interface{}{map[string]interface{}{keyName: mainContainerName}},
+						"podTemplate": map[string]any{
+							"spec": map[string]any{
+								"containers": []any{map[string]any{keyName: mainContainerName}},
 							},
 						},
 					},
@@ -551,7 +587,7 @@ func TestApplyInferenceWorkerScheduling(t *testing.T) {
 			if len(tols) != 1 {
 				t.Fatalf("worker tolerations count = %d, want 1", len(tols))
 			}
-			tol := tols[0].(map[string]interface{})
+			tol := tols[0].(map[string]any)
 			if tol["key"] != "dedicated" || tol["value"] != "worker-workload" || tol["effect"] != "NoSchedule" {
 				t.Errorf("worker toleration = %v, unexpected fields", tol)
 			}
@@ -564,7 +600,7 @@ func TestApplyInferenceWorkerScheduling(t *testing.T) {
 				if !claimsFound || len(claims) != 1 {
 					t.Fatalf("worker resourceClaims = %v (found=%t), want exactly one DRA claim binding", claims, claimsFound)
 				}
-				binding := claims[0].(map[string]interface{})
+				binding := claims[0].(map[string]any)
 				if binding["resourceClaimTemplateName"] != inferenceClaimTemplateName {
 					t.Errorf("claim binding template = %v, want %s", binding["resourceClaimTemplateName"], inferenceClaimTemplateName)
 				}
@@ -615,11 +651,11 @@ func TestApplyInferenceWorkerScheduling(t *testing.T) {
 
 // mainContainerResourceClaims returns the main container's resources.claims
 // entries (nil when absent).
-func mainContainerResourceClaims(t *testing.T, podSpec map[string]interface{}) []interface{} {
+func mainContainerResourceClaims(t *testing.T, podSpec map[string]any) []any {
 	t.Helper()
 	containers, _, _ := unstructured.NestedSlice(podSpec, "containers")
 	for _, raw := range containers {
-		container, ok := raw.(map[string]interface{})
+		container, ok := raw.(map[string]any)
 		if !ok || container[keyName] != mainContainerName {
 			continue
 		}
@@ -630,8 +666,8 @@ func mainContainerResourceClaims(t *testing.T, podSpec map[string]interface{}) [
 }
 
 func TestApplyInferenceWorkerScheduling_MissingServices(t *testing.T) {
-	obj := &unstructured.Unstructured{Object: map[string]interface{}{
-		"spec": map[string]interface{}{},
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"spec": map[string]any{},
 	}}
 	err := applyInferenceWorkerScheduling(obj, &inferenceWorkloadConfig{})
 	if err == nil {
@@ -640,9 +676,9 @@ func TestApplyInferenceWorkerScheduling_MissingServices(t *testing.T) {
 }
 
 func TestEnsureMainContainerGPULimit_AppendsMainWhenMissing(t *testing.T) {
-	podSpec := map[string]interface{}{
-		"containers": []interface{}{
-			map[string]interface{}{keyName: "sidecar-frontend"},
+	podSpec := map[string]any{
+		"containers": []any{
+			map[string]any{keyName: "sidecar-frontend"},
 		},
 	}
 	ensureMainContainerGPULimit(podSpec, 1)
@@ -654,14 +690,14 @@ func TestEnsureMainContainerGPULimit_AppendsMainWhenMissing(t *testing.T) {
 	if len(containers) != 2 {
 		t.Fatalf("containers count = %d, want 2: %v", len(containers), containers)
 	}
-	sidecar := containers[0].(map[string]interface{})
+	sidecar := containers[0].(map[string]any)
 	if sidecar[keyName] != "sidecar-frontend" {
 		t.Fatalf("first container = %v, want original sidecar preserved", sidecar)
 	}
 	if _, found, _ := unstructured.NestedString(sidecar, "resources", "limits", gpuResourceName); found {
 		t.Fatal("sidecar unexpectedly received a GPU limit")
 	}
-	main := containers[1].(map[string]interface{})
+	main := containers[1].(map[string]any)
 	if main[keyName] != mainContainerName {
 		t.Fatalf("appended container name = %v, want %s", main[keyName], mainContainerName)
 	}
@@ -678,12 +714,12 @@ func TestEnsureMainContainerGPULimit_AppendsMainWhenMissing(t *testing.T) {
 // limit is merged into an existing resources block (e.g. a template-supplied
 // memory limit) rather than replacing it.
 func TestEnsureMainContainerGPULimit_PreservesExistingResources(t *testing.T) {
-	podSpec := map[string]interface{}{
-		"containers": []interface{}{
-			map[string]interface{}{
+	podSpec := map[string]any{
+		"containers": []any{
+			map[string]any{
 				keyName: mainContainerName,
-				"resources": map[string]interface{}{
-					"limits": map[string]interface{}{"memory": "2Gi"},
+				"resources": map[string]any{
+					"limits": map[string]any{"memory": "2Gi"},
 				},
 			},
 		},
@@ -694,7 +730,7 @@ func TestEnsureMainContainerGPULimit_PreservesExistingResources(t *testing.T) {
 	if err != nil || len(containers) != 1 {
 		t.Fatalf("read containers: err=%v count=%d", err, len(containers))
 	}
-	main := containers[0].(map[string]interface{})
+	main := containers[0].(map[string]any)
 	mem, found, err := unstructured.NestedString(main, "resources", "limits", "memory")
 	if err != nil || !found || mem != "2Gi" {
 		t.Errorf("existing memory limit lost: %q found=%v err=%v", mem, found, err)
@@ -705,14 +741,14 @@ func TestEnsureMainContainerGPULimit_PreservesExistingResources(t *testing.T) {
 	}
 }
 
-func componentPodSpec(t *testing.T, obj *unstructured.Unstructured, name string) map[string]interface{} {
+func componentPodSpec(t *testing.T, obj *unstructured.Unstructured, name string) map[string]any {
 	t.Helper()
 	components, _, err := unstructured.NestedSlice(obj.Object, "spec", "components")
 	if err != nil {
 		t.Fatalf("read spec.components: %v", err)
 	}
 	for _, raw := range components {
-		component, ok := raw.(map[string]interface{})
+		component, ok := raw.(map[string]any)
 		if !ok || component[keyName] != name {
 			continue
 		}
@@ -729,14 +765,14 @@ func componentPodSpec(t *testing.T, obj *unstructured.Unstructured, name string)
 // mainContainerGPULimit returns the main container's
 // resources.limits["nvidia.com/gpu"] value, or nil when the limit (or the
 // main container's resources block) is absent.
-func mainContainerGPULimit(t *testing.T, podSpec map[string]interface{}) interface{} {
+func mainContainerGPULimit(t *testing.T, podSpec map[string]any) any {
 	t.Helper()
 	containers, _, err := unstructured.NestedSlice(podSpec, "containers")
 	if err != nil {
 		t.Fatalf("read containers: %v", err)
 	}
 	for _, raw := range containers {
-		container, ok := raw.(map[string]interface{})
+		container, ok := raw.(map[string]any)
 		if !ok || container[keyName] != mainContainerName {
 			continue
 		}
@@ -780,10 +816,10 @@ func TestParseDynamoTemplate_ScalarModelStaysString(t *testing.T) {
 				t.Fatalf("parseYAMLTemplate() error: %v", err)
 			}
 			envs := componentContainerEnv(t, obj, "Frontend", mainContainerName)
-			var got interface{}
+			var got any
 			var found bool
 			for _, e := range envs {
-				m, ok := e.(map[string]interface{})
+				m, ok := e.(map[string]any)
 				if ok && m["name"] == "SERVED_MODEL_NAME" {
 					got, found = m["value"], true
 					break
@@ -821,7 +857,7 @@ func TestParseDynamoTemplate_RouterModeSubstituted(t *testing.T) {
 	}
 	envs := componentContainerEnv(t, obj, "Frontend", mainContainerName)
 	for _, e := range envs {
-		m, ok := e.(map[string]interface{})
+		m, ok := e.(map[string]any)
 		if ok && m["name"] == "DYN_ROUTER_MODE" {
 			if got := m["value"]; got != "kv" {
 				t.Errorf("DYN_ROUTER_MODE = %v, want %q", got, "kv")
@@ -832,7 +868,68 @@ func TestParseDynamoTemplate_RouterModeSubstituted(t *testing.T) {
 	t.Fatal("DYN_ROUTER_MODE env not found in Frontend envs")
 }
 
-func componentContainerEnv(t *testing.T, obj *unstructured.Unstructured, componentName, containerName string) []interface{} {
+// TestParseDynamoTemplate_WorkerDriverLibPathAppend pins the worker command's
+// guarded LD_LIBRARY_PATH append in both Dynamo deployment templates. GKE's
+// managed device plugin (gke-default gpuStack value) mounts the node driver
+// tree at /usr/local/nvidia without touching the container environment, so
+// without this append vLLM cannot dlopen libcuda.so.1 and crashes with
+// "Failed to infer device type" (observed live in gke-default qualification).
+// The shape matters: a shell APPEND with the ${VAR:+} guard — a pod-level env
+// would clobber the image's own LD_LIBRARY_PATH (nixl/ucx/cuda entries), and
+// an unguarded "${LD_LIBRARY_PATH}:" append would create a leading empty
+// ld.so entry (= CWD). If someone reverts the wrapper to a bare
+// ["python3", "-m", "dynamo.vllm"], this fails.
+func TestParseDynamoTemplate_WorkerDriverLibPathAppend(t *testing.T) {
+	wantCommand := []string{
+		"/bin/bash",
+		"-c",
+		`export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/nvidia/lib64"; exec python3 -m dynamo.vllm "$@"`,
+		"dynamo.vllm",
+	}
+	for _, tmpl := range []string{"dynamo-deployment.yaml", "dynamo-deployment-gateway-epp.yaml"} {
+		t.Run(tmpl, func(t *testing.T) {
+			obj, err := parseYAMLTemplate(filepath.Join("testdata", "inference", tmpl), map[string]string{
+				"NAMESPACE":       "aicr-test",
+				"MODEL":           "Qwen/Qwen3-8B",
+				"ROUTER_MODE":     dynRouterModeDefault,
+				"GPU_COUNT":       "1",
+				"DEPLOYMENT_NAME": "aicr-inference",
+			})
+			if err != nil {
+				t.Fatalf("parseYAMLTemplate() error: %v", err)
+			}
+			podSpec := componentPodSpec(t, obj, "VllmDecodeWorker")
+			containers, _, err := unstructured.NestedSlice(podSpec, "containers")
+			if err != nil {
+				t.Fatalf("read VllmDecodeWorker containers: %v", err)
+			}
+			for _, raw := range containers {
+				container, ok := raw.(map[string]any)
+				if !ok || container[keyName] != mainContainerName {
+					continue
+				}
+				command, _, err := unstructured.NestedStringSlice(container, "command")
+				if err != nil {
+					t.Fatalf("read main container command: %v", err)
+				}
+				if !reflect.DeepEqual(command, wantCommand) {
+					t.Errorf("main container command = %#v, want %#v", command, wantCommand)
+				}
+				// The wrapper forwards args via "$@" with argv0 consumed by
+				// the trailing "dynamo.vllm" element — the model flag must
+				// still be the first arg the worker sees.
+				args, _, err := unstructured.NestedStringSlice(container, "args")
+				if err != nil || len(args) == 0 || args[0] != "--model" {
+					t.Errorf("main container args = %v (err=%v), want first element %q", args, err, "--model")
+				}
+				return
+			}
+			t.Fatal("main container not found in VllmDecodeWorker")
+		})
+	}
+}
+
+func componentContainerEnv(t *testing.T, obj *unstructured.Unstructured, componentName, containerName string) []any {
 	t.Helper()
 	podSpec := componentPodSpec(t, obj, componentName)
 	containers, _, err := unstructured.NestedSlice(podSpec, "containers")
@@ -840,7 +937,7 @@ func componentContainerEnv(t *testing.T, obj *unstructured.Unstructured, compone
 		t.Fatalf("read %s containers: %v", componentName, err)
 	}
 	for _, raw := range containers {
-		container, ok := raw.(map[string]interface{})
+		container, ok := raw.(map[string]any)
 		if !ok || container[keyName] != containerName {
 			continue
 		}
@@ -896,19 +993,64 @@ func TestBuildAIPerfJob_PrebuiltImageAndSentinel(t *testing.T) {
 		t.Errorf("aiperfBaseImage %q should be the pre-built ghcr image", aiperfBaseImage)
 	}
 
-	script := container.Args[0]
-	if strings.Contains(script, "pip install") {
-		t.Errorf("script should not pip install at runtime — aiperf is baked into the image; got:\n%s", script)
+	// The runtime image is distroless (no /bin/sh), so the Job must invoke the
+	// baked Python framing wrapper in exec form. A regression back to a shell
+	// would fail at pod start with "exec: /bin/sh: no such file or directory".
+	wantCommand := []string{aiperfEntrypointPython, aiperfEntrypointScript}
+	if !reflect.DeepEqual(container.Command, wantCommand) {
+		t.Errorf("container.Command = %v, want %v", container.Command, wantCommand)
 	}
-	if !strings.Contains(script, aiperfResultSentinel) {
-		t.Errorf("script missing result sentinel %q", aiperfResultSentinel)
+	assertNoShellIndicators(t, container, "the distroless runtime has none")
+
+	argv := strings.Join(container.Args, " ")
+	if strings.Contains(argv, "pip install") {
+		t.Errorf("args should not pip install at runtime — aiperf is baked into the image; got:\n%s", argv)
 	}
-	if strings.Contains(script, "2>&1") || strings.Contains(script, "> /dev/null") {
-		t.Errorf("script should not silence stderr/stdout — benchmark errors must surface in pod logs")
+	if strings.Contains(argv, "2>&1") || strings.Contains(argv, "> /dev/null") {
+		t.Errorf("args should not silence stderr/stdout — benchmark errors must surface in pod logs")
 	}
-	// /bin/sh is sufficient (POSIX) and avoids a bash install in the image.
-	if len(container.Command) == 0 || container.Command[0] != "/bin/sh" {
-		t.Errorf("container.Command[0] = %v, want /bin/sh", container.Command)
+	// The wrapper prepends `aiperf profile`, so Args must carry only flags —
+	// a leading subcommand would be passed twice.
+	if len(container.Args) == 0 || !strings.HasPrefix(container.Args[0], "-") {
+		t.Errorf("container.Args should start with a flag, got %v", container.Args)
+	}
+	for _, want := range []string{
+		"--output-artifact-dir " + aiperfArtifactDir,
+		"--export-level summary",
+		"--endpoint-type chat",
+	} {
+		if !strings.Contains(argv, want) {
+			t.Errorf("args missing %q; got:\n%s", want, argv)
+		}
+	}
+
+	// Sentinel framing moved from the shell script into env consumed by
+	// aiperf_entrypoint.py; parseAIPerfOutput still keys off this exact value.
+	env := map[string]string{}
+	for _, e := range container.Env {
+		env[e.Name] = e.Value
+	}
+	if env[envAIPerfResultMarker] != aiperfResultSentinel {
+		t.Errorf("%s = %q, want %q", envAIPerfResultMarker, env[envAIPerfResultMarker], aiperfResultSentinel)
+	}
+	if env[envAIPerfArtifactDir] != aiperfArtifactDir {
+		t.Errorf("%s = %q, want %q", envAIPerfArtifactDir, env[envAIPerfArtifactDir], aiperfArtifactDir)
+	}
+	// The artifact dir is double-sourced: argv tells aiperf where to write, env
+	// tells the wrapper where to read. They agree today because both resolve
+	// from one constant, but a future per-run subdirectory applied to only the
+	// argv side would leave the wrapper reading a stale path and returning 1
+	// ("cannot read result file") on an otherwise-successful benchmark.
+	argvArtifactDir, ok := argvFlagValue(container.Args, "--output-artifact-dir")
+	if !ok {
+		t.Fatalf("--output-artifact-dir missing from argv: %v", container.Args)
+	}
+	if argvArtifactDir != env[envAIPerfArtifactDir] {
+		t.Errorf("--output-artifact-dir = %q but %s = %q; aiperf would write where the wrapper does not read",
+			argvArtifactDir, envAIPerfArtifactDir, env[envAIPerfArtifactDir])
+	}
+	if env[envAIPerfModel] == "" {
+		t.Errorf("%s must be set so the wrapper can pass --model", envAIPerfModel)
 	}
 
 	// Pull secrets from the outer pod must propagate to the inner aiperf pod
@@ -1011,11 +1153,44 @@ func clearTuningEnvs(t *testing.T) {
 	}
 }
 
-// TestBuildAIPerfJob_ModelViaEnvNotShell verifies the model is passed through a
-// container env var and referenced as "$AICR_MODEL" in the script, never
-// interpolated into the /bin/sh -c text — so a model containing shell
-// metacharacters cannot be command-substituted before the benchmark runs.
-func TestBuildAIPerfJob_ModelViaEnvNotShell(t *testing.T) {
+// assertNoShellIndicators fails if any element of the container's full argv
+// looks like a shell invocation. The aiperf-bench runtime is distroless and
+// ships no /bin/sh, so a regression here fails at pod start rather than in a
+// test — and it is what keeps a metacharacter-bearing model inert. Shared by
+// every test that asserts the shell-free contract so the recognized set of
+// shell binaries stays in one place.
+func assertNoShellIndicators(t *testing.T, ctr v1.Container, why string) {
+	t.Helper()
+	for _, a := range append(append([]string{}, ctr.Command...), ctr.Args...) {
+		if strings.HasSuffix(a, "/sh") || strings.HasSuffix(a, "/bash") || a == "-c" {
+			t.Errorf("argv element %q implies a shell; %s", a, why)
+		}
+	}
+}
+
+// aiperfArgv renders the container's benchmark flags for substring assertions.
+// Args is exec-form argv (no shell), so joining on a space reproduces the
+// "--flag value" shape the older script-based assertions matched against.
+func aiperfArgv(job *batchv1.Job) string {
+	return strings.Join(job.Spec.Template.Spec.Containers[0].Args, " ")
+}
+
+// argvFlagValue returns the element following the named flag in argv.
+func argvFlagValue(args []string, flag string) (string, bool) {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1], true
+		}
+	}
+	return "", false
+}
+
+// TestBuildAIPerfJob_ModelCarriedAsDiscreteArgv verifies the model is handed to
+// execvp as its own argv element rather than spliced into a command string. The
+// runtime image is distroless with no shell, so a model containing shell
+// metacharacters must survive verbatim and inert — not be quoted, escaped, or
+// indirected through an env expansion that no longer has a shell to expand it.
+func TestBuildAIPerfJob_ModelCarriedAsDiscreteArgv(t *testing.T) {
 	clearTuningEnvs(t)
 	malicious := "$(touch /tmp/pwned)"
 	job, _, err := buildAIPerfJob("ns", "aicr-aiperf-run-0", "http://ep:8000", malicious, 16, nil)
@@ -1023,22 +1198,30 @@ func TestBuildAIPerfJob_ModelViaEnvNotShell(t *testing.T) {
 		t.Fatalf("buildAIPerfJob: %v", err)
 	}
 	ctr := job.Spec.Template.Spec.Containers[0]
-	script := ctr.Args[0]
-	if strings.Contains(script, malicious) {
-		t.Errorf("script must not interpolate the model verbatim (injection risk); script:\n%s", script)
+
+	// The value must appear as exactly one argv element, so execvp passes it
+	// as a single token with no re-parsing.
+	got, ok := argvFlagValue(ctr.Args, "--model")
+	if !ok {
+		t.Fatalf("--model flag missing from argv: %v", ctr.Args)
 	}
-	if !strings.Contains(script, `"$AICR_MODEL"`) {
-		t.Errorf("script must reference the model via \"$AICR_MODEL\"; script:\n%s", script)
+	if got != malicious {
+		t.Errorf("--model value = %q, want the raw model %q carried verbatim", got, malicious)
 	}
-	var got string
+
+	// No shell anywhere in the invocation means nothing can substitute it.
+	assertNoShellIndicators(t, ctr, "the model would become command-substitutable")
+
+	// Retained for operator visibility via `kubectl describe pod`.
+	var envVal string
 	found := false
 	for _, e := range ctr.Env {
-		if e.Name == "AICR_MODEL" {
-			got, found = e.Value, true
+		if e.Name == envAIPerfModel {
+			envVal, found = e.Value, true
 		}
 	}
-	if !found || got != malicious {
-		t.Errorf("AICR_MODEL env = %q (found=%v), want the raw model %q carried as data", got, found, malicious)
+	if !found || envVal != malicious {
+		t.Errorf("%s env = %q (found=%v), want the raw model %q", envAIPerfModel, envVal, found, malicious)
 	}
 }
 
@@ -1048,16 +1231,20 @@ func TestBuildAIPerfJob_ModelViaEnvNotShell(t *testing.T) {
 // regression here fails every inference-perf run on every cloud.
 func TestBuildAIPerfJob_ModelPassedWithFlag(t *testing.T) {
 	clearTuningEnvs(t)
-	job, _, err := buildAIPerfJob("ns", "aicr-aiperf-run-0", "http://ep:8000", "Qwen/Qwen3-8B", 16, nil)
+	const model = "Qwen/Qwen3-8B"
+	job, _, err := buildAIPerfJob("ns", "aicr-aiperf-run-0", "http://ep:8000", model, 16, nil)
 	if err != nil {
 		t.Fatalf("buildAIPerfJob: %v", err)
 	}
-	script := job.Spec.Template.Spec.Containers[0].Args[0]
-	if !strings.Contains(script, `--model "$AICR_MODEL"`) {
-		t.Errorf("script must pass the model as `--model \"$AICR_MODEL\"`; script:\n%s", script)
+	args := job.Spec.Template.Spec.Containers[0].Args
+	got, ok := argvFlagValue(args, "--model")
+	if !ok || got != model {
+		t.Errorf("argv must pass the model as `--model %s`; got %v", model, args)
 	}
-	if strings.Contains(script, `aiperf profile "$AICR_MODEL"`) {
-		t.Errorf("model must not be passed positionally (rejected by aiperf >= 0.11.0); script:\n%s", script)
+	// A bare positional would be argv[0] since the wrapper supplies only
+	// `aiperf profile` ahead of these args.
+	if len(args) > 0 && args[0] == model {
+		t.Errorf("model must not be passed positionally (rejected by aiperf >= 0.11.0); got %v", args)
 	}
 }
 
@@ -1074,7 +1261,7 @@ func TestBuildAIPerfJob_RequestCountFloor(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			job := mustBuildAIPerfJob(t, "ns", "aicr-aiperf-run-0", "http://ep:8000", tt.concurrency, nil)
-			script := job.Spec.Template.Spec.Containers[0].Args[0]
+			script := aiperfArgv(job)
 			needle := fmt.Sprintf("--request-count %d", tt.wantMinReqs)
 			if !strings.Contains(script, needle) {
 				t.Errorf("script missing %q; script:\n%s", needle, script)
@@ -1099,7 +1286,7 @@ func TestBuildAIPerfJob_Warmup(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			job := mustBuildAIPerfJob(t, "ns", "aicr-aiperf-run-0", "http://ep:8000", tt.concurrency, nil)
-			script := job.Spec.Template.Spec.Containers[0].Args[0]
+			script := aiperfArgv(job)
 			needle := fmt.Sprintf("--warmup-request-count %d", tt.concurrency*aiperfWarmupPerConcurrency)
 			if !strings.Contains(script, needle) {
 				t.Errorf("concurrency=%d: script missing %q; script:\n%s", tt.concurrency, needle, script)
@@ -1665,7 +1852,7 @@ func TestBuildAIPerfJob_EnvOverrides(t *testing.T) {
 	t.Setenv(envOutputTokensMean, "256")
 
 	job := mustBuildAIPerfJob(t, "ns", "run-0", "http://ep:8000", 100, nil)
-	script := job.Spec.Template.Spec.Containers[0].Args[0]
+	script := aiperfArgv(job)
 	for _, needle := range []string{
 		"--request-count 2000",
 		"--warmup-request-count 300",
@@ -2880,7 +3067,7 @@ func TestWaitForEndpointReady_AcceptsOnFirstRealCompletion(t *testing.T) {
 	// InferenceHealthTimeout (5 m). 250 ms is comfortable headroom over the
 	// 3-call/1 ms expected critical path while still tight enough to surface
 	// a stuck loop.
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), endpointReadySuccessTimeout)
 	defer cancel()
 	if err := waitForEndpointReadyWithInterval(ctx, srv.URL, "test-model", time.Millisecond, defaults.InferenceHealthTimeout); err != nil {
 		t.Fatalf("waitForEndpointReady returned error: %v", err)
@@ -2902,7 +3089,7 @@ func TestWaitForEndpointReady_TimesOutWhenAlwaysEmpty(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), endpointReadyFailureTimeout)
 	defer cancel()
 
 	err := waitForEndpointReadyWithInterval(ctx, srv.URL, "test-model", time.Millisecond, defaults.InferenceHealthTimeout)
@@ -2966,14 +3153,14 @@ func TestApplyWorkerClaimTemplate_VersionDispatch(t *testing.T) {
 			if !found || len(requests) != 1 {
 				t.Fatalf("spec.spec.devices.requests = %v (found=%t), want exactly one request", requests, found)
 			}
-			req := requests[0].(map[string]interface{})
+			req := requests[0].(map[string]any)
 			_, hasExactly := req["exactly"]
 			if hasExactly != tt.wantExactly {
 				t.Errorf("request has exactly wrapper = %t, want %t (version %s)", hasExactly, tt.wantExactly, effective)
 			}
 			fields := req
 			if tt.wantExactly {
-				fields = req["exactly"].(map[string]interface{})
+				fields = req["exactly"].(map[string]any)
 			}
 			if fields["deviceClassName"] != "gpu.nvidia.com" {
 				t.Errorf("deviceClassName = %v, want gpu.nvidia.com", fields["deviceClassName"])
@@ -3149,10 +3336,19 @@ func TestRejectUnsupportedGPUTopology(t *testing.T) {
 func TestInferenceSkipMessagesHaveContractualPrefix(t *testing.T) {
 	for _, msg := range []string{
 		inferenceSkipMsgNoDynamoPlatform,
-		inferenceSkipMsgCRDNotInstalled,
 	} {
 		if !strings.HasPrefix(msg, "skipped") {
 			t.Fatalf("skip status %q is missing contractual 'skipped' prefix — inference_perf.go dispatches on it", msg)
 		}
+	}
+}
+
+// TestInferenceFailMsgCRDNotInstalledIsNotASkip guards the #2122 fail-closed
+// contract: the guard-C message must NOT carry the "skipped" prefix, or
+// inference_perf.go would misroute a fail-closed CRD-absent result as a Skip.
+func TestInferenceFailMsgCRDNotInstalledIsNotASkip(t *testing.T) {
+	if strings.HasPrefix(inferenceFailMsgCRDNotInstalled, "skipped") {
+		t.Fatalf("guard-C fail message %q must not carry the 'skipped' prefix — a declared dynamo-platform with a missing CRD must fail, not skip (#2122)",
+			inferenceFailMsgCRDNotInstalled)
 	}
 }

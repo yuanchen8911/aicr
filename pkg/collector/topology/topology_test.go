@@ -317,6 +317,52 @@ func TestCollect(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Issue #2003: synthesized "zone.us-west" collides with the
+			// literal label of that name; one reading is dropped.
+			name: "label key collides with a disambiguated key",
+			nodes: []*corev1.Node{
+				makeNode("gpu-a", nil,
+					map[string]string{
+						"zone":         "us-west",
+						"zone.us-west": "true",
+					},
+				),
+				makeNode("gpu-b", nil,
+					map[string]string{
+						"zone":         "us-east",
+						"zone.us-west": "true",
+					},
+				),
+			},
+			wantNodeCount:  2,
+			wantTaintCount: 0,
+			// {zone,us-west}, {zone,us-east}, {zone.us-west,true}
+			wantLabelCount: 3,
+		},
+		{
+			// Issue #2003: encodeTaints counts per Key but disambiguates with
+			// Effect, so both entries synthesize "dedicated.NoSchedule".
+			name: "same taint key and effect with different values",
+			nodes: []*corev1.Node{
+				makeNode("node-1",
+					[]corev1.Taint{
+						{Key: "dedicated", Value: "team-a", Effect: corev1.TaintEffectNoSchedule},
+					},
+					nil,
+				),
+				makeNode("node-2",
+					[]corev1.Taint{
+						{Key: "dedicated", Value: "team-b", Effect: corev1.TaintEffectNoSchedule},
+					},
+					nil,
+				),
+			},
+			wantNodeCount: 2,
+			// {dedicated,NoSchedule,team-a}, {dedicated,NoSchedule,team-b}
+			wantTaintCount: 2,
+			wantLabelCount: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -455,5 +501,32 @@ func TestLabelEncoding(t *testing.T) {
 	}
 	if parts[1] != "worker-1" {
 		t.Errorf("nodes = %q, want worker-1", parts[1])
+	}
+}
+
+// TestIsTruncatedNodeListRoundTrip pins the truncation detector to
+// formatNodeList's actual output, so a change to the suffix wording breaks
+// this test instead of silently failing open in consumers that must reject
+// truncated membership lists (pkg/constraints' node-set form, issue #1755).
+func TestIsTruncatedNodeListRoundTrip(t *testing.T) {
+	nodes := []string{"node-a", "node-b", "node-c"}
+
+	tests := []struct {
+		name          string
+		maxNodes      int
+		wantTruncated bool
+	}{
+		{"truncated below count", 2, true},
+		{"no limit", 0, false},
+		{"limit equals count", 3, false},
+		{"limit above count", 4, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := formatNodeList(nodes, tt.maxNodes)
+			if got := IsTruncatedNodeList(encoded); got != tt.wantTruncated {
+				t.Errorf("IsTruncatedNodeList(%q) = %v, want %v", encoded, got, tt.wantTruncated)
+			}
+		})
 	}
 }

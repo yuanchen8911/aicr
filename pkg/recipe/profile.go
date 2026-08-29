@@ -27,18 +27,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/aicr/pkg/allocpolicy"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 )
 
-// RecipeProfileAPIVersion is the RecipeMetadata and RecipeResult version used
-// when a configuration profile is present. Other AICR artifact kinds remain on
-// header.GroupVersion.
-const RecipeProfileAPIVersion = header.RecipeResultGroupVersion
+// RecipeProfileAPIVersion is the emitter version for RecipeMetadata and
+// RecipeResult when a configuration profile is present. These are on the
+// ADR-022 profile-bearing track, so this aliases header.ProfileGroupVersion;
+// the track's target is header.GroupVersionV1Beta2, which readers already
+// accept through header.IsSupportedProfileAPIVersion.
+const RecipeProfileAPIVersion = header.ProfileGroupVersion
 
 const (
-	profileAdvertiserExternal   = "external"
 	profileComponentEnabledPath = "enabled"
 	profileJSONSafeIntegerMax   = 1<<53 - 1
 )
@@ -55,12 +57,36 @@ type ProfileDeclaration struct {
 
 // ProfileValue is the closed fragment applied for one declared value.
 //
-// Advertiser is reserved for the GKE extension in rollout PR 3. It remains in
-// the wire shape so that PR can enable the accepted ADR contract without
-// another schema change; the core mechanism rejects every non-empty value.
+// Advertiser declares who advertises nvidia.com/gpu for this value. The
+// vocabulary is closed (pkg/allocpolicy.ValidateAdvertiser): empty means
+// the recipe's own components advertise (the AKS shape), and "external"
+// (allocpolicy.AdvertiserExternal, the GKE gke-default shape) declares a
+// provider-managed plugin outside the recipe as THE advertiser in the
+// #1327 exactly-one invariant — the declaration is copied into
+// metadata.selectedProfile.advertiser and extends the dual-advertisement
+// gates fail-closed. Any other value is rejected.
 type ProfileValue struct {
-	Advertiser    string                `json:"advertiser,omitempty" yaml:"advertiser,omitempty"`
-	Constraints   []Constraint          `json:"constraints,omitempty" yaml:"constraints,omitempty"`
+	Advertiser  string       `json:"advertiser,omitempty" yaml:"advertiser,omitempty"`
+	Constraints []Constraint `json:"constraints,omitempty" yaml:"constraints,omitempty"`
+
+	// ReadinessConstraints are evaluated only by the aicr validate readiness
+	// pre-flight, never at generation time: applyEffectiveProfile routes them
+	// into spec.validation.readiness.constraints instead of spec.constraints.
+	// Two kinds of state legally live here (ADR-015, "Self-rendered readings
+	// do not qualify"): externally-grounded cluster state evaluated
+	// post-deployment (provider properties, provisioning-set node labels),
+	// and deployment-outcome checks — the post-deployment form of a
+	// self-falsified pre-condition, or a marker the value's own workload
+	// writes, which a fresh deployment cannot find in the pre-deployment
+	// snapshot that generation-time constraints are evaluated against.
+	// Only the first kind QUALIFIES the value (establishes the cluster's
+	// pre-existing mode matches the selection). An outcome check binds no
+	// deployment identity — a stale marker from an earlier deployment
+	// satisfies it — so declare workload-written markers only when the
+	// producer owns the marker's lifecycle. Same fail-closed semantics as
+	// Constraints once the pre-flight runs; same catalog-load validation.
+	ReadinessConstraints []Constraint `json:"readinessConstraints,omitempty" yaml:"readinessConstraints,omitempty"`
+
 	ComponentRefs []ProfileComponentRef `json:"componentRefs,omitempty" yaml:"componentRefs,omitempty"`
 }
 
@@ -187,14 +213,10 @@ func ValidateProfileDeclaration(decl *ProfileDeclaration) (map[string][]string, 
 				fmt.Sprintf("profile value %q must match [A-Za-z0-9._-]+", valueName))
 		}
 		value := decl.Values[valueName]
-		if value.Advertiser != "" {
-			if value.Advertiser != profileAdvertiserExternal {
-				return nil, errors.New(errors.ErrCodeInvalidRequest,
-					fmt.Sprintf("profile %q value %q has unknown advertiser %q", decl.Name, valueName, value.Advertiser))
-			}
-			return nil, errors.New(errors.ErrCodeInvalidRequest,
-				fmt.Sprintf("profile %q value %q uses advertiser %q, which is deferred to the GKE profile extension",
-					decl.Name, valueName, value.Advertiser))
+		// ValidateAdvertiser already returns ErrCodeInvalidRequest naming
+		// the offending value; propagate as-is rather than double-wrap.
+		if err := allocpolicy.ValidateAdvertiser(value.Advertiser); err != nil {
+			return nil, err
 		}
 
 		// Profile constraints reach the merged spec unchanged, and
@@ -204,23 +226,43 @@ func ValidateProfileDeclaration(decl *ProfileDeclaration) (map[string][]string, 
 		// constraints already fail closed on an empty name or value
 		// (validateConstraintWarningSource); catalog load is the equivalent
 		// boundary for profile-contributed ones.
-		seenConstraints := make(map[string]struct{}, len(value.Constraints))
-		for _, constraint := range value.Constraints {
-			if constraint.Name == "" {
-				return nil, errors.New(errors.ErrCodeInvalidRequest,
-					fmt.Sprintf("profile %q value %q declares a constraint with no name", decl.Name, valueName))
+		// Each list deduplicates independently: constraint names are
+		// measurement paths, and the same reading legitimately appears in
+		// both lists of one value with different expected states — the DD5
+		// pattern reads NodeTopology.gpu-nodes.label at generation (a pool
+		// pre-condition) AND at readiness (a post-deployment marker). The
+		// two lists evaluate in different phases with per-phase diagnostics,
+		// so cross-list reuse is unambiguous; a repeat WITHIN a list is two
+		// gates with one identity and stays rejected.
+		checkConstraints := func(constraints []Constraint, kind string) error {
+			seen := make(map[string]struct{}, len(constraints))
+			for _, constraint := range constraints {
+				if constraint.Name == "" {
+					return errors.New(errors.ErrCodeInvalidRequest,
+						fmt.Sprintf("profile %q value %q declares a %s with no name", decl.Name, valueName, kind))
+				}
+				if constraint.Value == "" {
+					return errors.New(errors.ErrCodeInvalidRequest,
+						fmt.Sprintf("profile %q value %q %s %q has no value",
+							decl.Name, valueName, kind, constraint.Name))
+				}
+				if _, repeat := seen[constraint.Name]; repeat {
+					// Name the list: the same measurement path is legal in
+					// both constraints and readinessConstraints (the DD5
+					// pattern), so a repeat must say which list to fix.
+					return errors.New(errors.ErrCodeInvalidRequest,
+						fmt.Sprintf("profile %q value %q repeats %s %q",
+							decl.Name, valueName, kind, constraint.Name))
+				}
+				seen[constraint.Name] = struct{}{}
 			}
-			if constraint.Value == "" {
-				return nil, errors.New(errors.ErrCodeInvalidRequest,
-					fmt.Sprintf("profile %q value %q constraint %q has no value",
-						decl.Name, valueName, constraint.Name))
-			}
-			if _, repeat := seenConstraints[constraint.Name]; repeat {
-				return nil, errors.New(errors.ErrCodeInvalidRequest,
-					fmt.Sprintf("profile %q value %q repeats constraint %q",
-						decl.Name, valueName, constraint.Name))
-			}
-			seenConstraints[constraint.Name] = struct{}{}
+			return nil
+		}
+		if err := checkConstraints(value.Constraints, "constraint"); err != nil {
+			return nil, err
+		}
+		if err := checkConstraints(value.ReadinessConstraints, "readiness constraint"); err != nil {
+			return nil, err
 		}
 
 		seenComponents := make(map[string]struct{}, len(value.ComponentRefs))
@@ -248,12 +290,6 @@ func ValidateProfileDeclaration(decl *ProfileDeclaration) (map[string][]string, 
 					map[string]any{"profile": decl.Name, "value": valueName, "component": ref.Name})
 			}
 			for _, path := range paths {
-				if isDeferredAllocationPolicyPath(ref.Name, path) {
-					return nil, errors.New(errors.ErrCodeInvalidRequest,
-						fmt.Sprintf("profile %q value %q owns deferred allocation-policy path %s.%s; "+
-							"allocation-policy profiles land with the GKE extension",
-							decl.Name, valueName, ref.Name, path))
-				}
 				valuePaths = append(valuePaths, ref.Name+":"+path)
 				if ownedSet[ref.Name] == nil {
 					ownedSet[ref.Name] = make(map[string]struct{})
@@ -499,14 +535,18 @@ func profileOverrideReferenceFor(value reflect.Value) (profileOverrideReference,
 	return reference, true
 }
 
-func isDeferredAllocationPolicyPath(component, path string) bool {
-	deferred := map[string][]string{
-		"gpu-operator":          {"devicePlugin.enabled"},
-		"gpu-operator-ocp":      {"devicePlugin.enabled"},
-		"nvidia-dra-driver-gpu": {"resources.gpus.enabled", "gpuResourcesEnabledOverride"},
+// ownsAllocationPolicySelectorPath reports whether an owned path
+// structurally intersects one of the canonical #1327 policy-selector paths
+// (pkg/allocpolicy). Owning one is the second closure trigger alongside
+// advertiser "external": locks follow ownership (ADR-015 GKE amendment).
+func ownsAllocationPolicySelectorPath(component, path string) bool {
+	if path == profileComponentEnabledPath {
+		// The synthetic presence path never triggers the closure:
+		// referencing an advertiser component is not policy ownership.
+		return false
 	}
-	for _, policyPath := range deferred[component] {
-		if PathsIntersect(path, policyPath) {
+	for _, selectorPath := range allocpolicy.SelectorPaths(component) {
+		if PathsIntersect(path, selectorPath) {
 			return true
 		}
 	}
@@ -543,20 +583,21 @@ func profileSummary(decl *ProfileDeclaration) *ProfileSummary {
 
 // ValidateRecipeMetadataProfile enforces the bidirectional version/declaration
 // contract for typed RecipeMetadata callers. Byte decoders additionally use
-// strict decoding for RecipeProfileAPIVersion so unknown keys cannot vanish.
+// strict decoding for the profile schema track so unknown keys cannot vanish.
 func ValidateRecipeMetadataProfile(metadata *RecipeMetadata) error {
 	if metadata == nil {
 		return nil
 	}
+	profileVersion := header.IsSupportedProfileAPIVersion(metadata.APIVersion)
 	switch {
-	case metadata.APIVersion == RecipeProfileAPIVersion && metadata.Spec.Profile == nil:
+	case profileVersion && metadata.Spec.Profile == nil:
 		return errors.New(errors.ErrCodeInvalidRequest,
 			fmt.Sprintf("RecipeMetadata uses apiVersion %q but has no spec.profile declaration",
-				RecipeProfileAPIVersion))
-	case metadata.Spec.Profile != nil && metadata.APIVersion != RecipeProfileAPIVersion:
+				metadata.APIVersion))
+	case metadata.Spec.Profile != nil && !profileVersion:
 		return errors.New(errors.ErrCodeInvalidRequest,
-			fmt.Sprintf("RecipeMetadata declares spec.profile but uses apiVersion %q; expected %q",
-				metadata.APIVersion, RecipeProfileAPIVersion))
+			fmt.Sprintf("RecipeMetadata declares spec.profile but uses apiVersion %q; expected %q or %q",
+				metadata.APIVersion, RecipeProfileAPIVersion, header.GroupVersionV1Beta2))
 	case metadata.Spec.Profile != nil:
 		_, err := ValidateProfileDeclaration(metadata.Spec.Profile)
 		return err
@@ -572,14 +613,14 @@ func (r *RecipeResult) ValidateProfileContract() error {
 	if r == nil {
 		return nil
 	}
-	switch r.APIVersion {
-	case "", RecipeAPIVersion:
+	switch {
+	case r.APIVersion == "" || header.IsSupportedAPIVersion(r.APIVersion):
 		if r.Metadata.SelectedProfile != nil {
 			return errors.New(errors.ErrCodeInvalidRequest,
 				fmt.Sprintf("recipe apiVersion %q cannot carry metadata.selectedProfile", r.APIVersion))
 		}
 		return r.validateInlineDeepCopyCycles()
-	case RecipeProfileAPIVersion:
+	case header.IsSupportedProfileAPIVersion(r.APIVersion):
 		if err := r.validateProfileMetadataItems(); err != nil {
 			return err
 		}
@@ -589,12 +630,13 @@ func (r *RecipeResult) ValidateProfileContract() error {
 			}
 			return errors.New(errors.ErrCodeInvalidRequest,
 				fmt.Sprintf("recipe apiVersion %q requires metadata.selectedProfile or configuration.slurm.accounting",
-					RecipeProfileAPIVersion))
+					r.APIVersion))
 		}
 	default:
 		return errors.New(errors.ErrCodeInvalidRequest,
-			fmt.Sprintf("recipe has unsupported apiVersion %q; expected %q or %q",
-				r.APIVersion, RecipeAPIVersion, RecipeProfileAPIVersion))
+			fmt.Sprintf("recipe has unsupported apiVersion %q; expected %q, %q, %q, or %q",
+				r.APIVersion, RecipeResultAPIVersion, header.GroupVersionV1,
+				RecipeProfileAPIVersion, header.GroupVersionV1Beta2))
 	}
 
 	selected := r.Metadata.SelectedProfile
@@ -602,9 +644,10 @@ func (r *RecipeResult) ValidateProfileContract() error {
 		return errors.New(errors.ErrCodeInvalidRequest,
 			"metadata.selectedProfile name and value must match [A-Za-z0-9._-]+")
 	}
-	if selected.Advertiser != "" {
-		return errors.New(errors.ErrCodeInvalidRequest,
-			"metadata.selectedProfile.advertiser is deferred to the GKE profile extension")
+	// ValidateAdvertiser already returns ErrCodeInvalidRequest naming the
+	// offending value; propagate as-is rather than double-wrap.
+	if err := allocpolicy.ValidateAdvertiser(selected.Advertiser); err != nil {
+		return err
 	}
 	if selected.OwnedPaths == nil {
 		return errors.New(errors.ErrCodeInvalidRequest,
@@ -634,10 +677,6 @@ func (r *RecipeResult) ValidateProfileContract() error {
 			if i > 0 && paths[i-1] == path {
 				return errors.New(errors.ErrCodeInvalidRequest,
 					fmt.Sprintf("metadata.selectedProfile.ownedPaths[%q] repeats path %q", component, path))
-			}
-			if isDeferredAllocationPolicyPath(component, path) {
-				return errors.New(errors.ErrCodeInvalidRequest,
-					fmt.Sprintf("metadata.selectedProfile owns deferred allocation-policy path %s.%s", component, path))
 			}
 		}
 	}
@@ -699,10 +738,40 @@ func (r *RecipeResult) validateProfileMetadataItems() error {
 // for profiled artifacts, hydrates locked component values to reject an
 // incoherent ownership record. Legacy artifacts perform no additional I/O.
 func (r *RecipeResult) PrepareAndValidateWithContext(ctx context.Context) error {
+	return r.prepareAndValidateWithSource(ctx, "")
+}
+
+// prepareAndValidateWithSource is PrepareAndValidateWithContext with the
+// originating file name, so a rejected constraint path can name it.
+//
+// Only loader.go has a file: the other callers (pkg/bundler, pkg/mirror,
+// pkg/client/v1) receive a RecipeResult from an SDK caller with no source, and
+// use the exported form. An empty source omits the file prefix and the "file"
+// error-context key rather than reporting a placeholder.
+func (r *RecipeResult) prepareAndValidateWithSource(ctx context.Context, source string) error {
 	if err := r.PrepareAndValidate(); err != nil {
 		return err
 	}
-	if r == nil || r.Metadata.SelectedProfile == nil {
+	if r == nil {
+		return nil
+	}
+
+	// A hydrated RecipeResult read from disk never builds a metadata store, so
+	// the load-time constraint-path gate in buildMetadataStore does not see it.
+	// Without this, `aicr bundle -r hydrated.yaml` and `aicr validate -r
+	// hydrated.yaml` would skip the check on the very artifact whose
+	// constraints feed the readiness pre-flight (#1783).
+	if err := validateConstraintPaths(r.Constraints, source, locResultConstraints); err != nil {
+		return err
+	}
+	if r.Validation != nil && r.Validation.Readiness != nil {
+		if err := validateConstraintPaths(
+			r.Validation.Readiness.Constraints, source, locResultReadiness); err != nil {
+			return err
+		}
+	}
+
+	if r.Metadata.SelectedProfile == nil {
 		return nil
 	}
 	return r.ValidateProfileValuesWithContext(ctx)
@@ -724,14 +793,22 @@ func (r *RecipeResult) validateProfileValuesWithContext(
 	if r == nil || r.Metadata.SelectedProfile == nil {
 		return map[string]map[string]any{}, nil
 	}
-	hydrated := make(map[string]map[string]any, len(r.Metadata.SelectedProfile.OwnedPaths))
-	components := slices.Sorted(maps.Keys(r.Metadata.SelectedProfile.OwnedPaths))
+	// The effective lock set is the declared ownedPaths plus, when the
+	// profile owns advertisement, the recomputed #1327 closure. Closure
+	// paths are locked and hydrated exactly like declared paths, but the
+	// inline-ownership requirement applies only to declared paths: closure
+	// paths are assigned by component values files by design, never by the
+	// profile fragment.
+	lockSet := r.EffectiveLockSet()
+	declared := r.Metadata.SelectedProfile.OwnedPaths
+	hydrated := make(map[string]map[string]any, len(lockSet))
+	components := slices.Sorted(maps.Keys(lockSet))
 	for _, component := range components {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, errors.Wrap(
 				errors.ErrCodeTimeout, "profile value validation canceled", ctxErr)
 		}
-		paths := r.Metadata.SelectedProfile.OwnedPaths[component]
+		paths := lockSet[component]
 		ref := r.GetComponentRef(component)
 		if ref == nil || !ref.IsEnabled() {
 			return nil, errors.New(errors.ErrCodeInvalidRequest,
@@ -754,7 +831,7 @@ func (r *RecipeResult) validateProfileValuesWithContext(
 		if err := validateProfileOwnedValues(ref.Overrides, component, paths); err != nil {
 			return nil, err
 		}
-		if err := validateProfileInlineOwnership(ref.Overrides, component, paths); err != nil {
+		if err := validateProfileInlineOwnership(ref.Overrides, component, declared[component]); err != nil {
 			return nil, err
 		}
 		values, err := r.GetValuesForComponentWithContext(ctx, component)
@@ -780,7 +857,133 @@ func (r *RecipeResult) validateProfileValuesWithContext(
 			}
 		}
 	}
+	if err := r.checkAdvertiserCoherence(hydrated); err != nil {
+		return nil, err
+	}
 	return hydrated, nil
+}
+
+// checkAdvertiserCoherence runs the shared #1327 tuple-coherence rules
+// against the hydrated advertiser components for EVERY closure-triggering
+// profile — a declared external advertiser AND the empty (operator-advertised)
+// advertiser shape alike. The verdicts come from the single shared
+// evaluator (allocpolicy.CheckCoherence), which applies the same #1327
+// tuple-coherence rows as the validation-time resolver (pkg/validator/v1
+// ResolveGPUAllocationPolicy) — gate/resolver symmetry over the shared
+// tuple verdicts (ADR-015): for those tuple rows, an artifact this gate
+// emits is exactly an artifact validation accepts. The #1685 dual-operator
+// rejection is resolution-time-only and deliberately not mirrored here
+// (it is outside #1685's scope); bundle-time rejection is a separate
+// follow-up. The gate is gated on the profile owning advertisement: an
+// AKS-shaped profile performs no evaluation here, and the conflicting
+// toggle typically lives in a component values file — which is exactly
+// why this runs at the hydration boundary rather than only at resolution
+// (disk-loaded, POSTed, and direct-bundler recipes bypass resolution).
+func (r *RecipeResult) checkAdvertiserCoherence(hydrated map[string]map[string]any) error {
+	if !r.profileClosureTriggered() {
+		return nil
+	}
+	observation := allocpolicy.Observation{Advertiser: r.Metadata.SelectedProfile.Advertiser}
+	external := observation.Advertiser == allocpolicy.AdvertiserExternal
+	// The closure guarantees every enabled descriptor component was
+	// hydrated above. An absent devicePlugin.enabled on an enabled
+	// operator component follows the upstream chart default (true) — the
+	// same reading the #1327 resolver applies. The aggregation mirrors the
+	// resolver's per-advertiser reading for the shared tuple verdicts:
+	// under a declared external advertiser EVERY enabled operator
+	// component is a potential second advertiser (OR semantics); under an
+	// empty advertiser the gate reads the first present operator component
+	// (gpu-operator before gpu-operator-ocp in the iteration). The
+	// resolver's #1685 rejection of a recipe with both operators enabled
+	// is resolution-time-only and deliberately not mirrored here —
+	// diverging on the shared tuple rows would emit artifacts validation
+	// resolves differently.
+	for _, component := range []string{allocpolicy.ComponentGPUOperator, allocpolicy.ComponentGPUOperatorOCP} {
+		values, ok := hydrated[component]
+		if !ok {
+			continue
+		}
+		enabled, known, err := profileBoolAtPath(values, component, allocpolicy.PathDevicePluginEnabled)
+		if err != nil {
+			return err
+		}
+		if !known {
+			// Absent devicePlugin.enabled on an enabled operator component
+			// follows the upstream chart default (true) — the same reading
+			// the #1327 resolver applies.
+			enabled = true
+		}
+		if observation.DevicePluginEnabled == nil {
+			observation.DevicePluginEnabled = &enabled
+			observation.GPUOperatorComponent = component
+		} else if external && enabled {
+			observation.DevicePluginEnabled = &enabled
+		}
+	}
+	if values, ok := hydrated[allocpolicy.ComponentDRADriver]; ok {
+		enabled, known, err := profileBoolAtPath(values, allocpolicy.ComponentDRADriver, allocpolicy.PathDRAGPUsEnabled)
+		if err != nil {
+			return err
+		}
+		if !known {
+			// Fail closed, mirroring the validation-time resolver
+			// (pkg/validator/v1 ResolveGPUAllocationPolicy): the upstream
+			// chart's DECLARED default is gpus.enabled=true, so an enabled
+			// DRA component with an absent switch would deploy a whole-GPU
+			// advertiser this gate never observed — under a declared
+			// external advertiser that is exactly the #1327 dual
+			// advertisement. Skipping (leaving the reading nil) would let
+			// the artifact through generation and bundling; validation is
+			// not guaranteed to run before deploy. The rejection is
+			// deliberately advertiser-independent: the resolver's
+			// absent-switch check fires before any advertiser branching
+			// (a chart-default whole-GPU advertiser next to an operator
+			// plugin is the same latent dual advertisement), so scoping
+			// this gate to advertiser==external would emit artifacts
+			// validation later rejects. Stock recipes always pin
+			// the switch via the component values; only custom/SDK values
+			// files can omit it.
+			return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+				"component %q is enabled but %q is not set — the upstream chart's declared default (true) would diverge from the artifact's advertiser-coherence evaluation; pin the value explicitly in the recipe (issue #1327)",
+				allocpolicy.ComponentDRADriver, allocpolicy.PathDRAGPUsEnabled))
+		}
+		observation.DRAGPUsEnabled = &enabled
+		waiver, waiverKnown, err := profileBoolAtPath(values, allocpolicy.ComponentDRADriver, allocpolicy.PathDRAGPUsEnabledOverride)
+		if err != nil {
+			return err
+		}
+		// Absent gpuResourcesEnabledOverride reads false — the upstream
+		// chart default, the same reading the #1327 resolver applies.
+		if !waiverKnown {
+			waiver = false
+		}
+		observation.DRAGPUsEnabledOverride = &waiver
+	}
+	return allocpolicy.CheckCoherence(observation)
+}
+
+// profileBoolAtPath reads a boolean at a dotted path. known is false when
+// the path is absent; a present non-bool or a blocking ancestor fails
+// closed.
+func profileBoolAtPath(values map[string]any, component, path string) (value, known bool, err error) {
+	raw, state := profileValueAtPath(values, path)
+	switch state {
+	case PathPresent:
+		b, ok := raw.(bool)
+		if !ok {
+			return false, false, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("component %q value %s must be a boolean, got %T", component, path, raw))
+		}
+		return b, true, nil
+	case PathBlocked:
+		return false, false, errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("component %q value %s is blocked by a non-map ancestor", component, path))
+	case PathAbsent:
+		return false, false, nil
+	default:
+		return false, false, errors.New(errors.ErrCodeInternal,
+			fmt.Sprintf("unexpected path state observing %s.%s", component, path))
+	}
 }
 
 // validateProfileInlineOwnership requires every non-synthetic owned path to be
@@ -970,13 +1173,19 @@ func (r *RecipeResult) ValidateProfileLock(
 		candidateEnabled[ref.Name] = ref.IsEnabled()
 	}
 
-	components := slices.Sorted(maps.Keys(r.Metadata.SelectedProfile.OwnedPaths))
+	// Iterate the EFFECTIVE lock set: a subset omitting a closure-locked
+	// component (e.g. nvidia-dra-driver-gpu on an advertisement-owning GKE
+	// profile) fails below exactly like one omitting a declaration-named
+	// component — the invariant cannot evaluate locked paths absent from
+	// the output.
+	lockSet := r.EffectiveLockSet()
+	components := slices.Sorted(maps.Keys(lockSet))
 	for _, component := range components {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return errors.Wrap(
 				errors.ErrCodeTimeout, "profile lock validation canceled", ctxErr)
 		}
-		paths := r.Metadata.SelectedProfile.OwnedPaths[component]
+		paths := lockSet[component]
 		baselineRef := r.GetComponentRef(component)
 		if baselineRef == nil {
 			return errors.New(errors.ErrCodeInvalidRequest,
@@ -1035,10 +1244,102 @@ func (r *RecipeResult) OwnsProfilePath(component, path string) bool {
 	if r == nil || r.Metadata.SelectedProfile == nil {
 		return false
 	}
-	for _, owned := range r.Metadata.SelectedProfile.OwnedPaths[component] {
+	for _, owned := range r.EffectiveLockSet()[component] {
 		if PathsIntersect(owned, path) {
 			return true
 		}
 	}
 	return false
+}
+
+// profileClosureTriggered reports whether the selected profile owns
+// advertisement (ADR-015 GKE amendment): a declared external advertiser,
+// or explicit ownership of a non-synthetic #1327 policy-selector path.
+// Locks follow ownership — a profile that does not own advertisement (the
+// AKS driver/toolkit values) leaves allocation-policy keys on today's WARN
+// semantics, and the synthetic per-component presence path never triggers
+// the closure.
+func (r *RecipeResult) profileClosureTriggered() bool {
+	selected := r.Metadata.SelectedProfile
+	if selected == nil {
+		return false
+	}
+	if selected.Advertiser == allocpolicy.AdvertiserExternal {
+		return true
+	}
+	for component, paths := range selected.OwnedPaths {
+		for _, path := range paths {
+			if ownsAllocationPolicySelectorPath(component, path) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ClosureDescriptorEntries returns the canonical #1327 descriptor entries
+// contributing to this recipe's effective profile lock closure: when the
+// selected profile owns advertisement (the closure trigger), every ENABLED
+// descriptor component's entry, in descriptor order; empty otherwise.
+// Evidence production records allocpolicy.IdentityFor over this set — the
+// deterministic identity of the entries contributing to THIS recipe's
+// closure — so a descriptor expansion that does not touch the recipe's
+// contributing entries cannot spuriously invalidate its evidence (ADR-015
+// descriptor-currentness).
+func (r *RecipeResult) ClosureDescriptorEntries() []allocpolicy.Entry {
+	if r == nil || !r.profileClosureTriggered() {
+		return nil
+	}
+	var entries []allocpolicy.Entry
+	for _, entry := range allocpolicy.Descriptor() {
+		ref := r.GetComponentRef(entry.Component)
+		if ref == nil || !ref.IsEnabled() {
+			continue
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+// EffectiveLockSet returns the profile's effective lock set: the declared
+// ownedPaths plus, when the profile owns advertisement, the recomputed
+// #1327 closure — every ENABLED descriptor component's selector paths plus
+// its synthetic presence path. The closure is recomputed from the
+// canonical descriptor (pkg/allocpolicy) at every artifact boundary and is
+// never persisted in the artifact: persisting it would freeze the lock at
+// authoring time, and a descriptor expansion could then never strengthen
+// older authentic recipes. Absent or declared-but-disabled descriptor
+// components contribute nothing (ADR-015).
+func (r *RecipeResult) EffectiveLockSet() map[string][]string {
+	if r == nil || r.Metadata.SelectedProfile == nil {
+		return nil
+	}
+	lock := cloneOwnedPaths(r.Metadata.SelectedProfile.OwnedPaths)
+	if !r.profileClosureTriggered() {
+		return lock
+	}
+	if lock == nil {
+		// A nil OwnedPaths never survives artifact validation
+		// (ValidateProfileContract requires the field), but the closure can
+		// trigger on Advertiser alone for a typed SDK caller that skipped
+		// validation — return the closure paths rather than panic on the
+		// nil-map assignment below.
+		lock = make(map[string][]string)
+	}
+	for _, entry := range allocpolicy.Descriptor() {
+		ref := r.GetComponentRef(entry.Component)
+		if ref == nil || !ref.IsEnabled() {
+			continue
+		}
+		merged := make(map[string]struct{}, len(lock[entry.Component])+len(entry.SelectorPaths)+1)
+		for _, path := range lock[entry.Component] {
+			merged[path] = struct{}{}
+		}
+		merged[profileComponentEnabledPath] = struct{}{}
+		for _, path := range entry.SelectorPaths {
+			merged[path] = struct{}{}
+		}
+		lock[entry.Component] = slices.Sorted(maps.Keys(merged))
+	}
+	return lock
 }

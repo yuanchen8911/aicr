@@ -46,10 +46,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: filter
         with:
           base: main
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             matched:
               - '.github/workflows/gpu-h100-training-test.yaml'
@@ -80,7 +81,6 @@ jobs:
               - 'cmd/aicr/**'
               - 'go.mod'
               - 'go.sum'
-              - 'vendor/**'
               - 'tests/chainsaw/chainsaw-config.yaml'
               - 'tests/chainsaw/ai-conformance/common/**'
               - 'tests/chainsaw/ai-conformance/kind-common/**'
@@ -106,6 +106,10 @@ jobs:
               - 'pkg/collector/**'
               - 'pkg/snapshotter/**'
               - '.github/actions/gpu-snapshot-validate/**'
+              # Markdown/MDX under the runtime globs is documentation — never a
+              # reason to launch a GPU job (#2149). Requires some-with-excludes.
+              - '!**/*.[mM][dD]'
+              - '!**/*.[mM][dD][xX]'
 
   # NVIDIA self-hosted GPU runners reject pull_request event jobs before
   # checkout. PR GPU coverage runs through the pull-request/<number> push

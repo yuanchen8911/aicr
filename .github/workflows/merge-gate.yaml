@@ -56,13 +56,15 @@ jobs:
       bom: ${{ steps.changes.outputs.bom }}
       tuning: ${{ steps.changes.outputs.tuning }}
       notices: ${{ steps.changes.outputs.notices }}
+      coverage: ${{ steps.changes.outputs.coverage }}
+      docs: ${{ steps.changes.outputs.docs }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       # Detect targeted path categories (default: any match = true)
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: changes
         with:
           filters: |
@@ -70,10 +72,36 @@ jobs:
               - '.github/workflows/**'
               - '.github/actions/**'
             deps:
+              # Inputs to the verify-licenses gate, which runs `make
+              # license-check` over the resolved dependency graph. Watch the
+              # dependency manifests, plus every input that
+              # defines the check itself, so a change to the gate cannot skip
+              # its own gate: the Makefile recipe is the check's contract, the
+              # install-go-licenses action supplies the binary it runs (that
+              # action clears GOFLAGS, without which -trimpath strips GOROOT and
+              # the check passes while inspecting zero packages), and this
+              # workflow defines the job. The entry replaced here named
+              # '.github/workflows/verify-licenses.yaml', which was deleted in
+              # 3c9f6ec5 when the job moved into this workflow, so the filter
+              # had stopped watching anything the job actually consumes.
+              #
+              # The toolchain pins are watched too, because the job resolves
+              # them through load-versions before running the check: .go-version
+              # supplies the Go toolchain (which determines the `go list std`
+              # ignore set) and .settings.yaml supplies linting.go_licenses (the
+              # go-licenses build that classifies packages). Both reach the gate
+              # only via that action, so all three paths must be watched or a
+              # version bump silently skips the gate it changes — #814 bumped
+              # go-licenses touching only .settings.yaml, and #1204 bumped Go
+              # touching only .go-version.
               - 'go.mod'
               - 'go.sum'
-              - 'vendor/**'
-              - '.github/workflows/verify-licenses.yaml'
+              - 'Makefile'
+              - '.go-version'
+              - '.settings.yaml'
+              - '.github/actions/install-go-licenses/**'
+              - '.github/actions/load-versions/**'
+              - '.github/workflows/merge-gate.yaml'
             renovate:
               # Watch every input the verify-renovate job consumes — including
               # the Makefile target that runs the validator — so changes to the
@@ -109,10 +137,10 @@ jobs:
               - 'tools/tuning/**'
             notices:
               # Inputs to the committed THIRD_PARTY_NOTICES.md freshness check.
-              # The file is the union of every vendored dependency's license
+              # The file is the union of every redistributed dependency's license
               # across the released OS/arch matrix, so any dependency-graph
-              # change can alter it. Watch the dependency manifests, the vendor
-              # tree, and the generator itself (plus the committed file, so a
+              # change can alter it. Watch the dependency manifests and the
+              # generator itself (plus the committed file, so a
               # hand edit is re-verified). .goreleaser.yaml is included because
               # the generator asserts its PLATFORMS matrix matches the release
               # targets defined there — a new goos/goarch must re-run this check.
@@ -124,14 +152,77 @@ jobs:
               # derivation, and a languages.go bump changes the `go list std`
               # ignore set. This is a standalone job — the full `tests` suite
               # does NOT regenerate the file.
+              # The Python half of the notices file covers the aiperf-bench
+              # image, whose dependency closure is an installed venv and not
+              # part of the Go module graph. It cannot be regenerated here (needs
+              # docker + PyPI), so the committed fragment is watched directly,
+              # alongside the requirements.txt whose sha256 the generator
+              # asserts the fragment still records — editing requirements
+              # without a refresh must fail this gate rather than ship stale
+              # attributions.
               - 'Makefile'
               - '.settings.yaml'
               - '.goreleaser.yaml'
               - 'go.mod'
               - 'go.sum'
-              - 'vendor/**'
               - 'tools/generate-notices'
+              - 'tools/generate-python-licenses'
+              - 'validators/performance/requirements.txt'
+              - 'validators/performance/licenses/**'
               - 'THIRD_PARTY_NOTICES.md'
+            coverage:
+              # Inputs to the committed CUJ/CLI coverage-matrix freshness check.
+              # The matrix is derived, so a change to ANY of its signal sources
+              # can move a row without touching the doc — and until #1977 the
+              # only thing keeping the committed page accurate was that nobody
+              # regenerated it. Watched here:
+              #   - the committed doc itself (catches a hand edit)
+              #   - the generator and pkg/cli (the verb registry it walks)
+              #   - infra/uat/reservations.yaml + pkg/uatbroker: which lanes are
+              #     nightly-enrolled, and for which intents
+              #   - the per-cloud uat-*.yaml pipelines: which CUJ phases are
+              #     actually enabled steps (a commented-out phase is not coverage)
+              #   - uat-nightly-batch.yaml: the previous_n version axis
+              #   - tests/uat, tests/chainsaw, demos: the scanned signal trees
+              #   - Makefile + this workflow: the generate/check contract and the
+              #     coverage-freshness job itself, so a change to either cannot
+              #     skip its own gate
+              - 'docs/user/coverage-matrix.md'
+              - 'tools/coverage/**'
+              - 'pkg/cli/**'
+              - 'pkg/uatbroker/**'
+              - 'infra/uat/reservations.yaml'
+              - '.github/workflows/uat-*.yaml'
+              - 'tests/uat/**'
+              - 'tests/chainsaw/**'
+              - 'demos/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            docs:
+              # Inputs to the parser-level MDX gate. Only the Fern-published
+              # trees matter — a change anywhere under them can introduce a
+              # construct that parses as CommonMark but aborts
+              # `fern generate --docs`.
+              #
+              # docs/index.yml is Fern's navigation manifest AND the source the
+              # checkers derive their file list from, so it is both an input and
+              # a trigger: adding a page there must run the gate over it.
+              # docs/README.md is the published landing page — the earlier
+              # per-subdirectory globs missed it entirely.
+              #
+              # Everything the gate is MADE of is listed too, so a change to the
+              # gate cannot skip its own verification: the two checkers, the page
+              # enumerator, the locked parser toolchain, this workflow, and the
+              # Makefile — whose `check-docs-mdx-parse` target is what the job
+              # actually invokes, matching why the `renovate` and `notices`
+              # filters watch it.
+              - 'docs/**'
+              - 'tools/check-docs-mdx'
+              - 'tools/check-docs-mdx-parse'
+              - 'tools/docs-published-files'
+              - 'tools/mdx/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
 
       # code = true iff at least one changed file is NOT docs/markdown/LICENSE.
       #
@@ -146,7 +237,7 @@ jobs:
       # always true — docs-only PRs ran full qualification. '**' matches
       # dotfiles too (dorny sets picomatch dot:true), so '.golangci.yaml',
       # '.settings.yaml', etc. still count as code.
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706  # v4.0.2
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         id: code
         with:
           predicate-quantifier: 'every'
@@ -203,14 +294,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: ${{ steps.versions.outputs.go }}
-          cache: false
-      - uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81  # v4.37.3
+          cache: true
+      - uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4.37.8
         with:
           languages: go
       - run: go build ./...
-        env:
-          GOFLAGS: -mod=vendor
-      - uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81  # v4.37.3
+      - uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28  # v4.37.8
 
   analyze-skip:
     needs: [check-paths]
@@ -325,12 +414,10 @@ jobs:
           cache: true
           cache-dependency-path: |
             go.sum
-            vendor/modules.txt
-      - name: Install go-licenses
-        run: go install github.com/google/go-licenses/v2@${{ steps.versions.outputs.go_licenses }}
+      - uses: ./.github/actions/install-go-licenses
+        with:
+          version: ${{ steps.versions.outputs.go_licenses }}
       - name: Report licenses
-        env:
-          GOFLAGS: -mod=vendor
         run: |
           echo "=== Dependency Licenses ==="
           go-licenses report ./... 2>/dev/null | sort -t',' -k3 | column -t -s','
@@ -338,8 +425,6 @@ jobs:
           echo "=== License Summary ==="
           go-licenses report ./... 2>/dev/null | cut -d',' -f3 | sort | uniq -c | sort -rn
       - name: Check licenses
-        env:
-          GOFLAGS: -mod=vendor
         run: make license-check
 
   verify-licenses-skip:
@@ -375,6 +460,47 @@ jobs:
       - run: echo "No Renovate config changes — validation not required"
 
   # ---------------------------------------------------------------------------
+  # MDX docs gate — parses every Fern-published doc with the real MDX parser.
+  #
+  # `fern check` (Fern Docs CI) does not parse MDX, and the job that does
+  # (`fern generate --docs --preview`) runs in a workflow_run companion whose
+  # status never lands on the PR head SHA, so it can never be required. That
+  # gap let a bare `<=` merge green and then fail every docs publish, including
+  # a release tag (#2050). This job is the blocking replacement: hermetic, no
+  # DOCS_FERN_TOKEN, no dependency on Fern's SaaS being up at merge time.
+  # ---------------------------------------------------------------------------
+
+  docs-mdx:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '20'
+      # The bash approximation runs first: it is instant and its messages name
+      # the specific hazard, so the common cases fail fast with better output.
+      # The parser then decides — it is the authoritative check, and GITHUB_ACTIONS
+      # makes a missing Node or a failed dependency install a hard error rather
+      # than the local warn-and-skip.
+      - name: Check MDX safety (pattern approximation)
+        run: make check-docs-mdx
+      - name: Validate docs with the real MDX parser
+        run: make check-docs-mdx-parse
+
+  docs-mdx-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.docs != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo "No published-docs changes — MDX parse gate not required"
+
+  # ---------------------------------------------------------------------------
   # BOM version freshness — ensures the committed container-images.md matches
   # the registry pins even on docs-only PRs (which skip the full `tests` job).
   # ---------------------------------------------------------------------------
@@ -393,10 +519,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: ${{ steps.versions.outputs.go }}
-          cache: false
+          cache: true
       - name: Verify committed BOM versions and variants match the recipes
-        env:
-          GOFLAGS: -mod=vendor
         # `go test -run <name>` exits 0 with "no tests to run" if a test is
         # renamed or removed, which would let this gate silently no-op. Assert
         # each named test actually executed by requiring its PASS line — a
@@ -444,10 +568,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version: ${{ steps.versions.outputs.go }}
-          cache: false
+          cache: true
       - name: Verify committed tuning-status table is up to date
-        env:
-          GOFLAGS: -mod=vendor
         # `make tuning-check` regenerates the table into a temp dir and splices
         # it into the doc, then fails if the working tree differs — so a stale
         # committed table (or missing splice markers) fails closed here.
@@ -463,8 +585,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Third-party notices freshness — ensures the committed THIRD_PARTY_NOTICES.md
-  # matches the vendored dependency graph across every released OS/arch target,
-  # on PRs touching its inputs (go.mod/go.sum/vendor + the generator).
+  # matches the resolved dependency graph across every released OS/arch target,
+  # on PRs touching its inputs (go.mod/go.sum + the generator).
   # ---------------------------------------------------------------------------
 
   notices-freshness:
@@ -484,12 +606,10 @@ jobs:
           cache: true
           cache-dependency-path: |
             go.sum
-            vendor/modules.txt
-      - name: Install go-licenses
-        run: go install github.com/google/go-licenses/v2@${{ steps.versions.outputs.go_licenses }}
+      - uses: ./.github/actions/install-go-licenses
+        with:
+          version: ${{ steps.versions.outputs.go_licenses }}
       - name: Verify committed THIRD_PARTY_NOTICES.md is up to date
-        env:
-          GOFLAGS: -mod=vendor
         # `make notices-check` regenerates the notices file (union across the
         # release OS/arch matrix, so it is host-independent) and fails if the
         # working tree differs — a stale committed file fails closed here.
@@ -502,6 +622,45 @@ jobs:
     timeout-minutes: 1
     steps:
       - run: echo "No dependency/generator changes — notices freshness check not required"
+
+  # ---------------------------------------------------------------------------
+  # Coverage-matrix freshness — ensures the committed docs/user/coverage-matrix.md
+  # matches the CLI registry, the nightly UAT wiring, and the in-repo test
+  # signals, on PRs touching its inputs (mirrors bom-freshness). Before #1977 the
+  # page was only accurate because contributors avoided regenerating it; this is
+  # the check that makes regeneration mandatory rather than optional.
+  # ---------------------------------------------------------------------------
+
+  coverage-freshness:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.coverage == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify committed coverage matrix is up to date
+        # `make coverage-check` regenerates the matrix in place and fails if the
+        # working tree differs. The generator itself fails closed on an
+        # unresolvable UAT wiring or version axis, so a moved registry or renamed
+        # workflow input errors here instead of quietly reporting the affected
+        # rows as uncovered.
+        run: make coverage-check
+
+  coverage-freshness-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.coverage != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo "No coverage-matrix inputs changed — freshness check not required"
 
   # ---------------------------------------------------------------------------
   # Aggregate gate — the single required status check
@@ -523,12 +682,16 @@ jobs:
       - verify-licenses-skip
       - verify-renovate
       - verify-renovate-skip
+      - docs-mdx
+      - docs-mdx-skip
       - bom-freshness
       - bom-freshness-skip
       - tuning-freshness
       - tuning-freshness-skip
       - notices-freshness
       - notices-freshness-skip
+      - coverage-freshness
+      - coverage-freshness-skip
     runs-on: ubuntu-latest
     timeout-minutes: 1
     steps:

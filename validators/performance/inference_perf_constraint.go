@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -137,6 +138,23 @@ const (
 	// aiperfArtifactDir is where AIPerf writes benchmark result files.
 	aiperfArtifactDir = "/tmp/aiperf"
 
+	// aiperfEntrypointPython and aiperfEntrypointScript locate the
+	// sentinel-framing wrapper baked into the aiperf-bench image. The runtime
+	// stage is distroless and ships no /bin/sh, so the Job cannot chain
+	// `aiperf`, `echo`, and `cat` in a shell; the wrapper does that framing in
+	// Python instead. Both paths are fixed by aiperf-bench.Dockerfile — keep
+	// them in sync with the COPY destination and venv layout there.
+	aiperfEntrypointPython = "/opt/venv/bin/python"
+	aiperfEntrypointScript = "/opt/aicr/aiperf_entrypoint.py"
+
+	// envAIPerfArtifactDir and envAIPerfResultMarker configure
+	// aiperf_entrypoint.py's framing. envAIPerfModel is informational only —
+	// the model reaches aiperf as an explicit --model argv element — and is
+	// kept so `kubectl describe pod` shows what a run benchmarked.
+	envAIPerfModel        = "AICR_MODEL"
+	envAIPerfArtifactDir  = "AICR_AIPERF_ARTIFACT_DIR"
+	envAIPerfResultMarker = "AICR_RESULT_SENTINEL"
+
 	// AICR_INFERENCE_PERF_* env vars let operators tune the benchmark without
 	// rebuilding the validator image. Each overrides the like-named constant
 	// above; set them on the inference-perf catalog entry's `env` (editable
@@ -200,10 +218,6 @@ const (
 	// inferenceDeploymentName is the DynamoGraphDeployment name for the benchmark
 	// workload. Passed to the template via ${DEPLOYMENT_NAME}.
 	inferenceDeploymentName = "aicr-inference-perf"
-
-	// inferenceQueueName is the KAI Queue name for the benchmark workload.
-	// Passed to the template via ${QUEUE_NAME}.
-	inferenceQueueName = "aicr-inference-perf"
 
 	// hfTokenSecretName / hfTokenSecretKey name the optional Secret that carries
 	// a Hugging Face token. The deploy template references it via an optional
@@ -270,14 +284,19 @@ const (
 	mainContainerName = "main"
 )
 
-// inferenceSkip* are the result.status strings returned when the inference
-// performance check cannot run. The "skipped " prefix is contractual:
-// inference_perf.go dispatches on it via strings.HasPrefix(result.status,
-// "skipped") to emit CTRF Skip status.
-const (
-	inferenceSkipMsgNoDynamoPlatform = "skipped - dynamo-platform not in recipe components"
-	inferenceSkipMsgCRDNotInstalled  = "skipped - DynamoGraphDeployment CRD not installed on cluster (dynamo-platform component declared but operator not deployed yet)"
-)
+// inferenceSkipMsgNoDynamoPlatform is the result.status string returned when
+// the inference performance check is genuinely inapplicable. The "skipped "
+// prefix is contractual: inference_perf.go dispatches on it via
+// strings.HasPrefix(result.status, "skipped") to emit CTRF Skip status.
+const inferenceSkipMsgNoDynamoPlatform = "skipped - dynamo-platform not in recipe components"
+
+// inferenceFailMsgCRDNotInstalled is the fail-closed message (#2122) for guard
+// C: the recipe DECLARES dynamo-platform but the DynamoGraphDeployment CRD is
+// not installed. This is a blocking failure, not a skip. It is emitted only on a
+// clean NotFound (the CRD is genuinely absent); Forbidden/auth failures take the
+// classified crdErr path in dynamoCRDInstalled, so no RBAC guidance belongs here
+// — apply the bundle (Dynamo operator).
+const inferenceFailMsgCRDNotInstalled = "recipe declares dynamo-platform but the DynamoGraphDeployment CRD is not installed on the cluster — apply the bundle (Dynamo operator)"
 
 type inferenceRoutingMode string
 
@@ -326,12 +345,6 @@ var (
 		Group:    "nvidia.com",
 		Version:  versionV1beta1,
 		Resource: "dynamographdeployments",
-	}
-
-	kaiQueueGVR = schema.GroupVersionResource{
-		Group:    "scheduling.run.ai",
-		Version:  "v2",
-		Resource: "queues",
 	}
 
 	httpRouteGVR = schema.GroupVersionResource{
@@ -431,22 +444,23 @@ func validateInferencePerf(ctx *validators.Context) (*inferenceResult, error) {
 	}
 
 	// Guard C: the Dynamo operator CRD must actually be installed on the
-	// cluster. The recipe can list dynamo-platform before the operator has
-	// been deployed (e.g., mid-bootstrap, or a staged rollout where the
-	// component is declared but `aicr bundle` hasn't run yet). Without this
-	// check the validator would fail later with a less-actionable
-	// "no matches for kind DynamoGraphDeployment" from the dynamic client.
+	// cluster. Guard B has already confirmed the recipe DECLARES dynamo-platform,
+	// so a missing CRD is a broken/incomplete deployment — not an inapplicable
+	// check. Fail closed (#2122): a declared dependency whose prerequisite is
+	// absent must BLOCK the gate, never masquerade as a benign skip. Without
+	// this the validator would fail later with a less-actionable "no matches for
+	// kind DynamoGraphDeployment" from the dynamic client.
 	//
-	// Only IsNotFound is treated as "not installed" → skip. Any other error
-	// (Forbidden, auth failure, apiserver timeout, transient connection) is
-	// a real problem with the check and must surface as a failure rather
-	// than masquerading as a benign skip.
+	// Any non-NotFound error (Forbidden, auth failure, apiserver timeout,
+	// transient connection) is surfaced by dynamoCRDInstalled as crdErr, already
+	// carrying the right code — propagate as-is. A clean NotFound returns
+	// (false, nil): since dynamo-platform is declared, that too fails closed.
 	installed, crdErr := dynamoCRDInstalled(ctx)
 	if crdErr != nil {
 		return nil, crdErr
 	}
 	if !installed {
-		return &inferenceResult{status: inferenceSkipMsgCRDNotInstalled}, nil
+		return nil, errors.New(errors.ErrCodeNotFound, inferenceFailMsgCRDNotInstalled)
 	}
 
 	// Build workload configuration from cluster state. Callees already
@@ -582,16 +596,16 @@ func hasDynamoPlatform(ctx *validators.Context) bool {
 }
 
 // dynamoCRDInstalled reports whether the DynamoGraphDeployment CRD is
-// registered on the cluster. This is a pre-flight check so the validator
-// produces an explicit "CRD not installed" skip instead of later failing
-// deep in the deploy path with an opaque "no matches for kind" error when
-// the recipe declares dynamo-platform but the operator has not been
-// deployed yet.
+// registered on the cluster. This is a pre-flight check so guard C produces an
+// explicit, actionable "CRD not installed" fail-closed error (#2122) instead
+// of later failing deep in the deploy path with an opaque "no matches for
+// kind" error when the recipe declares dynamo-platform but the operator has
+// not been deployed yet.
 //
 // Mirrors the signature of isTrainerInstalled: only IsNotFound returns
 // (false, nil) — any other error (Forbidden, auth failure, apiserver
 // timeout, transient connection) surfaces as a real validator failure
-// rather than being collapsed into a benign "not installed" skip.
+// rather than being collapsed into a benign "not installed" result.
 func dynamoCRDInstalled(ctx *validators.Context) (bool, error) {
 	crdGVR := schema.GroupVersionResource{
 		Group:    apiGroupAPIExtensions,
@@ -1253,10 +1267,7 @@ func podEffectiveGPURequest(pod *v1.Pod) int {
 	for i := range pod.Spec.Containers {
 		sum += containerGPUs(&pod.Spec.Containers[i])
 	}
-	effective := sum
-	if initMax > effective {
-		effective = initMax
-	}
+	effective := max(initMax, sum)
 	// Pod overhead (RuntimeClass) is added on top of max(steadyState, initMax),
 	// mirroring k8s.io/component-helpers resource accounting.
 	if q, ok := pod.Spec.Overhead[gpu]; ok {
@@ -1366,10 +1377,7 @@ func selectWorkerNode(candidates []v1.Node, mode *allocmode.Mode, policy string,
 		default:
 			continue // not in the probe's Ready/schedulable sets
 		}
-		f := capacity - occupancy
-		if f < 0 {
-			f = 0
-		}
+		f := max(capacity-occupancy, 0)
 		better := !ok || f > free ||
 			(f == free && dra && !draWiring) ||
 			(f == free && dra == draWiring && n.Name < chosen.Name)
@@ -1596,8 +1604,8 @@ func buildTolerations(node v1.Node) []v1.Toleration {
 	return tolerations
 }
 
-// deployInferenceWorkload deploys the KAI Queue, DynamoGraphDeployment, and
-// any routing-mode-specific Gateway API resources. Worker GPU wiring is
+// deployInferenceWorkload deploys the DynamoGraphDeployment and any
+// routing-mode-specific Gateway API resources. Worker GPU wiring is
 // MODE-DISPATCHED (config.useDRAWorkerClaims): in DRA mode a
 // ResourceClaimTemplate is applied and workers bind it via
 // podTemplate.spec.resourceClaims; in device-plugin mode no claim template is
@@ -1636,17 +1644,7 @@ func deployInferenceWorkload(ctx *validators.Context, config *inferenceWorkloadC
 		"ROUTER_MODE":         config.routerMode,
 		"GPU_COUNT":           strconv.Itoa(config.gpuCount),
 		"DEPLOYMENT_NAME":     inferenceDeploymentName,
-		"QUEUE_NAME":          inferenceQueueName,
 		"CLAIM_TEMPLATE_NAME": inferenceClaimTemplateName,
-	}
-
-	// Apply KAI Queue (best-effort; KAI scheduler may not be installed).
-	queuePath := filepath.Join("testdata", "inference", "queue.yaml")
-	if err := createOrUpdateFromTemplate(ctx, kaiQueueGVR,
-		config.namespace, queuePath, templateData, nil); err != nil {
-		slog.Info("Failed to apply KAI Queue (scheduler may not be installed)", "error", err)
-	} else {
-		slog.Info("Applied KAI Queue", "name", inferenceQueueName)
 	}
 
 	// DRA wiring mode: apply the ResourceClaimTemplate the worker pods bind
@@ -1720,9 +1718,7 @@ func applyWorkerClaimTemplate(ctx *validators.Context, config *inferenceWorkload
 		templateFile = "resource-claim-template-v1beta1.yaml"
 	}
 	data := make(map[string]string, len(templateData)+1)
-	for k, v := range templateData {
-		data[k] = v
-	}
+	maps.Copy(data, templateData)
 	data["CLAIM_API_VERSION"] = version
 
 	claimPath := filepath.Join("testdata", "inference", templateFile)
@@ -1751,16 +1747,16 @@ func applyInferenceWorkerScheduling(obj *unstructured.Unstructured,
 	}
 
 	// DRA wiring: bind the worker pod to the per-run ResourceClaimTemplate.
-	claimBindings := []interface{}{map[string]interface{}{
+	claimBindings := []any{map[string]any{
 		keyName:                     "gpu",
 		"resourceClaimTemplateName": inferenceClaimTemplateName,
 	}}
-	containerClaimRefs := []interface{}{map[string]interface{}{
+	containerClaimRefs := []any{map[string]any{
 		keyName: "gpu",
 	}}
 
 	for i, compRaw := range components {
-		component, ok := compRaw.(map[string]interface{})
+		component, ok := compRaw.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -1769,11 +1765,11 @@ func applyInferenceWorkerScheduling(obj *unstructured.Unstructured,
 
 		podTemplate, _, _ := unstructured.NestedMap(component, "podTemplate")
 		if podTemplate == nil {
-			podTemplate = map[string]interface{}{}
+			podTemplate = map[string]any{}
 		}
 		podSpec, _, _ := unstructured.NestedMap(podTemplate, "spec")
 		if podSpec == nil {
-			podSpec = map[string]interface{}{}
+			podSpec = map[string]any{}
 		}
 
 		// Tolerations AND nodeSelector apply to every component so all pods
@@ -1786,7 +1782,7 @@ func applyInferenceWorkerScheduling(obj *unstructured.Unstructured,
 			podSpec["tolerations"] = tolerationsToUnstructured(config.gpuTolerations)
 		}
 		if len(config.gpuNodeSelector) > 0 {
-			ns := make(map[string]interface{}, len(config.gpuNodeSelector))
+			ns := make(map[string]any, len(config.gpuNodeSelector))
 			for k, v := range config.gpuNodeSelector {
 				ns[k] = v
 			}
@@ -1823,11 +1819,11 @@ func applyInferenceWorkerScheduling(obj *unstructured.Unstructured,
 	return unstructured.SetNestedSlice(obj.Object, components, "spec", "components")
 }
 
-func tolerationsToUnstructured(tolerations []v1.Toleration) []interface{} {
-	tolList := make([]interface{}, 0, len(tolerations))
+func tolerationsToUnstructured(tolerations []v1.Toleration) []any {
+	tolList := make([]any, 0, len(tolerations))
 	for _, t := range tolerations {
-		tolMap := map[string]interface{}{
-			"operator": string(t.Operator),
+		tolMap := map[string]any{
+			keyOperator: string(t.Operator),
 		}
 		if t.Key != "" {
 			tolMap["key"] = t.Key
@@ -1856,14 +1852,14 @@ func isInferenceGPUComponent(componentName, componentType string) bool {
 // main container (DRA wiring mode), appending a bare named entry when the
 // container is absent — the Dynamo operator merges its defaults into it.
 // Sidecar/auxiliary containers are left untouched.
-func ensureMainContainerResourceClaims(podSpec map[string]interface{}, claims []interface{}) {
-	containers, _ := podSpec["containers"].([]interface{})
+func ensureMainContainerResourceClaims(podSpec map[string]any, claims []any) {
+	containers, _ := podSpec["containers"].([]any)
 	if len(containers) == 0 {
-		containers = []interface{}{map[string]interface{}{keyName: mainContainerName}}
+		containers = []any{map[string]any{keyName: mainContainerName}}
 	}
 	mainIdx := -1
 	for i, raw := range containers {
-		container, ok := raw.(map[string]interface{})
+		container, ok := raw.(map[string]any)
 		if ok && container[keyName] == mainContainerName {
 			mainIdx = i
 			break
@@ -1871,16 +1867,16 @@ func ensureMainContainerResourceClaims(podSpec map[string]interface{}, claims []
 	}
 	if mainIdx == -1 {
 		mainIdx = len(containers)
-		containers = append(containers, map[string]interface{}{keyName: mainContainerName})
+		containers = append(containers, map[string]any{keyName: mainContainerName})
 	}
 
-	container, ok := containers[mainIdx].(map[string]interface{})
+	container, ok := containers[mainIdx].(map[string]any)
 	if !ok {
-		container = map[string]interface{}{keyName: mainContainerName}
+		container = map[string]any{keyName: mainContainerName}
 	}
-	resources, _ := container["resources"].(map[string]interface{})
+	resources, _ := container["resources"].(map[string]any)
 	if resources == nil {
-		resources = map[string]interface{}{}
+		resources = map[string]any{}
 	}
 	resources["claims"] = claims
 	container["resources"] = resources
@@ -1894,14 +1890,14 @@ func ensureMainContainerResourceClaims(podSpec map[string]interface{}, claims []
 // is set: for extended resources the API server defaults requests from limits
 // and rejects requests != limits, so the limit alone is the canonical
 // device-plugin GPU request. Sidecar/auxiliary containers are left untouched.
-func ensureMainContainerGPULimit(podSpec map[string]interface{}, count int) {
-	containers, _ := podSpec["containers"].([]interface{})
+func ensureMainContainerGPULimit(podSpec map[string]any, count int) {
+	containers, _ := podSpec["containers"].([]any)
 	if len(containers) == 0 {
-		containers = []interface{}{map[string]interface{}{keyName: mainContainerName}}
+		containers = []any{map[string]any{keyName: mainContainerName}}
 	}
 	mainIdx := -1
 	for i, raw := range containers {
-		container, ok := raw.(map[string]interface{})
+		container, ok := raw.(map[string]any)
 		if ok && container[keyName] == mainContainerName {
 			mainIdx = i
 			break
@@ -1909,20 +1905,20 @@ func ensureMainContainerGPULimit(podSpec map[string]interface{}, count int) {
 	}
 	if mainIdx == -1 {
 		mainIdx = len(containers)
-		containers = append(containers, map[string]interface{}{keyName: mainContainerName})
+		containers = append(containers, map[string]any{keyName: mainContainerName})
 	}
 
-	container, ok := containers[mainIdx].(map[string]interface{})
+	container, ok := containers[mainIdx].(map[string]any)
 	if !ok {
-		container = map[string]interface{}{keyName: mainContainerName}
+		container = map[string]any{keyName: mainContainerName}
 	}
-	resources, _ := container["resources"].(map[string]interface{})
+	resources, _ := container["resources"].(map[string]any)
 	if resources == nil {
-		resources = map[string]interface{}{}
+		resources = map[string]any{}
 	}
-	limits, _ := resources["limits"].(map[string]interface{})
+	limits, _ := resources["limits"].(map[string]any)
 	if limits == nil {
-		limits = map[string]interface{}{}
+		limits = map[string]any{}
 	}
 	// Quantity as a string — the canonical YAML/JSON form for resource
 	// quantities; an int would also decode, but the string matches what a
@@ -2275,7 +2271,7 @@ func isDynamoDeploymentReady(obj *unstructured.Unstructured) bool {
 		if !ok {
 			return false
 		}
-		ssvc, ok := sraw.(map[string]interface{})
+		ssvc, ok := sraw.(map[string]any)
 		if !ok {
 			return false
 		}
@@ -2294,12 +2290,12 @@ func isDynamoDeploymentReady(obj *unstructured.Unstructured) bool {
 	return true
 }
 
-func desiredDynamoComponents(obj *unstructured.Unstructured) (map[string]map[string]interface{}, bool) {
+func desiredDynamoComponents(obj *unstructured.Unstructured) (map[string]map[string]any, bool) {
 	components, found, err := unstructured.NestedSlice(obj.Object, "spec", "components")
 	if err == nil && found {
-		out := make(map[string]map[string]interface{}, len(components))
+		out := make(map[string]map[string]any, len(components))
 		for _, raw := range components {
-			component, ok := raw.(map[string]interface{})
+			component, ok := raw.(map[string]any)
 			if !ok {
 				return nil, false
 			}
@@ -2316,9 +2312,9 @@ func desiredDynamoComponents(obj *unstructured.Unstructured) (map[string]map[str
 	if err != nil || !found {
 		return nil, false
 	}
-	out := make(map[string]map[string]interface{}, len(services))
+	out := make(map[string]map[string]any, len(services))
 	for name, raw := range services {
-		service, ok := raw.(map[string]interface{})
+		service, ok := raw.(map[string]any)
 		if !ok {
 			return nil, false
 		}
@@ -2455,14 +2451,6 @@ func cleanupInferenceWorkload(ctx *validators.Context, config *inferenceWorkload
 		slog.Warn("failed to delete DynamoGraphDeployment", "error", err)
 	} else {
 		slog.Info("Deleted DynamoGraphDeployment")
-	}
-
-	// Delete KAI Queue.
-	err = ctx.DynamicClient.Resource(kaiQueueGVR).
-		Namespace(config.namespace).
-		Delete(cleanupCtx, inferenceQueueName, metav1.DeleteOptions{})
-	if err != nil && !apierrors.IsNotFound(err) {
-		slog.Debug("Failed to delete KAI Queue", "error", err)
 	}
 
 	// Delete namespace (cascades all remaining resources).
@@ -2884,15 +2872,16 @@ type aiperfRunParams struct {
 
 // buildAIPerfJob constructs the Kubernetes Job spec for running AIPerf.
 // The image (aiperfBaseImage) has aiperf pre-installed at build time — no pip
-// install at runtime. The script wraps aiperf invocation in sentinel markers
-// so parseAIPerfOutput can locate the JSON unambiguously. Diagnostic output
+// install at runtime. The run is wrapped in sentinel markers so
+// parseAIPerfOutput can locate the JSON unambiguously. Diagnostic output
 // (aiperf progress, warnings) is kept in the pod logs — silencing it made
 // benchmark failures undiagnosable.
 //
-// Command overrides the image ENTRYPOINT (["aiperf"]) with a shell so we can
-// chain aiperf + echo + cat for sentinel framing. /bin/sh is POSIX-sufficient
-// for everything in the script (set -e, line continuation, echo, cat) and is
-// present in the python:3.12-slim base image, avoiding a bash dependency.
+// Command overrides the image ENTRYPOINT (["aiperf"]) with aiperf_entrypoint.py,
+// which performs that framing. It is a Python wrapper rather than a shell
+// pipeline because the runtime stage is NVIDIA's distroless Python image and
+// ships no /bin/sh — see the header of aiperf-bench.Dockerfile. Everything is
+// exec-form argv, so no element is shell-interpreted.
 func buildAIPerfJob(namespace, jobName, endpoint, model string, concurrency int, pullSecrets []v1.LocalObjectReference) (*batchv1.Job, aiperfRunParams, error) {
 	// AIPerf requires request_count >= concurrency. Scale the measured request
 	// count with concurrency so larger GPU counts still get a multi-wave
@@ -2930,44 +2919,35 @@ func buildAIPerfJob(namespace, jobName, endpoint, model string, concurrency int,
 	// were mutated between two calls (matters in tests; cheap in prod).
 	aiperfImage := resolveAiperfImage()
 
-	// The model is passed via the AICR_MODEL container env var and referenced as
-	// "$AICR_MODEL", not interpolated into the script text. A recipe /
-	// AICR_INFERENCE_PERF_MODEL value with shell metacharacters (e.g. $(...))
-	// would otherwise be command-substituted by /bin/sh -c even inside double
-	// quotes; "$AICR_MODEL" expands to the literal value without re-scanning it.
+	// Benchmark flags as exec-form argv. aiperf_entrypoint.py prepends
+	// `aiperf profile` and appends the sentinel-framed result JSON,
+	// reproducing what the previous `/bin/sh -c` script did. Every flag is
+	// built here so this file stays the single source of truth for the
+	// benchmark invocation.
 	//
-	// The model must be passed with the explicit --model flag: aiperf 0.11.0
-	// dropped support for a positional model argument, rejecting it with
-	// "Unused Tokens: ['<model>']" before the benchmark starts.
-	script := fmt.Sprintf(`set -e
-aiperf profile \
-  --model "$AICR_MODEL" \
-  --url %s \
-  --endpoint-type chat \
-  --streaming \
-  --concurrency %d \
-  --request-count %d \
-  --warmup-request-count %d \
-  --prompt-input-tokens-mean %d \
-  --prompt-input-tokens-stddev 0 \
-  --prompt-output-tokens-mean %d \
-  --prompt-output-tokens-stddev 0 \
-  --num-dataset-entries %d \
-  --random-seed %d \
-  --extra-inputs temperature:0 \
-  --output-artifact-dir %s \
-  --export-level summary
-echo '%s'
-cat %s/profile_export_aiperf.json
-echo '%s'`,
-		endpoint,
-		concurrency, requestCount, warmupCount,
-		inputTokensMean, outputTokensMean,
-		aiperfNumDatasetEntries, aiperfRandomSeed,
-		aiperfArtifactDir,
-		aiperfResultSentinel,
-		aiperfArtifactDir,
-		aiperfResultSentinel)
+	// The model is a discrete argv element handed to execvp, never spliced
+	// into a command string. The runtime image has no shell, so a model
+	// containing metacharacters cannot be command-substituted and needs no
+	// quoting. It must use the explicit --model flag: aiperf 0.11.0 dropped
+	// the positional form and aborts with "Unused Tokens: ['<model>']".
+	aiperfArgs := []string{
+		"--model", model,
+		"--url", endpoint,
+		"--endpoint-type", "chat",
+		"--streaming",
+		"--concurrency", strconv.Itoa(concurrency),
+		"--request-count", strconv.Itoa(requestCount),
+		"--warmup-request-count", strconv.Itoa(warmupCount),
+		"--prompt-input-tokens-mean", strconv.Itoa(inputTokensMean),
+		"--prompt-input-tokens-stddev", "0",
+		"--prompt-output-tokens-mean", strconv.Itoa(outputTokensMean),
+		"--prompt-output-tokens-stddev", "0",
+		"--num-dataset-entries", strconv.Itoa(aiperfNumDatasetEntries),
+		"--random-seed", strconv.Itoa(aiperfRandomSeed),
+		"--extra-inputs", "temperature:0",
+		"--output-artifact-dir", aiperfArtifactDir,
+		"--export-level", "summary",
+	}
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3006,12 +2986,21 @@ echo '%s'`,
 							// `:edge`, `:main`, and similar rolling tags
 							// on-push.yaml recreates on every merge.
 							ImagePullPolicy: validatorv1.ImagePullPolicy(aiperfImage, os.Getenv("AICR_VALIDATOR_IMAGE_TAG")),
-							// Model passed as env and referenced as "$AICR_MODEL"
-							// in the script so a value with shell metacharacters
-							// can't be command-substituted (see script above).
-							Env:     []v1.EnvVar{{Name: "AICR_MODEL", Value: model}},
-							Command: []string{shellBin, "-c"},
-							Args:    []string{script},
+							// The artifact dir and sentinel configure the framing
+							// wrapper. AICR_MODEL is not read by the wrapper (the
+							// model is an explicit --model argv element); it is
+							// retained so `kubectl describe pod` still shows which
+							// model a run benchmarked.
+							Env: []v1.EnvVar{
+								{Name: envAIPerfModel, Value: model},
+								{Name: envAIPerfArtifactDir, Value: aiperfArtifactDir},
+								{Name: envAIPerfResultMarker, Value: aiperfResultSentinel},
+							},
+							// Exec form, no shell: the runtime image is distroless
+							// and has no /bin/sh. Overrides the image ENTRYPOINT
+							// (["aiperf"]) with the framing wrapper.
+							Command: []string{aiperfEntrypointPython, aiperfEntrypointScript},
+							Args:    aiperfArgs,
 						},
 					},
 				},

@@ -71,6 +71,15 @@ spec:
                 echo "=== ${basename}: recipe (service=${service:-default} accel=${accelerator} os=${os_val} intent=${intent} platform=${platform:-none}) ==="
                 ${AICR_BIN} recipe ${flags} -o "${test_dir}/recipe.yaml" || { echo "FAIL: recipe generation for ${basename}" >&2; exit 1; }
 
+                # No NVSentinel flags: the recipes assign
+                # labeler.assumeDriverInstalled and, on AKS,
+                # metadata-collector.runtimeClassName themselves — from the
+                # gpuStack profile on AKS and GKE-COS, at overlay level on
+                # OKE (#2181). Bundling below therefore exercises the
+                # recipes satisfying both blocking NVSentinel validations
+                # (issues #2175 and #2176) unaided, which is the property
+                # this smoke test should be protecting.
+
                 # Generate bundle. Pass a keyed accelerated-node toleration:
                 # harmless for most overlays, but required on AKS, where the
                 # default wildcard toleration trips the blocking

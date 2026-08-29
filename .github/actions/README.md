@@ -13,6 +13,21 @@ executable bits or `./script.sh` invocation.
 
 ### Core CI/CD Actions
 
+#### `go-test/`
+
+**Purpose**: Set up Go and Helm, verify vendored dependencies, and run unit tests with race detection and coverage
+**When to use**: Go CI workflows that use the repository's `make test` target
+**Inputs**:
+- `go_version` (required): Go version to install
+- `coverage_report` (optional): Whether to generate a coverage report (default: "false")
+- `coverage_threshold` (optional): Minimum coverage percentage (default: empty)
+- `helm_version` (required): Helm version from `load-versions`
+- `setup_envtest_version` (required): setup-envtest version from `load-versions`
+- `apidiff_version` (optional): apidiff version from `load-versions`; when set, installs apidiff and runs `make api-diff` (default: empty, which skips both steps)
+
+Callers that set `apidiff_version` must check out full history with
+`fetch-depth: 0` so `make api-diff` can resolve a reachable stable release tag.
+
 #### `security-scan/`
 **Purpose**: Anchore/Grype vulnerability scanning with SARIF upload
 **When to use**: Security validation in CI/CD pipelines
@@ -52,13 +67,34 @@ This action runs `tools/setup-tools --skip-go --skip-docker` in auto mode, which
 - Skips Go (handled by `actions/setup-go`) and Docker (pre-installed on runners)
 - Uses the same installation logic as local development
 
+#### `install-go-licenses/`
+**Purpose**: Install the pinned `go-licenses` with `GOFLAGS` cleared
+**When to use**: Any job running `make license-check`, `make notices`, or `make notices-check`
+**Inputs**:
+- `version` (required): go-licenses version from `load-versions` (`.settings.yaml` `linting.go_licenses`)
+
+`go-licenses` publishes no binary release, so it cannot come from
+`setup-build-tools` (which installs from binary releases) and must be
+`go install`ed. Clearing `GOFLAGS` is a correctness requirement rather than a
+preference: `-trimpath` strips the binary's baked-in `GOROOT`, which makes
+`go-licenses` classify every package as standard library and report an empty
+dependency graph while still exiting `0`. The install is centralized here so no
+caller can silently drop that contract.
+
+**Example**:
+```yaml
+- uses: ./.github/actions/install-go-licenses
+  with:
+    version: ${{ steps.versions.outputs.go_licenses }}
+```
+
 #### `load-versions/`
 **Purpose**: Load tool versions from `.settings.yaml` as workflow outputs
 **When to use**: When you need version values in workflow steps
-**Outputs**:
-- `go`, `goreleaser`, `ko`, `crane`, `golangci_lint`, `yamllint`, `addlicense`
-- `grype`, `kubectl`, `kind`, `nvkind`, `ctlptl`, `tilt`, `helm`
-- `kind_node_image`, `h100_kind_node_image`
+**Outputs**: the Go version (from `.go-version`), plus one output per exposed
+`.settings.yaml` pin (tool versions, chart versions, image references, and
+quality thresholds; not every settings key is exposed) — see
+[`load-versions/action.yml`](load-versions/action.yml) for the authoritative set.
 
 **Example**:
 ```yaml
@@ -78,7 +114,7 @@ This action runs `tools/setup-tools --skip-go --skip-docker` in auto mode, which
 - `install_ko` (optional): Install ko (default: "false")
 - `install_syft` (optional): Install syft (default: "false")
 - `install_crane` (optional): Install crane (default: "false")
-- `crane_version` (optional): crane version (default: "v0.20.6")
+- `crane_version` (optional): crane version (default: "v0.21.0")
 - `install_goreleaser` (optional): Install goreleaser (default: "false")
 - `goreleaser_version` (required when `install_goreleaser: "true"`): GoReleaser version from `load-versions`
 
@@ -88,7 +124,7 @@ This action runs `tools/setup-tools --skip-go --skip-docker` in auto mode, which
   with:
     install_ko: 'true'
     install_crane: 'true'
-    crane_version: 'v0.20.6'
+    crane_version: 'v0.21.0'
 ```
 
 #### `go-build-release/`
@@ -142,8 +178,8 @@ paths are fully specified in `.goreleaser.yaml` under `kos.repositories`.
 ```
 
 #### `attest-image-from-tag/`
-**Purpose**: Bind a fixed AICR candidate image to an authoritative digest and
-generate SBOM + provenance
+**Purpose**: Bind a fixed AICR candidate image to an authoritative digest,
+resolve its per-platform manifest digests, and generate SBOM + VEX + provenance
 **When to use**: Attesting candidate images in the AICR release workflow
 **Inputs**:
 - `image_name` (required): One of the seven fixed AICR release image names
@@ -165,11 +201,20 @@ generate SBOM + provenance
 
 #### `sbom-and-attest/`
 
-**Purpose**: Generate SBOM and attestations for image with known digest  
-**When to use**: When you already have the digest (e.g., from build output)  
+**Purpose**: Generate the SPDX SBOM, OpenVEX and SLSA provenance attestations
+for an image whose digests are already known
+**When to use**: When you already have the digests (e.g., from build output)
 **Inputs**:
 - `image_name` (required): One of the seven fixed AICR release image names
-- `image_digest` (required): sha256 digest
+- `image_digest` (required): Multi-platform index digest; subject for the VEX and provenance attestations
+- `amd64_digest` (required): `linux/amd64` manifest digest; subject for the amd64 SBOM
+- `arm64_digest` (required): `linux/arm64` manifest digest; subject for the arm64 SBOM
+
+Cosign is pinned from `.settings.yaml` via `load-versions`, and every
+`cosign attest` call sets `--new-bundle-format=true` explicitly so the
+attestations land through the OCI referrers path by our decision rather than by
+an installer default. Per-platform SBOM subjects and index-level VEX subjects
+are explained in the action's header comment.
 
 **Example**:
 
@@ -178,6 +223,8 @@ generate SBOM + provenance
   with:
     image_name: ghcr.io/nvidia/aicrd
     image_digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    amd64_digest: sha256:1111111111111111111111111111111111111111111111111111111111111111
+    arm64_digest: sha256:2222222222222222222222222222222222222222222222222222222222222222
 ```
 
 ### KWOK Testing Actions
@@ -190,7 +237,7 @@ generate SBOM + provenance
 - `go_version` (required): Go version to install
 - `goreleaser_version` (required): GoReleaser version from `load-versions`
 - `kind_version` (optional): Kind version (default: "0.31.0")
-- `helm_version` (optional): Helm version (default: "v4.1.0")
+- `helm_version` (optional): Helm version (default: "v4.1.1")
 - `kwok_version` (optional): KWOK version (default: "v0.7.0")
 - `kubectl_version` (optional): kubectl version (default: "v1.35.0")
 
@@ -328,12 +375,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/load-versions
         id: versions
       - uses: ./.github/actions/go-test
         with:
           go_version: ${{ steps.versions.outputs.go }}
           helm_version: ${{ steps.versions.outputs.helm }}
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          apidiff_version: ${{ steps.versions.outputs.apidiff }}
           coverage_report: 'true'
       - uses: ./.github/actions/go-lint
         with:
@@ -349,12 +400,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/load-versions
         id: versions
       - uses: ./.github/actions/go-test
         with:
           go_version: ${{ steps.versions.outputs.go }}
           helm_version: ${{ steps.versions.outputs.helm }}
+          apidiff_version: ${{ steps.versions.outputs.apidiff }}
       - uses: ./.github/actions/go-build-release
         id: release
         with:
@@ -423,6 +477,10 @@ To use these actions in other repositories:
 - uses: NVIDIA/aicr/.github/actions/go-test@main
   with:
     go_version: '1.26'
-    helm_version: 'v4.2.2'
+    helm_version: 'v4.2.3'
     coverage_report: 'true'
 ```
+
+The cross-repository example intentionally omits `apidiff_version`. Repositories
+without AICR's `make api-diff` target retain the original test behavior because
+an empty `apidiff_version` skips the API compatibility steps.

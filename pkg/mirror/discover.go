@@ -18,11 +18,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/Masterminds/semver/v3"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/NVIDIA/aicr/pkg/bom"
@@ -35,6 +37,8 @@ import (
 )
 
 const logKeyComponent = "component"
+
+var mirrorRenderFloor = semver.MustParse(defaults.MirrorDefaultKubeVersion)
 
 // Option configures a Lister.
 type Option func(*Lister)
@@ -110,6 +114,14 @@ type mirrorCandidate struct {
 // overlay sees overlay-provided manifests and values consistently. When the
 // recipe carries no bound provider, reads fall back to the package-global
 // embedded provider inside recipe.GetManifestContentWithContext.
+//
+// A component whose values cannot be hydrated is a fatal error, not a warning.
+// The returned MirrorList is a completeness claim — the full set of images an
+// operator relocates into a disconnected registry — and a component that fails
+// to hydrate renders nothing, so it would contribute zero images to an
+// otherwise successful result. Transient, per-component conditions (a failed
+// helm template, an unreadable manifest) remain warnings on the affected
+// ComponentImages; deterministic resolution failures do not.
 func (l *Lister) Discover(ctx context.Context, rec *recipe.RecipeResult) (*MirrorList, error) {
 	if rec == nil {
 		return nil, errors.New(errors.ErrCodeInvalidRequest, "recipe is required")
@@ -157,74 +169,86 @@ func (l *Lister) Discover(ctx context.Context, rec *recipe.RecipeResult) (*Mirro
 			// produce a spurious warning.
 			if compRef.Type == recipe.ComponentTypeHelm && compRef.HasExternalChart() {
 				values, prevalidated := candidate.profileValues[compRef.Name]
-				var valErr error
 				if !prevalidated {
-					values, valErr = rec.GetValuesForComponentWithContext(gctx, compRef.Name)
-				}
-				if valErr != nil {
-					slog.Warn("failed to load values for component",
-						logKeyComponent, compRef.Name, "error", valErr)
-					ci.Warnings = append(ci.Warnings,
-						fmt.Sprintf("failed to load values: %v", valErr))
-				} else {
-					// Profile-owned values were already overridden and lock-
-					// validated above. Other components retain mirror's
-					// best-effort hydration behavior and apply the same
-					// canonical/alias-resolved override map.
-					if !prevalidated {
-						if applyErr := component.ApplyMapOverrides(
-							values, candidate.overrides[compRef.Name],
-						); applyErr != nil {
-							return errors.WrapWithContext(errors.ErrCodeInvalidRequest,
-								"failed to apply mirror value overrides",
-								applyErr,
-								map[string]any{logKeyComponent: compRef.Name})
-						}
+					// A values-load failure is deterministic and structural (a
+					// missing or unreadable values file, or a provider-binding
+					// problem), not something a retry fixes. Warning and
+					// continuing would skip rendering entirely, so the component
+					// contributes zero images while Discover still succeeds — an
+					// air-gap relocation would then omit them and the component
+					// would fail to pull in the disconnected environment, where
+					// diagnosis is hardest. Fail closed, matching
+					// prepareMirrorCandidate and the bundler.
+					// Bound the read: gctx may carry no deadline (the CLI
+					// root context does not), and a provider read that
+					// blocks — a values file on a stalled network mount —
+					// would otherwise hang discovery indefinitely. Cancel
+					// eagerly rather than deferring, so the timer is released
+					// before the render below rather than at goroutine exit.
+					valCtx, cancelVal := context.WithTimeout(gctx, defaults.FileReadTimeout)
+					var valErr error
+					values, valErr = rec.GetValuesForComponentWithContext(valCtx, compRef.Name)
+					cancelVal()
+					if valErr != nil {
+						return errors.PropagateOrWrap(valErr, errors.ErrCodeInternal,
+							fmt.Sprintf("failed to load values for component %q", compRef.Name))
 					}
 
-					// Source-only refs omit the chart name; EffectiveChart
-					// applies the same component-name fallback the deployers
-					// use, so the mirror inventory matches what deploys.
-					rendered, renderErr := l.helmRenderer.Render(gctx, helm.ChartInput{
-						Name:        compRef.Name,
-						Chart:       compRef.EffectiveChart(),
-						Repository:  compRef.Source,
-						Version:     compRef.Version,
-						Namespace:   compRef.Namespace,
-						Values:      values,
-						KubeVersion: l.kubeVersion,
-						APIVersions: defaults.MirrorExtraAPIVersions,
-					})
-					if renderErr != nil {
-						// Context cancellation is fatal — propagate it.
-						if gctx.Err() != nil {
-							return gctx.Err()
+					// Profile-owned values were already overridden and lock-
+					// validated above. Other components apply the same
+					// canonical/alias-resolved override map here.
+					if applyErr := component.ApplyMapOverrides(
+						values, candidate.overrides[compRef.Name],
+					); applyErr != nil {
+						return errors.WrapWithContext(errors.ErrCodeInvalidRequest,
+							"failed to apply mirror value overrides",
+							applyErr,
+							map[string]any{logKeyComponent: compRef.Name})
+					}
+				}
+
+				// Source-only refs omit the chart name; EffectiveChart
+				// applies the same component-name fallback the deployers
+				// use, so the mirror inventory matches what deploys.
+				rendered, renderErr := l.helmRenderer.Render(gctx, helm.ChartInput{
+					Name:        compRef.Name,
+					Chart:       compRef.EffectiveChart(),
+					Repository:  compRef.Source,
+					Version:     compRef.Version,
+					Namespace:   compRef.Namespace,
+					Values:      values,
+					KubeVersion: l.kubeVersion,
+					APIVersions: defaults.MirrorExtraAPIVersions,
+				})
+				if renderErr != nil {
+					// Context cancellation is fatal — propagate it.
+					if gctx.Err() != nil {
+						return gctx.Err()
+					}
+					slog.Warn("helm template failed for component",
+						logKeyComponent, compRef.Name, "error", renderErr)
+					ci.Warnings = append(ci.Warnings,
+						fmt.Sprintf("helm template failed: %v", renderErr))
+				} else {
+					imgs, extractErr := bom.ExtractImagesFromYAML(rendered)
+					if extractErr != nil {
+						if bom.IsInvalidStructuredImageDescriptor(extractErr) {
+							return errors.WrapWithContext(
+								errors.ErrCodeInvalidRequest,
+								fmt.Sprintf(
+									"invalid structured image descriptor in component %q",
+									compRef.Name,
+								),
+								extractErr,
+								map[string]any{"component": compRef.Name},
+							)
 						}
-						slog.Warn("helm template failed for component",
-							logKeyComponent, compRef.Name, "error", renderErr)
+						slog.Warn("image extraction failed",
+							logKeyComponent, compRef.Name, "error", extractErr)
 						ci.Warnings = append(ci.Warnings,
-							fmt.Sprintf("helm template failed: %v", renderErr))
+							fmt.Sprintf("image extraction failed: %v", extractErr))
 					} else {
-						imgs, extractErr := bom.ExtractImagesFromYAML(rendered)
-						if extractErr != nil {
-							if bom.IsInvalidStructuredImageDescriptor(extractErr) {
-								return errors.WrapWithContext(
-									errors.ErrCodeInvalidRequest,
-									fmt.Sprintf(
-										"invalid structured image descriptor in component %q",
-										compRef.Name,
-									),
-									extractErr,
-									map[string]any{"component": compRef.Name},
-								)
-							}
-							slog.Warn("image extraction failed",
-								logKeyComponent, compRef.Name, "error", extractErr)
-							ci.Warnings = append(ci.Warnings,
-								fmt.Sprintf("image extraction failed: %v", extractErr))
-						} else {
-							allImages = append(allImages, imgs...)
-						}
+						allImages = append(allImages, imgs...)
 					}
 				}
 			}
@@ -409,12 +433,9 @@ func effectiveOverridesForComponent(
 		}
 	}
 	merged := make(map[string]string)
-	for i := len(keys) - 1; i >= 0; i-- {
-		key := keys[i]
+	for _, key := range slices.Backward(keys) {
 		if overrides, ok := lookup[key]; ok {
-			for path, val := range overrides {
-				merged[path] = val
-			}
+			maps.Copy(merged, overrides)
 		}
 	}
 	return merged, nil
@@ -431,10 +452,10 @@ func prepareMirrorCandidate(
 		overrides:     make(map[string]map[string]string, len(rec.ComponentRefs)),
 		profileValues: make(map[string]map[string]any),
 	}
-	var owned map[string][]string
-	if rec.Metadata.SelectedProfile != nil {
-		owned = rec.Metadata.SelectedProfile.OwnedPaths
-	}
+	// The effective lock set includes the recomputed #1327 closure when
+	// the profile owns advertisement, so mirror preparation hydrates and
+	// guards closure-locked components exactly like declared ones.
+	owned := rec.EffectiveLockSet()
 	for _, ref := range rec.ComponentRefs {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, errors.Wrap(
@@ -477,7 +498,11 @@ func prepareMirrorCandidate(
 			continue
 		}
 
-		values, valueErr := rec.GetValuesForComponentWithContext(ctx, ref.Name)
+		// Same bound as the unowned path in Discover: cancel eagerly rather
+		// than deferring, so timers do not accumulate across this loop.
+		valCtx, cancelVal := context.WithTimeout(ctx, defaults.FileReadTimeout)
+		values, valueErr := rec.GetValuesForComponentWithContext(valCtx, ref.Name)
+		cancelVal()
 		if valueErr != nil {
 			return nil, errors.PropagateOrWrap(valueErr, errors.ErrCodeInternal,
 				fmt.Sprintf("failed to load profile candidate values for component %q", ref.Name))
@@ -512,11 +537,20 @@ const k8sConstraintName = "K8s.server.version"
 // the recipe's K8s.server.version constraint. The constraint value is
 // typically a semver range like ">= 1.32.4"; this function extracts the
 // version digits so it can be passed to `helm template --kube-version`.
-// Returns defaults.MirrorDefaultKubeVersion if no constraint is found.
+// Returns defaults.MirrorDefaultKubeVersion if no valid constraint is found
+// or the extracted version is below the render-safe floor.
 func KubeVersionFromConstraints(constraints []recipe.Constraint) string {
 	for _, c := range constraints {
 		if c.Name == k8sConstraintName {
-			return extractVersion(c.Value)
+			kubeVersion := extractVersion(c.Value)
+			parsedVersion, err := semver.NewVersion(kubeVersion)
+			if err != nil {
+				return defaults.MirrorDefaultKubeVersion
+			}
+			if parsedVersion.LessThan(mirrorRenderFloor) {
+				return defaults.MirrorDefaultKubeVersion
+			}
+			return kubeVersion
 		}
 	}
 	return defaults.MirrorDefaultKubeVersion

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 	"gopkg.in/yaml.v3"
 )
@@ -399,17 +400,32 @@ func TestValidateProfileDeclaration(t *testing.T) {
 			wantErr: `repeats constraint "K8s.server.version"`,
 		},
 		{
-			name: "advertiser deferred",
+			name: "unknown advertiser rejected",
+			decl: &ProfileDeclaration{
+				Name: "mode", Default: "one",
+				Values: map[string]ProfileValue{"one": {Advertiser: "csp"}},
+			},
+			wantErr: "unknown advertiser",
+		},
+		{
+			// The GKE profile extension activated the reserved vocabulary:
+			// "external" is the one valid non-empty advertiser value.
+			name: "external advertiser accepted",
 			decl: &ProfileDeclaration{
 				Name: "mode", Default: "one",
 				Values: map[string]ProfileValue{"one": {Advertiser: "external"}},
 			},
-			wantErr: "deferred to the GKE",
+			wantOwned: map[string][]string{},
 		},
 		{
-			name:    "allocation policy deferred",
-			decl:    withOverride("gpu-operator", map[string]any{"devicePlugin": map[string]any{"enabled": false}}),
-			wantErr: "deferred allocation-policy",
+			// Owning a #1327 policy-selector path is legal since the GKE
+			// extension — it triggers the recomputed closure instead of
+			// rejecting at catalog load.
+			name: "allocation-policy selector path ownership accepted",
+			decl: withOverride("gpu-operator", map[string]any{"devicePlugin": map[string]any{"enabled": false}}),
+			wantOwned: map[string][]string{
+				"gpu-operator": {"devicePlugin.enabled", "enabled"},
+			},
 		},
 	}
 
@@ -571,7 +587,7 @@ func TestBuildRecipeResultWithProfile(t *testing.T) {
 
 	t.Run("selection without declaration fails", func(t *testing.T) {
 		legacy := testProfileStore(nil)
-		legacy.Overlays["aks"].APIVersion = RecipeAPIVersion
+		legacy.Overlays["aks"].APIVersion = RecipeMetadataAPIVersion
 		result, err := legacy.BuildRecipeResultWithProfile(ctx, criteria, "gpuStack=operator-managed")
 		if err == nil || result != nil {
 			t.Fatalf("BuildRecipeResultWithProfile() = (%#v, %v), want error", result, err)
@@ -580,12 +596,12 @@ func TestBuildRecipeResultWithProfile(t *testing.T) {
 
 	t.Run("composition without declaration stays legacy", func(t *testing.T) {
 		legacy := testProfileStore(nil)
-		legacy.Overlays["aks"].APIVersion = RecipeAPIVersion
+		legacy.Overlays["aks"].APIVersion = RecipeMetadataAPIVersion
 		result, err := legacy.BuildRecipeResult(ctx, criteria)
 		if err != nil {
 			t.Fatalf("BuildRecipeResult() error = %v", err)
 		}
-		if result.APIVersion != RecipeAPIVersion || result.Metadata.SelectedProfile != nil {
+		if result.APIVersion != RecipeResultAPIVersion || result.Metadata.SelectedProfile != nil {
 			t.Fatalf("legacy result apiVersion=%q selectedProfile=%#v",
 				result.APIVersion, result.Metadata.SelectedProfile)
 		}
@@ -610,7 +626,7 @@ func TestProfileResolutionGuards(t *testing.T) {
 
 	t.Run("typed declaration requires profile api version", func(t *testing.T) {
 		overlay := newOverlay("service", &Criteria{Service: CriteriaServiceAKS}, testProfileDeclaration())
-		overlay.APIVersion = RecipeAPIVersion
+		overlay.APIVersion = RecipeMetadataAPIVersion
 		store := &MetadataStore{
 			Base:     base,
 			Overlays: map[string]*RecipeMetadata{"service": overlay},
@@ -810,11 +826,19 @@ func TestProfileArtifactContract(t *testing.T) {
 		result  *RecipeResult
 		wantErr string
 	}{
-		{name: "legacy", result: &RecipeResult{APIVersion: RecipeAPIVersion}},
+		{name: "legacy", result: &RecipeResult{APIVersion: RecipeResultAPIVersion}},
+		{name: "Release N target default", result: &RecipeResult{APIVersion: header.GroupVersionV1}},
 		{
 			name: "profile",
 			result: &RecipeResult{
 				APIVersion: RecipeProfileAPIVersion,
+				Metadata:   RecipeResultMetadata{SelectedProfile: selected},
+			},
+		},
+		{
+			name: "Release N target profile",
+			result: &RecipeResult{
+				APIVersion: header.GroupVersionV1Beta2,
 				Metadata:   RecipeResultMetadata{SelectedProfile: selected},
 			},
 		},
@@ -893,7 +917,7 @@ func TestProfileArtifactContract(t *testing.T) {
 		{
 			name: "legacy with selection",
 			result: &RecipeResult{
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeResultAPIVersion,
 				Metadata:   RecipeResultMetadata{SelectedProfile: selected},
 			},
 			wantErr: "cannot carry",
@@ -969,15 +993,28 @@ func TestProfileArtifactContract(t *testing.T) {
 			wantErr: "name and value",
 		},
 		{
-			name: "advertiser deferred",
+			name: "unknown advertiser rejected",
 			result: &RecipeResult{
 				APIVersion: RecipeProfileAPIVersion,
 				Metadata: RecipeResultMetadata{SelectedProfile: &SelectedProfile{
-					Name: "gpuStack", Value: "driver-installed", Advertiser: "external",
+					Name: "gpuStack", Value: "driver-installed", Advertiser: "managed",
 					OwnedPaths: map[string][]string{},
 				}},
 			},
-			wantErr: "advertiser is deferred",
+			wantErr: "unknown advertiser",
+		},
+		{
+			// "external" is valid since the GKE extension; the empty
+			// ownedPaths map stays acceptable at this shape gate (path-level
+			// coherence is the hydrating gate's job).
+			name: "external advertiser accepted",
+			result: &RecipeResult{
+				APIVersion: RecipeProfileAPIVersion,
+				Metadata: RecipeResultMetadata{SelectedProfile: &SelectedProfile{
+					Name: "gpuStack", Value: "gke-default", Advertiser: "external",
+					OwnedPaths: map[string][]string{},
+				}},
+			},
 		},
 		{
 			name: "ownership map required",
@@ -1023,7 +1060,10 @@ func TestProfileArtifactContract(t *testing.T) {
 			wantErr: "repeats path",
 		},
 		{
-			name: "allocation policy ownership deferred",
+			// Owning a #1327 policy-selector path is legal since the GKE
+			// extension: the recorded ownership triggers the recomputed
+			// closure downstream instead of failing the shape gate.
+			name: "allocation policy ownership accepted",
 			result: &RecipeResult{
 				APIVersion: RecipeProfileAPIVersion,
 				Metadata: RecipeResultMetadata{SelectedProfile: &SelectedProfile{
@@ -1033,7 +1073,6 @@ func TestProfileArtifactContract(t *testing.T) {
 					},
 				}},
 			},
-			wantErr: "deferred allocation-policy",
 		},
 	}
 	for _, tt := range tests {
@@ -1145,7 +1184,7 @@ componentRefs: []
 		},
 		{
 			name:    "legacy version with selected profile",
-			data:    []byte(strings.Replace(string(valid), RecipeProfileAPIVersion, RecipeAPIVersion, 1)),
+			data:    []byte(strings.Replace(string(valid), RecipeProfileAPIVersion, RecipeResultAPIVersion, 1)),
 			wantErr: "cannot carry",
 		},
 	}
@@ -1319,10 +1358,12 @@ spec:
 		content []byte
 		wantErr string
 	}{
-		{name: "legacy without profile", content: overlay(RecipeAPIVersion, "")},
-		{name: "empty version without profile", content: overlay("", "")},
-		{name: "unknown version without profile", content: overlay("aicr.run/v99", "")},
+		{name: "legacy without profile", content: overlay(RecipeMetadataAPIVersion, "")},
+		{name: "target authoring without profile", content: overlay(header.GroupVersionV1Beta1, "")},
+		{name: "empty version without profile", content: overlay("", ""), wantErr: `apiVersion ""`},
+		{name: "unknown version without profile", content: overlay("aicr.run/v99", ""), wantErr: `apiVersion "aicr.run/v99"`},
 		{name: "profile version with declaration", content: overlay(RecipeProfileAPIVersion, validProfile)},
+		{name: "target profile version with declaration", content: overlay(header.GroupVersionV1Beta2, validProfile)},
 		{
 			name:    "profile version without declaration",
 			content: overlay(RecipeProfileAPIVersion, ""),
@@ -1334,7 +1375,7 @@ spec:
 				string(overlay(RecipeProfileAPIVersion, validProfile)),
 				"kind: RecipeMetadata", "kind: RecipeMetdata", 1,
 			)),
-			wantErr: `requires kind "RecipeMetadata", got "RecipeMetdata"`,
+			wantErr: `has kind "RecipeMetdata", expected "RecipeMetadata"`,
 		},
 		{
 			name: "profile version requires metadata name",
@@ -1346,7 +1387,7 @@ spec:
 		},
 		{
 			name:    "legacy version with declaration",
-			content: overlay(RecipeAPIVersion, validProfile),
+			content: overlay(RecipeMetadataAPIVersion, validProfile),
 			wantErr: "expected \"aicr.run/v1alpha3\"",
 		},
 		{
@@ -2087,7 +2128,7 @@ func TestValidateProfileValuesKustomizeOwnership(t *testing.T) {
 }
 
 // TestPathsIntersect covers the exported helper directly. It is otherwise
-// reached only through isDeferredAllocationPolicyPath, the dynamic-path guard,
+// reached only through ownsAllocationPolicySelectorPath, the dynamic-path guard,
 // and OwnsProfilePath, so a change to its prefix semantics would surface as a
 // failure in one of those rather than here — and the ancestor/descendant cases
 // below are precisely what the profile lock depends on.

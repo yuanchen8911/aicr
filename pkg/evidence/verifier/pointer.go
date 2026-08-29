@@ -15,8 +15,7 @@
 package verifier
 
 import (
-	"io"
-	"os"
+	"context"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -24,6 +23,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/evidence/attestation"
+	"github.com/NVIDIA/aicr/pkg/evidence/internal/boundedio"
 )
 
 // pointerSizeCeiling caps the bytes the verifier will read from a
@@ -34,20 +34,23 @@ var pointerSizeCeiling = defaults.MaxRecipePOSTBytes
 // LoadAndValidatePointer reads and validates the pointer file at path.
 // V1 enforces schema 1.0.x with exactly one attestation entry — schema
 // 2.0 (multi-instance pointers) is reserved.
+//
+// Deprecated: prefer LoadAndValidatePointerContext. This form derives its own
+// defaults.FileReadTimeout-bounded context, so it cannot be aborted by the
+// caller; it is retained for source compatibility with the ctx-free evidence
+// tree gate (pkg/evidence/verifier/discover.go and tools/evidence-pointercheck).
 func LoadAndValidatePointer(path string) (*attestation.Pointer, error) {
-	f, err := os.Open(path) //nolint:gosec // operator-supplied path
-	if err != nil {
-		return nil, errors.Wrap(errors.ErrCodeNotFound, "failed to open pointer file", err)
-	}
-	defer func() { _ = f.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.FileReadTimeout)
+	defer cancel()
+	return LoadAndValidatePointerContext(ctx, path)
+}
 
-	body, readErr := io.ReadAll(io.LimitReader(f, pointerSizeCeiling+1))
-	if readErr != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to read pointer file", readErr)
-	}
-	if int64(len(body)) > pointerSizeCeiling {
-		return nil, errors.New(errors.ErrCodeInvalidRequest,
-			"pointer file exceeds size limit (1 MiB)")
+// LoadAndValidatePointerContext is LoadAndValidatePointer bounded by the
+// caller's context.
+func LoadAndValidatePointerContext(ctx context.Context, path string) (*attestation.Pointer, error) {
+	body, err := boundedio.ReadFile(ctx, path, "pointer file", pointerSizeCeiling)
+	if err != nil {
+		return nil, err
 	}
 
 	var ptr attestation.Pointer
@@ -97,9 +100,22 @@ func validatePointer(p *attestation.Pointer) error {
 			"pointer.attestations has multiple entries — schema 2.0 not yet supported")
 	}
 	att := p.Attestations[0]
-	if att.Bundle.PredicateType != attestation.PredicateTypeV1 {
+	switch att.Bundle.PredicateType {
+	case attestation.PredicateTypeV1, attestation.PredicateTypeV2:
+	default:
 		return errors.New(errors.ErrCodeInvalidRequest,
 			"unsupported predicateType "+att.Bundle.PredicateType)
+	}
+	// Bidirectional pointer-level coherence: a profiled pointer must
+	// reference v2 evidence, and an unprofiled one must not.
+	if p.Profile != "" && att.Bundle.PredicateType != attestation.PredicateTypeV2 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"pointer records a profile selection but references "+att.Bundle.PredicateType+
+				" evidence; profile-bearing recipes require "+attestation.PredicateTypeV2)
+	}
+	if p.Profile == "" && att.Bundle.PredicateType == attestation.PredicateTypeV2 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"pointer references "+attestation.PredicateTypeV2+" evidence without a profile selection")
 	}
 	if att.Bundle.OCI != "" && !strings.HasPrefix(att.Bundle.Digest, "sha256:") {
 		return errors.New(errors.ErrCodeInvalidRequest,

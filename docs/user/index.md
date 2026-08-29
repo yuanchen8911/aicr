@@ -17,15 +17,22 @@ This section is for users who:
 | [Installation](installation.md) | Install the `aicr` CLI (automated script, manual, or build from source) |
 | [End-to-End Tutorial](tutorial.md) | Learning path: install → recipe → bundle → deploy → validate, start to finish |
 | [CLI Reference](cli-reference.md) | Complete command reference with examples for all CLI operations |
+| [CLI Configuration File](cli-config.md) | The complete `AICRConfig` schema for `--config` on snapshot, recipe, bundle, validate, and verify |
 | [Generating Bundles](bundling.md) | Task-oriented how-to: deployers, value overrides, node scheduling, offline/vendored charts, readiness gates |
+| [Fabric-Attached Training](fabric-attached-training.md) | What your workload must declare to use the high-speed fabric an AICR recipe delivers |
 | [Artifact Verification](artifact-verification.md) | Verify bundles and recipe-evidence: trust levels, public-trust, KMS/PEM keys, offline, and CI gating |
 | [API Reference](api-reference.md) | REST API quick start and endpoint documentation |
 | [Agent Deployment](agent-deployment.md) | Deploy the Kubernetes agent for automated cluster snapshots |
 | [Validation](validation.md) | Task-oriented walkthrough: validate a cluster against a recipe, both training and inference performance phases |
 | [Component Catalog](component-catalog.md) | Every component that can appear in a recipe |
 | [Slurm Accounting](slinky-slurm-accounting.md) | Configure Slinky Slurm accounting with a customer-operated MariaDB database |
+| [Slurm Enroot Configuration](slinky-slurm-enroot.md) | Configure cluster-wide Enroot settings and job-level environment overrides for Slinky Slurm |
+| [Slurm Shared Storage](slinky-slurm-storage.md) | Add opt-in persistent RWX home and data filesystems to Slinky Slurm |
 | [Container Images](container-images.md) | Container image inventory across all components (BOM) |
 | [Recipe Health](recipe-health.md) | Per-recipe health and validation status tracking |
+| [TestGrid](testgrid.md) | Live per-recipe validation pass/fail board and its coordinate scheme |
+| [Evidence Dashboard](evidence-dashboard.md) | Signed third-party recipe evidence, consensus model, and deep links |
+| [Coverage Matrix](coverage-matrix.md) | Which CUJs and CLI verbs are exercised, on what hardware, at what cadence (generated) |
 | [Air-Gap Mirror](air-gap-mirror.md) | Mirror images and charts for air-gapped deployment |
 
 ## Quick Start

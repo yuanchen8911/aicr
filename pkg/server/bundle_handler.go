@@ -32,6 +32,7 @@ import (
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
 
@@ -73,17 +74,24 @@ type bundleHandler struct {
 	signing *signingConfig
 	// newAttester builds an Attester from resolve options. Injectable for tests.
 	newAttester attesterBuilder
+	// allowVendorCharts gates the vendor-charts=true query parameter. Off by
+	// default; the vendor path performs server-side helm pull against a
+	// caller-supplied URL, so exposing it requires operator opt-in via
+	// defaults.EnvAllowVendorCharts. See issue #2118.
+	allowVendorCharts bool
 }
 
 // newBundleHandler constructs a bundleHandler bound to the given client,
-// allowlists, and server signing identity.
-func newBundleHandler(client *aicr.Client, allowLists *aicr.AllowLists, signing *signingConfig) *bundleHandler {
+// allowlists, and server signing identity. allowVendorCharts opts the server
+// into honoring vendor-charts=true — see defaults.EnvAllowVendorCharts.
+func newBundleHandler(client *aicr.Client, allowLists *aicr.AllowLists, signing *signingConfig, allowVendorCharts bool) *bundleHandler {
 	return &bundleHandler{
-		client:      client,
-		allowLists:  allowLists,
-		streamZip:   bundler.StreamZipResponseContext,
-		signing:     signing,
-		newAttester: attestation.ResolveAttester,
+		client:            client,
+		allowLists:        allowLists,
+		streamZip:         bundler.StreamZipResponseContext,
+		signing:           signing,
+		newAttester:       attestation.ResolveAttester,
+		allowVendorCharts: allowVendorCharts,
 	}
 }
 
@@ -151,6 +159,10 @@ func (h *bundleHandler) handleBundles(w http.ResponseWriter, r *http.Request, v2
 		return
 	}
 
+	if h.vendorChartsRejected(w, r, bundleConfig) {
+		return
+	}
+
 	// Opt-in signing (?attest=true), parsed and validated up front so a bad
 	// value or an unconfigured server is rejected before any bundle work.
 	attestRequested, handled := h.resolveAttestRequest(w, r)
@@ -167,8 +179,7 @@ func (h *bundleHandler) handleBundles(w http.ResponseWriter, r *http.Request, v2
 	)
 
 	if err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if stderrors.As(err, &maxBytesErr) {
+		if maxBytesErr, ok := stderrors.AsType[*http.MaxBytesError](err); ok {
 			logger.Warn("bundle POST body exceeded size limit",
 				"limit", defaults.MaxBundlePOSTBytes,
 				"received", maxBytesErr.Limit,
@@ -302,6 +313,21 @@ func (h *bundleHandler) handleBundles(w http.ResponseWriter, r *http.Request, v2
 	h.writeZipResponse(ctx, w, r, tempDir, output)
 }
 
+// vendorChartsRejected fails-fast on vendor-charts=true when the server has
+// not opted into that egress-triggering path. Kept as a small helper so the
+// gate stays visible next to the other request-time gates and handleBundles
+// remains readable. See issue #2118 and defaults.EnvAllowVendorCharts.
+func (h *bundleHandler) vendorChartsRejected(w http.ResponseWriter, r *http.Request, cfg *bundlercfg.Config) bool {
+	if !cfg.VendorCharts() || h.allowVendorCharts {
+		return false
+	}
+	WriteError(w, r, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest,
+		"vendor-charts is not enabled on this server", false, map[string]any{
+			keyParam: "vendor-charts",
+		})
+	return true
+}
+
 func bundleRequestRejected(w http.ResponseWriter, r *http.Request, v2 bool) bool {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -333,16 +359,16 @@ func decodeRecipeResultRequest(body io.Reader, result *recipe.RecipeResult) erro
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
 			"failed to read request body", err)
 	}
-	var header struct {
+	var artifactHeader struct {
 		APIVersion string `json:"apiVersion"`
 	}
-	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&header); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&artifactHeader); err != nil {
 		return aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
 			"failed to inspect request apiVersion", err)
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if header.APIVersion == recipe.ConfiguredRecipeResultAPIVersion {
+	if header.IsSupportedProfileAPIVersion(artifactHeader.APIVersion) {
 		decoder.DisallowUnknownFields()
 	}
 	if err := decoder.Decode(result); err != nil {

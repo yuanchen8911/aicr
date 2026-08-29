@@ -40,6 +40,14 @@ on:
         description: 'nightly (provision→CUJ→teardown) | daytime-up (provision+deploy+HOLD) | daytime-down (tear down the held daytime cluster).'
         type: string
         default: nightly
+      slug:
+        description: 'Daytime cluster-name discovery slug (ADR-017; from the reservation row) — the <slug> in aicr-uat-day-<slug>-<slot>-<run_id>.'
+        type: string
+        default: ''
+      slot:
+        description: 'Daytime cluster slot (ADR-017) — the <slot> in aicr-uat-day-<slug>-<slot>-<run_id>. Only slot 0 is provisioned today.'
+        type: string
+        default: '0'
       cluster_config_path:
         description: 'Cluster-config the EKS actuator provisions from (from infra/uat/reservations.yaml).'
         type: string
@@ -60,6 +68,14 @@ on:
         description: 'Skip UAT test execution (manual runs only; the nightly batch always tests).'
         type: boolean
         default: false
+      deployer:
+        # helmfile = <accelerator>-<intent>-config.yaml (the existing
+        # filename shape every cell has always used). argocd = insert
+        # -argocd before -config.yaml (e.g. h100-training-argocd-config.yaml).
+        # See issue #2194.
+        description: 'Deployer variant.'
+        type: string
+        default: helmfile
 
 permissions:
   contents: read
@@ -71,19 +87,38 @@ permissions:
 
 jobs:
   uat-aws:
-    if: github.repository == 'nvidia/aicr'
+    # always() so a cancelled run still reaches the step-level always()-run
+    # Destroy Cluster teardown. Without it GitHub applies an implicit success()
+    # to the job-level if:, force-killing the job ~5m after cancellation — before
+    # the ~18m-per-attempt teardown can release the EKS cluster / capacity
+    # reservation, leaking them. The repository guard is preserved as the second
+    # conjunct so forks still skip the job.
+    if: always() && github.repository == 'nvidia/aicr'
     runs-on: ubuntu-latest
     # Budget = uncapped non-UAT steps (build, validator image push, EKS
-    # provisioning, evidence upload ~30m) + UAT phase steps (prep 15 + install 90
-    # + validate 40 + the intent-selected CUJ (train 25 OR serve 40) + verify 5
-    # = up to 190) + the always()-run Destroy Cluster teardown (3 retries, ~10m
-    # each = up to ~40m). Only one of train/serve runs per intent, so the budget
-    # counts the larger (serve). The teardown MUST fit in this budget: a job-level
-    # timeout cancels pending always() steps, so an undersized cap would skip
-    # teardown and leak the GPU node / capacity reservation. 190 UAT + ~30 setup +
-    # ~8 failure-path debug collection (Collect cluster debug bundle) + ~40
-    # teardown = ~268, so 280 leaves the teardown headroom on a worst-case run.
-    timeout-minutes: 280
+    # provisioning, evidence upload ~30m) + UAT phase steps + ~8 failure-path
+    # debug collection + the always()-run Destroy Cluster teardown (up to 3
+    # retries × ~18m real destroy = up to ~54m). The teardown MUST fit in this
+    # cap: a job-level timeout cancels pending always() steps, so an undersized
+    # cap would skip teardown and leak the GPU node / capacity reservation
+    # even after a LATE failure. Only one of train/serve runs per intent, so
+    # the UAT phase-step count uses the larger.
+    #
+    # UAT-phase-step budgets by (deployer, intent), using the current
+    # timeout-minutes on each step below:
+    #   helmfile+training:  prep 15 + install  90 + validate 40 + train 25 + verify 5 = 175
+    #   helmfile+inference: prep 15 + install  90 + validate 40 + serve 40 + verify 5 = 190
+    #   argocd+training:    prep 15 + install 110 + validate 40 + train 25 + verify 5 = 195   (issue #2194, aws-h100 only)
+    #   argocd+inference:   not shipped today; would be 15 + 110 + 40 + 40 + 5 = 210          (needs cap bump below)
+    #
+    # Total = ~30 setup + <UAT> + ~8 debug + ~54 teardown. On today's
+    # worst-case (argocd+training or helmfile+inference), ~30 + max(195,190)
+    # + ~8 + ~54 = ~287, so 300 leaves ~13m of teardown headroom.
+    # NOTE: the "not shipped today" argocd+inference row would push total to
+    # ~302, over the cap. If a future PR wires the argocd variant for the
+    # inference cell (or re-enables phase_serve alongside argocd), raise this
+    # to ~330 in the same PR.
+    timeout-minutes: 300
     permissions:
       contents: read
       actions: read
@@ -106,26 +141,44 @@ jobs:
       AWS_REGION: "us-east-1"
       GITHUB_ACTIONS_ROLE_NAME: "github-actions-role-aicr"
       # Cluster name (EKS actuator derives it from .deployment.id). The nightly
-      # per-run lifecycle uses a run-scoped name for per-run OCI/state isolation;
-      # the daytime lifecycles use a STABLE, reservation-tagged name so the
-      # evening teardown (daytime-down) and the nightly pre-batch guard can find
-      # the held cluster. Reservation names are lowercase alnum+hyphen, so the
-      # derived name is a valid EKS cluster name.
+      # per-run lifecycle uses a run-scoped name for per-run OCI/state isolation.
+      # daytime-up uses an EPHEMERAL, (slug, slot)-scoped name (ADR-017) — the
+      # stable prefix aicr-uat-day-<slug>-<slot>- with the up-run's id appended —
+      # so a re-provision never reuses a name the previous teardown just deleted
+      # (which collides with cloud deletion tombstones and stale terraform-state
+      # locks). Discovery is name-free: the pre-batch guard and daytime-down both
+      # scan the stable prefix (the actuator derives the name AND its TF-state key
+      # from .deployment.id, so recovering the name recovers everything teardown
+      # needs). daytime-down has no static name here — it resolves the concrete
+      # cluster at runtime (see the "Resolve daytime cluster to tear down" step)
+      # and overrides DEPLOYMENT_ID. The slug is a lowercase-alnum registry key and
+      # slot a small integer, so the derived name is a valid EKS cluster name.
       DEPLOYMENT_ID: >-
-        ${{ (inputs.lifecycle == 'daytime-up' || inputs.lifecycle == 'daytime-down')
-        && format('aicr-uat-day-{0}', inputs.reservation)
+        ${{ inputs.lifecycle == 'daytime-up'
+        && format('aicr-uat-day-{0}-{1}-{2}', inputs.slug, inputs.slot, github.run_id)
         || format('aicr-uat-{0}', github.run_id) }}
       CLUSTER_CONFIG: ${{ inputs.cluster_config_path }}
-      # The AICRConfig is selected by accelerator + intent
-      # (<accelerator>-<intent>-config.yaml); both intents drive the same
-      # cluster-config (GPU pool from the reservation, system/CPU pools dynamic).
-      TEST_CONFIG: ${{ inputs.test_config_dir }}/${{ inputs.accelerator }}-${{ inputs.intent }}-config.yaml
-      # v0.4.27 — required for node-group taints in the cluster-config schema
-      # (GPU pool carries skyhook.nvidia.com=runtime-required:NoSchedule until
-      # NodeWrite finishes tuning + reboot). Earlier v0.4.x pins predate taint
-      # support; v0.2.6 read .compute.nodeGroups.* directly and failed
-      # Terraform parse with "object with 1 attribute eks".
-      EKS_IMAGE: "ghcr.io/mchmarny/cluster/eks@sha256:8bc33d14e6e5659d242aa2cdbcd69fca389cfcdb9e94f7a7a1b82fd33176befa"
+      # The AICRConfig is selected by accelerator + intent + deployer:
+      #   deployer=helmfile → <accelerator>-<intent>-config.yaml (the default;
+      #                       backwards-compatible with every existing cell)
+      #   deployer=X (X!=helmfile) → <accelerator>-<intent>-X-config.yaml
+      #                              (e.g. deployer=argocd → h100-training-argocd-config.yaml, issue #2194)
+      # Both variants drive the same cluster-config (GPU pool from the
+      # reservation, system/CPU pools dynamic). The step-level check below asserts
+      # the resolved file exists so an unwired deployer variant fails early
+      # (before any provisioning) rather than deep in phase_prep.
+      TEST_CONFIG: >-
+        ${{ inputs.test_config_dir }}/${{ inputs.accelerator }}-${{ inputs.intent }}${{
+          inputs.deployer != 'helmfile' && format('-{0}', inputs.deployer) || ''
+        }}-config.yaml
+      # v0.5.1 — GPU-conditional worker taints (non-GPU worker pools stay
+      # untainted) + native GB300 (p6e-gb300/p6e-gb300r) EFA layout, on top of the
+      # node-group taint schema introduced in v0.4.27 (GPU pool carries
+      # skyhook.nvidia.com=runtime-required:NoSchedule until NodeWrite finishes
+      # tuning + reboot). Earlier v0.4.x pins predate taint support; v0.2.6 read
+      # .compute.nodeGroups.* directly and failed Terraform parse with
+      # "object with 1 attribute eks".
+      EKS_IMAGE: "ghcr.io/mchmarny/cluster/eks@sha256:91762c28d63c6f47774e86a922b84596a8daed031b225b9e7a25bd4910829f9b"
       VALIDATOR_IMAGE_PREFIX: "ghcr.io/nvidia/aicr-validators"
       VALIDATOR_TAG: "uat-${{ github.run_id }}"
       # Target platform(s) for the main-cell image builds (snapshot-agent + the
@@ -165,6 +218,9 @@ jobs:
         env:
           INTENT: ${{ inputs.intent }}
           LIFECYCLE: ${{ inputs.lifecycle }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
+          DEPLOYER: ${{ inputs.deployer }}
         run: |
           set -euo pipefail
           case "${INTENT}" in
@@ -175,6 +231,21 @@ jobs:
             nightly|daytime-up|daytime-down) ;;
             *) echo "::error::unknown lifecycle '${LIFECYCLE}' (want nightly|daytime-up|daytime-down)"; exit 1 ;;
           esac
+          # Fail closed on a malformed slug/slot (ADR-017): both become cluster-name
+          # components AND grep -E prefixes in the guard/teardown scans, so a blank
+          # slug misses the held cluster and a slot carrying ERE metacharacters makes
+          # the pattern invalid (grep ... || true then reads it as "no match" — the
+          # guard would provision anyway, or daytime-down skip teardown). slug matches
+          # the registry charset; slot is numeric and length-bounded (the ADR models
+          # 1-2 digit slots; uat-run additionally pins today's policy to slot 0).
+          SLUG_RE='^[a-z][a-z0-9]{1,3}$'
+          SLOT_RE='^[0-9]{1,2}$'
+          if [[ ! "${SLUG}" =~ $SLUG_RE ]]; then
+            echo "::error::invalid slug '${SLUG}' (want ${SLUG_RE})"; exit 1
+          fi
+          if [[ ! "${SLOT}" =~ $SLOT_RE ]]; then
+            echo "::error::invalid slot '${SLOT}' (want 1-2 digits)"; exit 1
+          fi
           # Derive + export the account FIRST, before any lifecycle-specific
           # gate below can exit. The account the OIDC role is assumed into
           # (AWS_ACCOUNT_ID) is the cluster-config's .deployment.tenancy — the
@@ -193,6 +264,15 @@ jobs:
             echo "::error::${CLUSTER_CONFIG} has no .deployment.tenancy"; exit 1
           fi
           echo "AWS_ACCOUNT_ID=${TENANCY}" >> "${GITHUB_ENV}"
+          # Validate deployer after the account export (which teardown depends on).
+          # workflow_dispatch constrains this to a choice, but workflow_call passes
+          # free strings, so a typo from a caller must surface as a clear error here
+          # rather than as a missing test-config file below or a mysterious dispatch
+          # deep in phases.sh. Allowlist mirrors uat-run.yaml's choice input.
+          case "${DEPLOYER}" in
+            helmfile|argocd) ;;
+            *) echo "::error::unsupported deployer '${DEPLOYER}' (want helmfile|argocd)"; exit 1 ;;
+          esac
           # The test config only matters for the run phases (nightly / daytime-up
           # provision+deploy). daytime-down just tears the held cluster down and
           # never reads it, so skip the existence check there — a missing sibling
@@ -218,7 +298,6 @@ jobs:
           cache: true
           cache-dependency-path: |
             go.sum
-            vendor/modules.txt
 
       # Main cell (aicr_version empty): build the aicr binary from the
       # checked-out source (tip). Release cells install the released binary
@@ -227,7 +306,6 @@ jobs:
       - name: Build aicr binary
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         env:
-          GOFLAGS: -mod=vendor
           # github.sha via env (never inline ${{ }} in a shell run — expression
           # injection). It is a 40-hex commit, so no real risk, but env is the
           # repo norm and keeps zizmor/CodeRabbit quiet.
@@ -282,25 +360,27 @@ jobs:
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
       - name: Set up Docker Buildx
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       # Main cell only: release cells use the released validator images the
       # released binary self-resolves to (skipped when aicr_version is set).
       - name: Build and push validator images
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         run: |
-          GO_VERSION="$(cat .go-version)"
+          set -euo pipefail
+          VALIDATOR_ARCHES="${BUILD_PLATFORMS//linux\//}" \
+            ./tools/build-validator-binaries
           # CHAINSAW_* args dropped in #1236 — the deployment validator
           # no longer ships /usr/local/bin/chainsaw; it executes Chainsaw
-          # Test format in-process via validators/chainsaw/inprocess.go.
+          # Test format in-process via pkg/chainsaw/inprocess.go.
           #
           # aiperf-bench is an ancillary (non-Go) validator image the
           # performance phase's inference-perf check pulls at runtime, resolved
           # through the same AICR_VALIDATOR_IMAGE_TAG=uat-<run_id> override as
           # the Go validators. It MUST be built+pushed here too, or the AIPerf
           # pod ImagePullBackOffs on a nonexistent uat-<run_id> tag and hangs
-          # until the job timeout (#1636). It uses a different Dockerfile path
-          # and takes no GO_VERSION build-arg. Keep the phase set in sync with
+          # until the job timeout (#1636). It uses a different Dockerfile and
+          # does not consume a prebuilt Go binary. Keep the phase set in sync with
           # VALIDATOR_PHASES in on-push.yaml / on-tag.yaml.
           #
           # buildx build --push emits a multi-arch manifest for GB200
@@ -319,7 +399,6 @@ jobs:
               *)
                 docker buildx build --platform="${BUILD_PLATFORMS}" \
                   -f "validators/${phase}/Dockerfile" \
-                  --build-arg "GO_VERSION=${GO_VERSION}" \
                   -t "${IMAGE}" --push .
                 ;;
             esac
@@ -343,39 +422,134 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-UAT-AICR
 
-      # Pre-batch guard (#1275, DC2). The nightly lifecycle refuses to provision
-      # into a reservation that still holds an un-torn-down daytime cluster:
-      # a missed evening teardown must surface as a BLOCKED batch, not as silent
-      # contention with the daytime deployment. Detect by the stable daytime
-      # cluster name (aicr-uat-day-<reservation>); we already hold the
-      # reservation lease (uat-run.yaml) and are authenticated to the cloud, so
-      # this runs before Bringup and fails fast rather than racing. Only the
-      # nightly lifecycle guards — daytime-up creates that cluster, daytime-down
-      # removes it.
+      # Pre-batch guard (#1275, DC2). A provisioning run refuses to provision into
+      # a reservation that still holds an un-torn-down daytime cluster: a missed
+      # evening teardown must surface as a BLOCKED run, not as silent contention
+      # with the daytime deployment (or a second, stacked daytime cluster).
+      #
+      # daytime clusters are EPHEMERALLY named (aicr-uat-day-<slug>-<slot>-<id>,
+      # ADR-017), so this detects them by the stable, (slug, slot)-scoped PREFIX
+      # rather than a reconstructed exact name — nothing in the system can name a
+      # held cluster again, so a prefix scan is the only name-free way to find it.
+      # DUAL-PREFIX MIGRATION SHIM: it also matches the LEGACY reservation-name
+      # prefix (aicr-uat-day-<reservation>-) so a daytime cluster provisioned under
+      # the old scheme is still discovered and blocks the batch. Remove the legacy
+      # leg once no old-named daytime clusters remain. Both the nightly batch AND
+      # daytime-up guard: daytime-up must refuse if a prior day's
+      # cluster leaked (the reservation cannot host two, and unique names would
+      # otherwise let them stack). daytime-up's OWN cluster does not exist yet (it
+      # is provisioned after this step), so only a leaked prior cluster matches.
+      # We already hold the reservation lease (uat-run.yaml) and are authenticated,
+      # so this runs before Bringup and fails fast rather than racing.
       - name: Pre-batch guard — refuse if a daytime cluster still holds the reservation
         id: guard
-        if: inputs.lifecycle == 'nightly'
+        if: inputs.lifecycle == 'nightly' || inputs.lifecycle == 'daytime-up'
         env:
           RESERVATION: ${{ inputs.reservation }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
         run: |
           set -euo pipefail
-          DAYTIME_NAME="aicr-uat-day-${RESERVATION}"
+          # New (slug, slot)-scoped prefix (ADR-017) plus the LEGACY reservation
+          # prefix — a transitional shim so an old-named daytime cluster still
+          # blocks the batch; drop the legacy leg once none remain.
+          PREFIX="aicr-uat-day-${SLUG}-${SLOT}-"
+          LEGACY_PREFIX="aicr-uat-day-${RESERVATION}-"
           set +e
-          OUT=$(aws eks describe-cluster --name "${DAYTIME_NAME}" --region "${AWS_REGION}" 2>&1)
+          OUT=$(aws eks list-clusters --region "${AWS_REGION}" --query "clusters[]" --output text 2>&1)
           RC=$?
           set -e
-          if [[ ${RC} -eq 0 ]]; then
-            echo "::error::daytime cluster ${DAYTIME_NAME} still holds reservation ${RESERVATION}; refusing to start the nightly batch. Tear it down first (uat-run lifecycle=daytime-down)."
+          # Fail closed on a list error: a throttle/auth failure must not be read
+          # as "no daytime cluster, clear to proceed".
+          if [[ ${RC} -ne 0 ]]; then
+            echo "::error::could not list clusters to determine daytime-cluster state for reservation ${RESERVATION}: ${OUT}"
             exit 1
           fi
-          # Fail closed on anything that is NOT a definitive "does not exist":
-          # a throttle/auth error must not be read as "clear to proceed".
-          if grep -q 'ResourceNotFoundException' <<<"${OUT}"; then
-            echo "no daytime cluster on reservation ${RESERVATION}; proceeding"
-          else
-            echo "::error::could not determine daytime-cluster state for ${DAYTIME_NAME}: ${OUT}"
+          # Broad matcher (anything prefix-ish blocks a batch), both prefixes.
+          HELD=$(printf '%s\n' "${OUT}" | tr '\t' '\n' | grep -E "^(${PREFIX}|${LEGACY_PREFIX})[0-9]" || true)
+          if [[ -n "${HELD}" ]]; then
+            echo "::error::a daytime cluster still holds reservation ${RESERVATION}; refusing (lifecycle=${LIFECYCLE})."
+            echo "::error::tear it down first: gh workflow run uat-run.yaml -f reservation=${RESERVATION} -f lifecycle=daytime-down"
+            while IFS= read -r c; do
+              [[ -z "${c}" ]] && continue
+              echo "::error::  held: ${c}"
+            done <<<"${HELD}"
             exit 1
           fi
+          echo "no daytime cluster on reservation ${RESERVATION}; proceeding"
+
+      # Resolve the ephemeral daytime cluster this daytime-down run must tear down.
+      # daytime-up names it aicr-uat-day-<slug>-<slot>-<up-run-id> (ADR-017), so
+      # this evening run (a different run id) cannot reconstruct the name — it
+      # discovers it by the stable, (slug, slot)-scoped prefix (name-free, exactly
+      # like the guard), plus the LEGACY reservation-name prefix as a transitional
+      # shim so an old-named held cluster is still torn down (drop the legacy leg
+      # once none remain).
+      # The resolved name is exported to DEPLOYMENT_ID so the unconditional Update
+      # Config step writes it into the cluster-config and the always()-run teardown
+      # steps (creds refresh, LB cleanup, Destroy) target it — the actuator derives
+      # both the cluster name and its TF-state key from .deployment.id, so the
+      # discovered name is all teardown needs. Runs before Update Config.
+      #   0 matches → benign no-op (already gone / never provisioned); teardown skips.
+      #   1 match   → the normal case; export it.
+      #   >1        → a broken invariant (the guard refuses a second daytime-up while
+      #               one is held); fail loud rather than silently tear down one.
+      - name: Resolve daytime cluster to tear down
+        if: inputs.lifecycle == 'daytime-down'
+        env:
+          RESERVATION: ${{ inputs.reservation }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
+        run: |
+          set -euo pipefail
+          # New (slug, slot)-scoped prefix (ADR-017) plus the LEGACY reservation
+          # prefix (transitional shim; drop once no old-named clusters remain).
+          PREFIX="aicr-uat-day-${SLUG}-${SLOT}-"
+          LEGACY_PREFIX="aicr-uat-day-${RESERVATION}-"
+          # Bounded retry. Every teardown gate below keys off DAYTIME_FOUND, so a
+          # single throttled/transient list call ending this step early would skip
+          # teardown entirely and leak the cluster (and the reservation) until a
+          # human re-dispatches daytime-down. Retry, then fail LOUDLY saying so.
+          RC=1
+          OUT=
+          for attempt in 1 2 3; do
+            set +e
+            OUT=$(aws eks list-clusters --region "${AWS_REGION}" --query "clusters[]" --output text 2>&1)
+            RC=$?
+            set -e
+            if [[ ${RC} -eq 0 ]]; then
+              break
+            fi
+            echo "cluster listing attempt ${attempt} failed (rc=${RC}): ${OUT}"
+            if [[ ${attempt} -lt 3 ]]; then
+              sleep 15
+            fi
+          done
+          if [[ ${RC} -ne 0 ]]; then
+            echo "::error::could not list clusters for reservation ${RESERVATION} after 3 attempts: ${OUT}"
+            echo "::error::TEARDOWN SKIPPED — any daytime cluster is still up and the reservation may still be held."
+            echo "::error::re-dispatch: gh workflow run uat-run.yaml -f reservation=${RESERVATION} -f lifecycle=daytime-down"
+            exit 1
+          fi
+          # End-anchored: only an exact <prefix><run-id> name is a teardown
+          # target. The guard's matcher is deliberately broader — anything
+          # prefix-ish should BLOCK a batch, but must not be destroyed here.
+          # Matches the new (slug, slot) prefix OR the legacy reservation prefix.
+          mapfile -t held < <(printf '%s\n' "${OUT}" | tr '\t' '\n' | grep -E "^(${PREFIX}|${LEGACY_PREFIX})[0-9]+$" || true)
+          if [[ "${#held[@]}" -eq 0 ]]; then
+            echo "no ${PREFIX}* or legacy ${LEGACY_PREFIX}* cluster found; nothing to tear down (already gone or never provisioned)."
+            echo "DAYTIME_FOUND=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [[ "${#held[@]}" -gt 1 ]]; then
+            echo "::error::expected at most one daytime cluster for ${RESERVATION} but found ${#held[@]}: ${held[*]}"
+            echo "::error::the pre-batch guard should prevent this; tear each down manually and investigate the leak."
+            exit 1
+          fi
+          echo "daytime cluster to tear down: ${held[0]}"
+          echo "DEPLOYMENT_ID=${held[0]}" >> "$GITHUB_ENV"
+          echo "DAYTIME_FOUND=true" >> "$GITHUB_ENV"
 
       # Post-lease capacity assertion (#1275, DC2). The reservation lease
       # (uat-run.yaml) is now the contention gate, so this is no longer a
@@ -466,7 +640,6 @@ jobs:
       - name: Build and push snapshot-agent image
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         env:
-          GOFLAGS: -mod=vendor
           KO_DOCKER_REPO: ghcr.io/nvidia/aicr-validators/agent
         run: |
           set -euo pipefail
@@ -550,21 +723,36 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubActions-UAT-AICR-Install
 
-      - name: UAT - install (helmfile apply)
+      - name: UAT - install (helmfile apply or argocd sync)
         id: install
         if: steps.prep.outcome == 'success'
-        # helmfile apply (up to HELMFILE_TIMEOUT_SECONDS, 20m) + the post-install
-        # readiness gate, which runs `aicr validate --phase deployment` until it
-        # passes READINESS_CONSECUTIVE_PASSES times (up to READINESS_TIMEOUT_SECONDS,
-        # 60m, spanning nodewright tuning + reboots, which can run past 30m on a
-        # cold GPU node). Sized to exceed one helmfile attempt + the full gate
-        # window (20 + 60 = 80, + margin) so the gate's own fail-closed path runs
-        # before GitHub Actions kills the step.
-        timeout-minutes: 90
+        # Step-level timeout must fit the LARGER of the two deployer branches,
+        # because both dispatch from `./run install` and share this cap:
+        #   helmfile: HELMFILE_TIMEOUT_SECONDS 20m + gate 60m = 80m
+        #   argocd:   helm-install 5m + apply+sync 30m + root-grace 2m + gate 60m = 97m
+        # ARGOCD_HELM_TIMEOUT_SECONDS + ARGOCD_SYNC_TIMEOUT_SECONDS +
+        # ARGOCD_ROOT_APP_GRACE_SECONDS + READINESS_TIMEOUT_SECONDS in
+        # tests/uat/lib/phases.sh drive the argocd side. Sized at 110m so the
+        # argocd fail-closed paths (each shared-budget retry loop's `::error::`)
+        # run before GitHub Actions kills the step. The gate's own fail-closed
+        # path still fires within budget on both branches.
+        timeout-minutes: 110
         shell: bash
         env:
           AICR_BIN: ${{ github.workspace }}/aicr
           RUN_ID: ${{ github.run_id }}
+          # Consumed only by the argocd deployer branch (install_argocd in
+          # tests/uat/lib/phases.sh), which provisions an in-cluster ghcr.io
+          # repo-creds Secret so Argo CD's repo-server can pull the bundle
+          # pushed by phase_prep. GITHUB_ACTOR is auto-injected by the
+          # Actions runtime; GITHUB_TOKEN is not, so pass it explicitly.
+          # The token is scoped to `packages: write` at the job level (see
+          # permissions block above), which is exactly what the Secret
+          # needs. Set the token ONLY for the argocd branch so helmfile's
+          # kubectl/aicr/chart-hook children don't inherit it in-env;
+          # install_argocd's `:?` guard fires on the empty default, which
+          # is what we want if a caller misconfigures the deployer input.
+          GITHUB_TOKEN: ${{ inputs.deployer == 'argocd' && github.token || '' }}
         run: ./tests/uat/aws/run install "${TEST_CONFIG}"
 
       # Runs ALL validate phases (deployment + conformance + performance), not
@@ -688,7 +876,7 @@ jobs:
         if: always() && steps.conformance.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: uat-aws-evidence-pointer-${{ github.run_id }}
+          name: uat-aws-evidence-pointer-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/pointer.yaml
           retention-days: 90
           if-no-files-found: error
@@ -726,7 +914,7 @@ jobs:
         if: failure() && steps.prep.outcome != 'skipped'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: uat-aws-debug-${{ github.run_id }}
+          name: uat-aws-debug-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             snapshot.yaml
             recipe.yaml
@@ -748,12 +936,20 @@ jobs:
           SUMMARY_AICR_VERSION: ${{ inputs.aicr_version }}
           SUMMARY_INTENT: ${{ inputs.intent }}
           SUMMARY_LIFECYCLE: ${{ inputs.lifecycle }}
+          SUMMARY_DEPLOYER: ${{ inputs.deployer }}
         run: |
           {
             echo "## UAT Results (AWS)"
             echo ""
             printf '**Reservation:** `%s` · **Intent:** `%s` · **Lifecycle:** `%s`\n' \
               "$SUMMARY_RESERVATION" "$SUMMARY_INTENT" "$SUMMARY_LIFECYCLE"
+            # Render the deployer only when it deviates from the default
+            # (helmfile), so existing cells' summaries are unchanged and
+            # only argocd cells surface the extra line — makes it easy to
+            # spot which lane a run was in from the Test Summary alone.
+            if [[ "$SUMMARY_DEPLOYER" != "" && "$SUMMARY_DEPLOYER" != "helmfile" ]]; then
+              printf '**Deployer:** `%s`\n' "$SUMMARY_DEPLOYER"
+            fi
             printf '**Cluster:** `%s`\n' "$DEPLOYMENT_ID"
             printf '**AICR version:** `%s`\n' "${SUMMARY_AICR_VERSION:-main (build from source)}"
             echo "**Build:** \`${{ github.sha }}\` (branch: \`${{ github.ref_name }}\`)"
@@ -815,14 +1011,25 @@ jobs:
       # Teardown gating (#1275, DC2): tear down for the nightly lifecycle
       # (unless skip_delete) and for daytime-down (the explicit evening
       # teardown of the held cluster — daytime-down provisions nothing, so it
-      # does not gate on steps.infra). NEVER for daytime-up, which holds the
-      # cluster for handoff. skip_delete is a nightly-only debugging escape and
-      # is ignored for daytime-down.
+      # does not gate on steps.infra). skip_delete is a nightly-only debugging
+      # escape and is ignored for daytime-down.
+      #
+      # daytime-up (provision + deploy + HOLD) holds the cluster for handoff ONLY
+      # on a clean run: if any stage failed or the run was cancelled
+      # (failure() || cancelled()), there is no usable cluster to hand off, so we
+      # tear it down rather than leak its GPU node / capacity reservation + VPC.
+      # Gated on steps.infra.outcome != 'skipped' so a cancel before Bringup —
+      # which provisioned nothing — still no-ops. The Destroy step targets this
+      # run's own DEPLOYMENT_ID (aicr-uat-day-<reservation>-<run_id>), which it
+      # sets itself, so it tears down exactly the cluster this up-run created
+      # (the daytime-down runtime name resolution is gated on daytime-down and
+      # does not run here).
       - name: Refresh AWS credentials for teardown
         if: >-
           always() && (
-            inputs.lifecycle == 'daytime-down' ||
-            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped')
+            (inputs.lifecycle == 'daytime-down' && env.DAYTIME_FOUND == 'true') ||
+            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped') ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()) && steps.infra.outcome != 'skipped')
           )
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
         with:
@@ -843,8 +1050,9 @@ jobs:
       - name: Delete LoadBalancer Services (pre-teardown)
         if: >-
           always() && (
-            inputs.lifecycle == 'daytime-down' ||
-            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped')
+            (inputs.lifecycle == 'daytime-down' && env.DAYTIME_FOUND == 'true') ||
+            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped') ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()) && steps.infra.outcome != 'skipped')
           )
         # Bounded so a hung API server (or many LB Services) can never starve the
         # always()-run Destroy Cluster of the job-timeout budget it needs — a
@@ -883,14 +1091,28 @@ jobs:
       - name: Destroy Cluster
         if: >-
           always() && (
-            inputs.lifecycle == 'daytime-down' ||
-            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped')
+            (inputs.lifecycle == 'daytime-down' && env.DAYTIME_FOUND == 'true') ||
+            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped') ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()) && steps.infra.outcome != 'skipped')
           )
         shell: bash
         run: |
           set -euo pipefail
-          yq -i '.deployment.destroy = true' "$CLUSTER_CONFIG"
+          # Set BOTH deployment fields here rather than relying on the Update
+          # Config step (mirrors uat-azure.yaml): any failure between Resolve and
+          # Update Config would otherwise leave the destroy targeting the
+          # committed placeholder id (aicr-uat) while the real — now ephemerally
+          # named — cluster leaks.
+          yq -i '.deployment.id = strenv(DEPLOYMENT_ID) | .deployment.destroy = true' "$CLUSTER_CONFIG"
           cat "$CLUSTER_CONFIG"
+          # NOTE: unlike the GCP and Azure teardowns, there is deliberately no
+          # stale-lock break here. The EKS actuator's S3 backend runs WITHOUT
+          # state locking — its `terraform init -backend-config` passes only
+          # bucket/key/region/prefix/encrypt (no `dynamodb_table`, no
+          # `use_lockfile`), so a cancel mid-bringup cannot orphan a lock that
+          # would block this destroy. If the actuator ever adds S3-native
+          # locking (a `<key>.tflock` object) or a DynamoDB lock table, add the
+          # equivalent best-effort break here (see uat-gcp.yaml / uat-azure.yaml).
           destroyed=false
           attempts=3
           for attempt in 1 2 3; do

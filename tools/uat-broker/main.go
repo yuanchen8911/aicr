@@ -182,6 +182,10 @@ func runReservations(args []string, stdout, stderr io.Writer) error {
 			return lookupErr
 		}
 		// GITHUB_OUTPUT-style key=value lines; every value is single-line.
+		// slug is surfaced so uat-run.yaml's resolve step exposes
+		// needs.resolve.outputs.slug (the daytime cluster name's discovery key,
+		// ADR-017), the same way cloud/accelerator are threaded to the pipelines.
+		fmt.Fprintf(&b, "slug=%s\n", res.Slug)
 		fmt.Fprintf(&b, "cloud=%s\n", res.Cloud)
 		fmt.Fprintf(&b, "reservation-id=%s\n", res.ReservationID)
 		fmt.Fprintf(&b, "accelerator=%s\n", res.Accelerator)
@@ -327,7 +331,7 @@ func readTags(ctx context.Context, stdin io.Reader) ([]string, error) {
 		return nil, errors.New(errors.ErrCodeInvalidRequest, "tag list on stdin exceeds size limit")
 	}
 	var tags []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
 			tags = append(tags, line)
 		}
@@ -375,7 +379,7 @@ func boolCount(flags ...bool) int {
 // empties.
 func splitCSV(csv string) []string {
 	var out []string
-	for _, p := range strings.Split(csv, ",") {
+	for p := range strings.SplitSeq(csv, ",") {
 		if p = strings.TrimSpace(p); p != "" {
 			out = append(out, p)
 		}

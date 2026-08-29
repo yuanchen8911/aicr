@@ -40,6 +40,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer/argocdhelm"
 	bundleverifier "github.com/NVIDIA/aicr/pkg/bundler/verifier"
 	"github.com/NVIDIA/aicr/pkg/component"
+	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
@@ -154,6 +155,15 @@ func TestNew(t *testing.T) {
 		// Should use default config when nil is passed
 		if bundler.Config == nil {
 			t.Fatal("Config should not be nil after passing nil")
+		}
+	})
+
+	t.Run("with invalid DRA eviction label", func(t *testing.T) {
+		cfg := config.NewConfig(config.WithDRAEvictionNodeLabel(config.NodeLabel{
+			Key: "not a label key", Value: "true",
+		}))
+		if _, err := New(WithConfig(cfg)); err == nil {
+			t.Fatal("New() error = nil, want invalid configuration error")
 		}
 	})
 }
@@ -700,6 +710,25 @@ func TestMake_NilConfigFailsClosed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "construct the bundler with New") {
 		t.Fatalf("Make() error = %v, want constructor guidance", err)
+	}
+}
+
+func TestMake_InvalidConfigFailsClosed(t *testing.T) {
+	bundler := &DefaultBundler{Config: config.NewConfig(
+		config.WithDRAEvictionNodeLabel(config.NodeLabel{
+			Key: "not a label key", Value: "true",
+		}),
+	)}
+	recipeResult := &recipe.RecipeResult{
+		ComponentRefs: []recipe.ComponentRef{{Name: "gpu-operator"}},
+	}
+
+	_, err := bundler.Make(t.Context(), recipeResult, t.TempDir())
+	if !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+		t.Fatalf("Make() error = %v, want ErrCodeInvalidRequest", err)
+	}
+	if !strings.Contains(err.Error(), "invalid node label key") {
+		t.Fatalf("Make() error = %v, want invalid node label context", err)
 	}
 }
 
@@ -1290,7 +1319,7 @@ func TestFilterEnabledComponents_ExcludedDriverInstallerWarning(t *testing.T) {
 			}
 			recipeResult.Metadata.GPUDriverState = tt.state
 
-			if _, _, filterErr := b.filterEnabledComponents(recipeResult); filterErr != nil {
+			if _, _, _, filterErr := b.filterEnabledComponents(recipeResult); filterErr != nil {
 				t.Fatalf("filterEnabledComponents() error = %v", filterErr)
 			}
 
@@ -3405,6 +3434,14 @@ func TestMake_DynamicValuesValidComponent(t *testing.T) {
 	}
 }
 
+// TestMake_DisabledComponentWithDynamic pins that a --dynamic
+// declaration on a component removed from the bundle is REJECTED. This
+// test previously pinned the opposite — the declaration was silently
+// dropped and the bundle succeeded — which is the exact silent discard
+// the absent-component override gate removes: the two flags ask for
+// contradictory things (remove the component; defer one of its values
+// to install-time editing), and a dynamic path on an absent component
+// exports nothing.
 func TestMake_DisabledComponentWithDynamic(t *testing.T) {
 	t.Parallel()
 
@@ -3449,30 +3486,23 @@ func TestMake_DisabledComponentWithDynamic(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 	_, makeErr := bundler.Make(ctx, recipeResult, tmpDir)
-	if makeErr != nil {
-		t.Fatalf("Make() error = %v", makeErr)
+	if makeErr == nil {
+		t.Fatal("Make() = nil error, want the absent-component --dynamic rejection")
 	}
-
-	// Disabled component should NOT have a directory at all (under any numbering).
-	// The directory check implies cluster-values.yaml absence, so don't double-check.
-	for _, dir := range []string{"aws-ebs-csi-driver", "001-aws-ebs-csi-driver", "002-aws-ebs-csi-driver"} {
-		if _, statErr := os.Stat(filepath.Join(tmpDir, dir)); !os.IsNotExist(statErr) {
-			t.Errorf("expected %s directory to NOT be created (component is disabled)", dir)
+	if !stderrors.Is(makeErr, errors.New(errors.ErrCodeInvalidRequest, "")) {
+		t.Errorf("error code = %v, want ErrCodeInvalidRequest", makeErr)
+	}
+	for _, want := range []string{
+		"--dynamic awsebscsidriver:controller.replicaCount cannot take effect",
+		"not in the generated bundle",
+	} {
+		if !strings.Contains(makeErr.Error(), want) {
+			t.Errorf("error missing %q: %v", want, makeErr)
 		}
 	}
-
-	// Enabled component should still exist (gpu-operator is the only enabled → 001)
-	if _, statErr := os.Stat(filepath.Join(tmpDir, "001-gpu-operator", "values.yaml")); os.IsNotExist(statErr) {
-		t.Error("expected 001-gpu-operator/values.yaml to be created")
-	}
-
-	// deploy.sh should not reference the disabled component
-	deployScript, readErr := os.ReadFile(filepath.Join(tmpDir, "deploy.sh"))
-	if readErr != nil {
-		t.Fatalf("failed to read deploy.sh: %v", readErr)
-	}
-	if strings.Contains(string(deployScript), "aws-ebs-csi-driver") {
-		t.Error("deploy.sh should not contain aws-ebs-csi-driver (disabled component)")
+	// Nothing may be emitted for a rejected bundle.
+	if _, statErr := os.Stat(filepath.Join(tmpDir, "001-gpu-operator")); !os.IsNotExist(statErr) {
+		t.Error("rejected bundle must not emit component directories")
 	}
 }
 
@@ -3510,7 +3540,8 @@ func TestMake_ArgoCDRejectsDynamic(t *testing.T) {
 // TestMake_OCP builds a real OCP inference recipe via BuildFromCriteria,
 // bundles it with --readiness-hooks, and verifies:
 //   - Numbered folder layout: 3 OLM + 3 readiness + 3 CR = 9 directories
-//   - Rendered manifest content: Subscription, OperatorGroup, ClusterPolicy, etc.
+//   - Rendered manifest content: Subscription, OperatorGroup, ClusterPolicy,
+//     and the DRA eviction contract in the ClusterPolicy driver manager
 //   - Readiness gate folders with correct gate image
 //   - Deployment ordering: OLM < readiness < CR for each operator
 func TestMake_OCP(t *testing.T) {
@@ -3633,6 +3664,28 @@ func TestMake_OCP(t *testing.T) {
 		}
 		templates := readTemplateFiles(t, dir)
 		assertKindInTemplates(t, comp, templates, kind)
+	}
+
+	// The OCP GPU Operator component is a local chart that projects its values
+	// into a ClusterPolicy CR. Assert the contract reaches the rendered resource,
+	// not merely its generated values.yaml.
+	gpuOperatorDir := findNumberedDir(t, outDir, "gpu-operator-ocp")
+	if gpuOperatorDir != "" {
+		templates := readTemplateFiles(t, gpuOperatorDir)
+		clusterPolicyYAML, ok := templates["clusterpolicy.yaml"]
+		if !ok {
+			t.Error("gpu-operator-ocp: clusterpolicy.yaml was not rendered")
+		} else {
+			var clusterPolicy map[string]any
+			if unmarshalErr := yaml.Unmarshal([]byte(clusterPolicyYAML), &clusterPolicy); unmarshalErr != nil {
+				t.Fatalf("decode rendered ClusterPolicy: %v", unmarshalErr)
+			}
+			spec, _ := clusterPolicy["spec"].(map[string]any)
+			if got := driverManagerEnvValues(spec, draEvictionEnvName); len(got) != 1 || got[0] != defaults.DRAEvictionNodeLabelKey {
+				t.Errorf("ClusterPolicy Driver Manager eviction env values = %v, want [%s]",
+					got, defaults.DRAEvictionNodeLabelKey)
+			}
+		}
 	}
 
 	// Assert readiness gate content — each readiness folder must contain the

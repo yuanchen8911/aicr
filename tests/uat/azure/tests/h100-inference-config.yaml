@@ -31,8 +31,10 @@
 # `nvidia.com/gpu=present:NoSchedule`; AICR system components target the
 # CPU worker pool (the AKS system pool is CriticalAddonsOnly).
 #
-# Deliberately NO value overrides, although the manual AKS validation bundled
-# with two `--set-json` flags:
+# The config deliberately carries no value overrides. The two NVSentinel
+# remedies the azure-managed profile needs are supplied by the recipe
+# itself (#2181), so this lane exercises them unaided. The manual AKS
+# validation additionally bundled with two `--set-json` flags:
 #   - gpuoperator:toolkit.env RUNTIME_CONFIG_SOURCE=file — already baked into
 #     the recipe's gpu-operator values (values-aks.yaml; #1689), so the
 #     override was redundant.
@@ -81,6 +83,10 @@ spec:
       target: ./bundle
     deployment:
       deployer: helmfile
+      # No NVSentinel overrides: the azure-managed gpuStack profile
+      # assigns labeler.assumeDriverInstalled and
+      # metadata-collector.runtimeClassName itself (#2181), so this lane
+      # exercises the recipes supplying both remedies unaided.
     scheduling:
       acceleratedNodeSelector:
         nodeGroup: gpu-worker

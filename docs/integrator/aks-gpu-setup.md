@@ -122,6 +122,23 @@ spec:
           enabled: false
 ```
 
+### Label GPU nodes for the DRA kubelet plugin
+
+A bundle that enables both `gpu-operator` and `nvidia-dra-driver-gpu` schedules
+the DRA kubelet plugin only on nodes labeled
+`nvidia.com/dra-kubelet-plugin=true` (or the pair given to
+`aicr bundle --dra-eviction-node-label`). Set it **in the node pool
+definition**, with the other required node labels — an ad hoc
+`kubectl label node` does not survive node replacement, recycling,
+autoscaling, or a pool scaled from zero, so later nodes arrive unlabeled.
+
+An unlabeled GPU node fails silently: it runs no kubelet plugin and publishes
+no `ResourceSlices`, and neither Helm nor the bundle's `deploy.sh` reports an
+error. With no labeled GPU node at all the DaemonSet sits at `DESIRED=0`; with
+only some labeled, those nodes work while the rest silently lack DRA. This applies to existing clusters too — adding
+the selector during an upgrade removes a plugin that was previously working.
+See [Prepare DRA nodes before applying upgraded bundles](../user/bundling.md#prepare-dra-nodes-before-applying-upgraded-bundles).
+
 ## GPU Driver Setup
 
 AKS has two mutually exclusive GPU **ownership modes**. Each is a complete
@@ -188,7 +205,12 @@ aicr recipe --service aks --accelerator h100 --os ubuntu --intent training \
   --snapshot snapshot.yaml -o recipe.yaml                 # azure-managed default
 #   ... or, for --gpu-driver none pools:
 #   --profile gpuStack=operator-managed
-aicr bundle -r recipe.yaml -o ./bundles
+# The keyed toleration is required on AKS under either profile value.
+# NVSentinel needs no overrides: the gpuStack profile configures it.
+# See "NVSentinel is configured by the profile" below.
+aicr bundle -r recipe.yaml \
+  --accelerated-node-toleration nvidia.com/gpu:NoSchedule \
+  -o ./bundles
 ```
 
 The reading qualifies the selection — it does not choose for you. Every
@@ -235,7 +257,8 @@ az aks nodepool add \
   --resource-group <rg> \
   --name gpupool \
   --node-vm-size Standard_ND96isr_H100_v5 \
-  --node-count 1
+  --node-count 1 \
+  --labels nvidia.com/dra-kubelet-plugin=true
 ```
 
 No changes to AICR recipes are needed — this is the AKS family's `gpuStack`
@@ -308,8 +331,8 @@ check-nvidia-smi) for training and inference, and the training performance
 phase passes the calibrated NCCL all-reduce gate at 157.29 GB/s (16 GiB
 message size across 2 nodes, gate >= 150). The Dynamo inference counterpart
 (`h100-aks-ubuntu-inference-dynamo`) passes `inference-perf` at
-148,004 tok/s throughput (gate >= 50,000) with 579.70 ms TTFT p99
-(gate <= 2,000) — Qwen/Qwen3-8B at 256 concurrency per GPU via
+148,004 tok/s throughput (gate `>= 50,000`) with 579.70 ms TTFT p99
+(gate `<= 2,000`) — Qwen/Qwen3-8B at 256 concurrency per GPU via
 dynamo-router on a single ND96isr node. Other SKUs and node images have
 not been exercised — run `aicr validate` after deployment and report gaps.
 
@@ -475,6 +498,84 @@ GDRCopy, switch to the GPU-Operator-managed profile below (regenerate with
 at bundle time — `gdrcopy.enabled` is not a profile-owned path, so the
 override is accepted.
 
+**NVSentinel is configured by the profile.** Two silent NVSentinel
+misconfigurations are specific to `azure-managed`. The `gpuStack` profile now
+sets both values itself ([#2181](https://github.com/NVIDIA/aicr/issues/2181)),
+so no bundle-time override is needed under either profile value:
+
+| Path | `azure-managed` (default) | `operator-managed` |
+|---|---|---|
+| `nvsentinel.labeler.assumeDriverInstalled` | `true` | `false` |
+| `nvsentinel.metadata-collector.runtimeClassName` | `nvidia-container-runtime` | `nvidia` |
+
+Because these are profile-owned paths, a bundle-time `--set` diverging from the
+selected value is **rejected** rather than silently applied. The two gates
+below remain as defense in depth.
+
+The two failure signatures look similar but are distinct, and both must be
+fixed for `metadata-collector` to become ready:
+
+| Symptom | DaemonSets | Cause |
+|---|---|---|
+| **0 DESIRED** pods — pods never scheduled, no error, no event | `metadata-collector`, `syslog-health-monitor-regular`, `syslog-health-monitor-kata` | driver label never applied ([#2175](https://github.com/NVIDIA/aicr/issues/2175)) |
+| **N desired / 0 CREATED** — `FailedCreate` at admission, no pod object exists | `metadata-collector` | RuntimeClass name mismatch ([#2176](https://github.com/NVIDIA/aicr/issues/2176)) |
+
+**Driver label (`labeler.assumeDriverInstalled`).** With
+`driver.enabled=false` there is no GPU Operator driver pod, and the NVSentinel
+labeler decides the node label `nvsentinel.dgxc.nvidia.com/driver.installed` by
+watching for one. Left unset the label is never applied, and the three
+DaemonSets that select on it come up with **0 desired pods**. This is easy to
+miss: a DaemonSet matching no node is not unhealthy, so it reports no error
+and emits no event, and `gpu-health-monitor` keeps running because it selects
+on the DCGM label instead. The stack presents as fully rolled out.
+
+The value renders the labeler's `--assume-driver-installed` argument — the
+chart-level automation of the Manual Labeling Procedure in NVSentinel design
+018 — and, per the upstream decision in
+[NVIDIA/NVSentinel#1583](https://github.com/NVIDIA/NVSentinel/issues/1583),
+the recommended, permanent mechanism for host-installed drivers (no automatic
+detection fallback will be added). Under `azure-managed` a recipe that reaches
+bundle generation without it is a **blocking error**
+(`CheckNVSentinelDriverLabelDetectable`), so the silent half-rollout cannot
+ship. Under `operator-managed` the profile sets it to an explicit `false` and
+the gate does not fire at all: the operator's driver pod is the evidence there,
+and skipping detection would keep the label applied across an unloaded driver.
+
+**Runtime class (`metadata-collector.runtimeClassName`).** The
+metadata-collector DaemonSet requests a RuntimeClass by name, and the GPU
+Operator's ClusterPolicy controller names its primary RuntimeClass after
+`operator.runtimeClass`. Under `azure-managed` that is
+`nvidia-container-runtime` (matching the handler preconfigured on the AKS node
+image), so a collector left on its chart default `nvidia` finds no such
+RuntimeClass and the API server rejects every pod at admission:
+
+```text
+Warning  FailedCreate  daemonset/metadata-collector
+Error creating: pods "metadata-collector-" is forbidden:
+pod rejected: RuntimeClass "nvidia" not found
+```
+
+No pod object is ever created, so there is nothing to `kubectl describe`; the
+`FailedCreate` event on the DaemonSet is the only signal.
+
+The same profile value owns both `gpu-operator.operator.runtimeClass` and
+`nvsentinel.metadata-collector.runtimeClassName`, so the two names are
+consistent by construction under either value.
+`CheckNVSentinelRuntimeClassCoherence` still compares the resolved names as a
+**blocking error** if they ever diverge.
+
+**Labeling the nodes by hand does not persist.** Applying the label manually:
+
+```shell
+kubectl label node <node> nvsentinel.dgxc.nvidia.com/driver.installed=true
+```
+
+takes effect immediately and then silently reverts — with no driver pod to
+observe, the labeler computes an empty desired value and removes the label on
+its next reconcile. Design 018 documents manual labeling as the procedure for
+this case, so an operator following it will see it work and later find the
+DaemonSets back at 0 desired.
+
 ### Alternative: Let GPU Operator Manage the Driver
 
 If you prefer the GPU Operator to install the driver (e.g., to pin the driver
@@ -489,7 +590,8 @@ az aks nodepool add \
   --name gpupool \
   --node-vm-size Standard_ND96isr_H100_v5 \
   --gpu-driver none \
-  --node-count 1
+  --node-count 1 \
+  --labels nvidia.com/dra-kubelet-plugin=true
 ```
 
 Then select the mode at recipe generation time with the `gpuStack`

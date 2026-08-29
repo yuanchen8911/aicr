@@ -28,7 +28,7 @@ NVIDIA AI Cluster Runtime (AICR) generates validated GPU-accelerated Kubernetes 
  state         config         vs actual     manifests
 ```
 
-**Tech Stack:** Go 1.26, Kubernetes 1.33+, golangci-lint, Ko for images (pinned versions in `.settings.yaml`)
+**Tech Stack:** Go 1.26, Kubernetes, golangci-lint, Ko for images (pinned versions in `.settings.yaml`)
 
 ## Commands
 
@@ -38,7 +38,7 @@ NVIDIA AI Cluster Runtime (AICR) generates validated GPU-accelerated Kubernetes 
 unset GITLAB_TOKEN
 
 # Development workflow
-make qualify      # Full check: test + lint + e2e + scan (run before PR)
+make qualify      # Full check: test-coverage + lint + tuning-check + e2e + scan + license-check + api-diff (run before PR)
 make test         # Unit tests with -race
 make lint         # golangci-lint + yamllint
 make scan         # Grype vulnerability scan
@@ -108,6 +108,7 @@ workspace paths. Use local file paths only when explicitly requested.
 | `pkg/component` | Bundler utilities and test helpers | Yes |
 | `pkg/collector` | System state collection | Yes |
 | `pkg/validator` | Constraint evaluation | Yes |
+| `pkg/chainsaw` | In-process Chainsaw Test executor (assert/error only) + read-only allowlist; no external chainsaw binary | Yes |
 | `pkg/errors` | Structured error handling with codes | Yes |
 | `pkg/manifest` | Shared Helm-compatible manifest rendering | Yes |
 | `pkg/evidence` | Conformance evidence capture and formatting | Yes |
@@ -115,7 +116,7 @@ workspace paths. Use local file paths only when explicitly requested.
 | `pkg/snapshotter` | System state snapshot orchestration | Yes |
 | `pkg/k8s/client` | Singleton Kubernetes client | Yes |
 | `pkg/k8s/pod` | Shared K8s Job/Pod utilities (wait, logs, ConfigMap URIs) | Yes |
-| `pkg/validator/helper` | Shared validator helpers (PodLifecycle, test context) | Yes |
+| `validators/helper` | Shared validator helpers (PodLifecycle, GPU/resource utilities) | Yes |
 | `pkg/defaults` | Centralized timeout and configuration constants | Yes |
 
 **Critical Architecture Principle:**
@@ -557,14 +558,28 @@ Process and unique findings below; the rule sections above (Error Wrapping, Cont
 
 ## Pull Request Requirements
 
-**Pre-push checklist:** Always run `make qualify` before pushing. This is the CI-equivalent gate that covers tests, linting (golangci-lint + yamllint), e2e, vulnerability scan, and repo-specific checks (docs sidebar, agents sync). Do not substitute a subset of commands — if `make qualify` passes locally, CI will pass.
+**Pre-push checklist:** Always run `make qualify` before pushing. This is the CI-equivalent gate that covers coverage-gated tests, linting (golangci-lint + yamllint + license headers, agents sync, docs filename/MDX gates, chart-version pins), tuning-check, e2e, vulnerability scan, license allowlist check, and API compatibility (api-diff). Do not substitute a subset of commands — `make qualify` is the closest local equivalent of the CI gate. A few checks run only in CI (e.g. the lychee docs link check on `docs/**` PRs, CodeQL, and the GPU test lanes), so a green local `qualify` does not guarantee every CI job passes.
 
 **Mandatory lint gate for Go changes:** If your PR changes any `.go` files, you MUST run `golangci-lint run -c .golangci.yaml` on each affected package path (e.g., `./pkg/recipe/...`, `./cmd/aicr/...`, `./tests/chainsaw/...`) and confirm zero issues before creating or pushing the PR. For a full module scan, use `./...`. Do not rely on CI to catch lint failures — fix them locally first. This applies even to PRs labeled as "documentation only" if they include Go code changes.
 
-**Branch hygiene:**
-- Always rebase onto the target branch before pushing: `git fetch origin main && git rebase origin/main`
-- Squash commits into a single commit before push
-- Cryptographically sign commits (`git commit -S`)
+**Branch hygiene.** The governing idea: the SHA a reviewer is reading should be the SHA you want reviewed.
+
+- **Keep the PR in draft while you are still changing it**; flip it to ready only when you want eyes on it. Draft PRs do not page reviewers, and that is the phase where rewriting history is free.
+- **While the PR is a draft, rebase and squash freely.** Do not key this on whether comments exist: CodeRabbit auto-reviews drafts here (`.coderabbit.yaml`, `auto_review.drafts: true`), so a bot comment lands minutes after the first push.
+- **Once the PR is not a draft — whether you flipped it or opened it that way — append commits instead of rewriting history.** Inline comments anchor to SHAs, and any rewrite outdates every one of them. Each appended commit dismisses approvals (`dismiss_stale_reviews_on_push` is on); that is the intended cost, since a force-push dismisses them too *and* destroys the anchors. Returning to draft stops paging reviewers and restores the draft phase's freedom to rewrite; if inline comments already exist, say on the PR that you rewrote and name the old and new SHA so reviewers know to restart.
+- **Do not hand-squash before merge.** `NVIDIA/aicr` is squash-merge-only, so GitHub composes the commit on `main` from the PR title; by default only the title and trailers reach `main`. Durable wording belongs in the PR title.
+- **Once the PR is not a draft, rebase only when the merge gate requires it** — but it does require it: the repo enforces up-to-date branches, so a PR behind `main` cannot merge. `git fetch origin main && git rebase origin/main`, never GitHub's "Update branch" button or a merge commit. A rebase is itself a force-push and can outdate anchors even when the content is unchanged, so treat it as one. To confirm it replayed your work cleanly, compare `git diff origin/main...HEAD` before and after, or use `git range-diff <old-sha>...HEAD`.
+- **Once the PR is not a draft, force-push only when you must** — a gate-required rebase, a missing signature or sign-off, a wrong base, a committed secret. Nothing else qualifies at that point; while it is still a draft the bullets above apply. **Default to the first form below**; never combine the two forms:
+  - `--force-with-lease --force-if-includes` — adds a reflog check that the remote tip was integrated locally, which is what closes the fail-open hole below. Enable it once per clone with `git config push.useForceIfIncludes true` — **per-repo, not `--global`**: the check also rejects in a fresh clone (the only reflog entry is the clone itself), and that friction belongs only where it is needed; or
+  - `--force-with-lease=<refname>:<sha-you-observed>` — pins the lease to a head you read and confirmed first. Use it where the reflog check cannot pass, such as a fresh clone. `<refname>` is the branch name as it exists on the remote, unprefixed, e.g. `git push origin my-branch --force-with-lease=my-branch:abc1234`.
+
+  `--force-if-includes` is a documented no-op when the lease already names an expected SHA, so pairing them leaves you trusting a guard git has disabled. A bare `--force-with-lease` alone can silently pass, because a background fetch or a concurrent session sharing the clone may have refreshed the remote-tracking ref its lease reads. Never plain `--force`. Say on the PR that you force-pushed, naming the old and new SHA. Both guards are a backstop, not the primary protection — they do not replace the rule against rebasing or force-pushing a branch you do not own.
+- Verify what you are about to push: `git log --oneline origin/main..HEAD` and `git diff --stat origin/main...HEAD`.
+- Sign every commit both ways: `git commit -S -s` (see Git Configuration above).
+
+**Responding to review:**
+- **Answer feedback on the thread, not only in code.** Reply with what changed and where — or why you disagreed or deferred. Do not make a reviewer diff two SHAs to find out, including when the feedback came via Slack.
+- Re-request review when you have finished responding to a round, and after any rewrite that changes the reviewed SHA. Not once per appended commit.
 
 **Documentation updates:** When a PR adds or changes user-visible behavior (new CLI flag, API endpoint, component, recipe field, deployment pattern, environment variable, error code), update the relevant page in `docs/` in the same PR — don't defer to a follow-up. Common targets by kind of change:
 - CLI flag / subcommand → `docs/user/cli-reference.md`
@@ -580,8 +595,8 @@ Follow the heading conventions in the `## Documentation Style` section above. Do
 
 **Test coverage gate (Go packages only; not YAML/docs/CI):**
 Before pushing a PR that changes Go source, check coverage on affected packages. Set `pkg` to the narrowest changed root — `$pkg/...` includes descendants (e.g. use `pkg=pkg/collector/topology`, not `pkg=pkg/collector`, unless you want a combined delta).
-1. Current: `GOFLAGS="-mod=vendor" go test -coverprofile=cover.out ./$pkg/...` on each changed package.
-2. Baseline (skip for new packages; commit changes first): `(git worktree add $TMPDIR/baseline origin/main && (cd $TMPDIR/baseline && GOFLAGS="-mod=vendor" go test -coverprofile=$TMPDIR/base.out ./$pkg/...); rc=$?; git worktree remove --force $TMPDIR/baseline; return $rc 2>/dev/null || (exit $rc))` — `$TMPDIR/base.out` survives cleanup and `rc` preserves test status. Compare with `go tool cover -func`.
+1. Current: `go test -coverprofile=cover.out ./$pkg/...` on each changed package.
+2. Baseline (skip for new packages; commit changes first): `(git worktree add $TMPDIR/baseline origin/main && (cd $TMPDIR/baseline && go test -coverprofile=$TMPDIR/base.out ./$pkg/...); rc=$?; git worktree remove --force $TMPDIR/baseline; return $rc 2>/dev/null || (exit $rc))` — `$TMPDIR/base.out` survives cleanup and `rc` preserves test status. Compare with `go tool cover -func`.
 3. **Block** if `make test-coverage` fails (enforces the 80% floor from `.settings.yaml`, excluding `validators/` — see #1752; do not use per-package profiles for this check).
 4. **Flag** any package with per-package decrease > 0.5% (step 1 vs 2).
 5. **Block** if any new exported func/method (`git diff origin/main -- $pkg/`, added uppercase `func` lines) has 0% coverage — add tests first.
@@ -595,7 +610,8 @@ CI also posts per-package deltas post-push via `go-coverage-report` (`on-push-co
 - Area labels are auto-assigned by `.github/labeler.yml` based on changed file paths (e.g., `area/recipes`, `area/ci`, `area/api`, `area/cli`, `area/bundler`, `area/collector`, `area/validator`, `area/docs`, `area/infra`, `area/tests`). You may also add them manually when the auto-labeler wouldn't match (e.g., issue-only PRs or cross-cutting changes).
 - Do NOT add issue priority labels `P0`, `P1`, or `P2` to PRs; they are reserved for issues and automation removes them from pull requests
 - Do NOT add `size/*` labels (auto-assigned by bot)
-- Keep the PR title under 70 characters; use the description for details
+- **PR titles are linted.** CI enforces Conventional Commits format — `type: subject`, `type(scope): subject`, `type!: subject`, or `type(scope)!: subject`, where `!` marks a breaking change. Valid types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`. Scopes may be mixed case (`fix(GB200):`). A malformed title fails the check; editing the title re-runs it automatically. The title is the whole commit message on `main` (`squash_merge_commit_message: BLANK`) and cannot be corrected after merge
+- Keep the PR title to 70 characters or fewer; use the description for details. Over 70 warns but does not block — dependency-bot titles embed pseudo-versions that cannot be shortened
 
 **Issue policy:**
 - Set an **org issue type** on new issues. This is a GitHub-native field (shown in the standard issue view, distinct from repo `area/*`/`theme/*` labels) that categorizes the issue. Valid types: `Task`, `Bug`, `Enhancement`, `Epic`, `Initiative`, `Documentation`.

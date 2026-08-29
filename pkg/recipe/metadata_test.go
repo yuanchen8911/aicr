@@ -35,11 +35,14 @@ package recipe
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"reflect"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/NVIDIA/aicr/pkg/errors"
 )
 
 func TestRecipeMetadataSpecValidateDependencies(t *testing.T) {
@@ -2296,6 +2299,8 @@ func TestNFDTopologyUpdater_OverlayCoverage(t *testing.T) {
 		{"h100-gke-cos-inference", criteria{CriteriaServiceGKE, CriteriaAcceleratorH100, CriteriaOSCOS, CriteriaIntentInference, ""}, true},
 		{"gb200-eks-training", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB200, "", CriteriaIntentTraining, ""}, true},
 		{"gb200-eks-inference", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB200, "", CriteriaIntentInference, ""}, true},
+		{"gb300-eks-training", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, "", CriteriaIntentTraining, ""}, true},
+		{"gb300-eks-inference", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, "", CriteriaIntentInference, ""}, true},
 		{"gb200-oke-training", criteria{CriteriaServiceOKE, CriteriaAcceleratorGB200, CriteriaOSOracleLinux, CriteriaIntentTraining, ""}, true},
 		{"gb200-oke-inference", criteria{CriteriaServiceOKE, CriteriaAcceleratorGB200, CriteriaOSOracleLinux, CriteriaIntentInference, ""}, true},
 		{"l40s-oke-training", criteria{CriteriaServiceOKE, CriteriaAcceleratorL40S, CriteriaOSOracleLinux, CriteriaIntentTraining, ""}, true},
@@ -2328,6 +2333,11 @@ func TestNFDTopologyUpdater_OverlayCoverage(t *testing.T) {
 		{"gb200-eks-ubuntu-inference", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB200, CriteriaOSUbuntu, CriteriaIntentInference, ""}, true},
 		{"gb200-eks-ubuntu-training-kubeflow", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB200, CriteriaOSUbuntu, CriteriaIntentTraining, CriteriaPlatformKubeflow}, true},
 		{"gb200-eks-ubuntu-inference-dynamo", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB200, CriteriaOSUbuntu, CriteriaIntentInference, CriteriaPlatformDynamo}, true},
+		// GB300 EKS Ubuntu variants
+		{"gb300-eks-ubuntu-training", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, CriteriaOSUbuntu, CriteriaIntentTraining, ""}, true},
+		{"gb300-eks-ubuntu-inference", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, CriteriaOSUbuntu, CriteriaIntentInference, ""}, true},
+		{"gb300-eks-ubuntu-training-kubeflow", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, CriteriaOSUbuntu, CriteriaIntentTraining, CriteriaPlatformKubeflow}, true},
+		{"gb300-eks-ubuntu-inference-dynamo", criteria{CriteriaServiceEKS, CriteriaAcceleratorGB300, CriteriaOSUbuntu, CriteriaIntentInference, CriteriaPlatformDynamo}, true},
 		// GB200 OKE Ubuntu variants
 		{"gb200-oke-ubuntu-training", criteria{CriteriaServiceOKE, CriteriaAcceleratorGB200, CriteriaOSUbuntu, CriteriaIntentTraining, ""}, true},
 		{"gb200-oke-ubuntu-inference", criteria{CriteriaServiceOKE, CriteriaAcceleratorGB200, CriteriaOSUbuntu, CriteriaIntentInference, ""}, true},
@@ -2470,5 +2480,57 @@ func TestDeepMergeMap_NoSliceAliasing(t *testing.T) {
 	}
 	if got := src["env"].([]any)[0]; got != srcOriginalEnv {
 		t.Errorf("src env corrupted via dst alias: got %v want %v", got, srcOriginalEnv)
+	}
+}
+
+// TestRecipeResultNormalizeKind pins the ingest-boundary kind contract: the
+// legacy shapes this API accepted through v0.18.0 are rewritten to the
+// canonical kind so the emitted artifact reloads, the canonical value is a
+// no-op, and any other kind is rejected the way the file loader and the
+// strict v2 decode path already reject it. See issue #1953.
+func TestRecipeResultNormalizeKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		kind     string
+		wantKind string
+		wantErr  bool
+	}{
+		{name: "canonical kind is unchanged", kind: RecipeResultKind, wantKind: RecipeResultKind},
+		{name: "absent kind is stamped", kind: "", wantKind: RecipeResultKind},
+		{name: "legacy Recipe kind is normalized", kind: "Recipe", wantKind: RecipeResultKind},
+		{name: "unrelated artifact kind is rejected", kind: RecipeMetadataKind, wantKind: RecipeMetadataKind, wantErr: true},
+		{name: "unknown kind is rejected", kind: "Widget", wantKind: "Widget", wantErr: true},
+		{name: "wrong-case kind is rejected", kind: "reciperesult", wantKind: "reciperesult", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			r := &RecipeResult{Kind: tt.kind}
+			err := r.NormalizeKind()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NormalizeKind() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if r.Kind != tt.wantKind {
+				t.Errorf("Kind = %q, want %q", r.Kind, tt.wantKind)
+			}
+			if tt.wantErr && !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+				t.Errorf("error code = %v, want %v", err, errors.ErrCodeInvalidRequest)
+			}
+		})
+	}
+}
+
+// TestRecipeResultNormalizeKindNilReceiver keeps the helper safe on the nil
+// receiver the surrounding validation helpers all tolerate.
+func TestRecipeResultNormalizeKindNilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var r *RecipeResult
+	if err := r.NormalizeKind(); err != nil {
+		t.Errorf("NormalizeKind() on nil receiver = %v, want nil", err)
 	}
 }

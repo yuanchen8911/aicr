@@ -33,6 +33,16 @@ const (
 	workflowsDir = "../../.github/workflows"
 	actuatorRoot = "ghcr.io/mchmarny/cluster/"
 	pinnedGKERef = "${{ env.GKE_ACTUATOR_IMAGE }}"
+
+	// githubHostedRunner is the runs-on label for GitHub-hosted Ubuntu runners.
+	githubHostedRunner = "ubuntu-latest"
+	// githubHostedJobCapMinutes is the hard 6h execution ceiling GitHub imposes
+	// on a job running on a GitHub-hosted runner. A job-level timeout-minutes
+	// above this is silently clamped to it, so a UAT teardown budget that reads
+	// above the cap would not actually take effect — the always() Destroy step
+	// would be canceled at 360m and the cluster leaked. See uat-gcp.yaml's
+	// timeout budget comment and #2066/#2067.
+	githubHostedJobCapMinutes = 360
 )
 
 type actuatorExpectation struct {
@@ -61,6 +71,18 @@ var credentialApplyExpectations = []credentialApplyExpectation{
 
 var actuatorStepNames = []string{"Bringup Infra", "Destroy Cluster"}
 
+// awsTokenBearingStepNames enumerates AWS-lane steps that carry credentials
+// via env (not credentials_file_path). Adding the argocd deployer variant
+// wired GITHUB_TOKEN into the install step so install_argocd can provision
+// the ghcr.io repo-creds Secret (see .github/workflows/uat-aws.yaml + issue
+// #2194). The install path never enables `set -x` today and the token is
+// scoped to `packages: write`, so this is a low-value invariant pin rather
+// than a gap in protection — the pin exists so a future set -x addition in
+// the install step (an addition invisible in an env-only diff) is caught by
+// TestCredentialBearingUATStepsDisableXtrace instead of leaking the token
+// into log lines.
+var awsTokenBearingStepNames = []string{"UAT - install (helmfile apply or argocd sync)"}
+
 type workflowDocument struct {
 	Env      map[string]string      `yaml:"env"`
 	Defaults workflowDefaults       `yaml:"defaults"`
@@ -68,9 +90,11 @@ type workflowDocument struct {
 }
 
 type workflowJob struct {
-	Env      map[string]string `yaml:"env"`
-	Defaults workflowDefaults  `yaml:"defaults"`
-	Steps    []workflowStep    `yaml:"steps"`
+	Env            map[string]string `yaml:"env"`
+	Defaults       workflowDefaults  `yaml:"defaults"`
+	Steps          []workflowStep    `yaml:"steps"`
+	RunsOn         string            `yaml:"runs-on"`
+	TimeoutMinutes int               `yaml:"timeout-minutes"`
 }
 
 type workflowDefaults struct {
@@ -139,6 +163,70 @@ func TestUATActuatorInvocationsArePinnedApplyCommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUATCloudJobTimeoutsWithinPlatformCap guards the teardown-on-cancel
+// budgets: the three cloud UAT jobs run on GitHub-hosted runners, which hard-cap
+// a job at 360m. A job-level timeout-minutes above that is silently clamped, so a
+// budget that reads higher would not take effect and the always() Destroy step
+// would be canceled at 360m — leaking the cluster #2066/#2067 exist to protect.
+func TestUATCloudJobTimeoutsWithinPlatformCap(t *testing.T) {
+	for _, tt := range actuatorExpectations {
+		t.Run(tt.name, func(t *testing.T) {
+			workflow := decodeWorkflow(t, tt.file)
+			job, ok := workflow.Jobs[tt.job]
+			if !ok {
+				t.Fatalf("%s: missing job %q", tt.file, tt.job)
+			}
+			if job.RunsOn != githubHostedRunner {
+				t.Fatalf("%s: job %q runs-on %q, want %q (GitHub-hosted cap assumption)",
+					tt.file, tt.job, job.RunsOn, githubHostedRunner)
+			}
+			if job.TimeoutMinutes <= 0 {
+				t.Fatalf("%s: job %q must set an explicit timeout-minutes so an "+
+					"overrun cannot cancel the always() teardown", tt.file, tt.job)
+			}
+			if job.TimeoutMinutes > githubHostedJobCapMinutes {
+				t.Errorf("%s: job %q timeout-minutes=%d exceeds the GitHub-hosted cap of %d; "+
+					"a value above the cap is silently clamped and the budget comment would lie",
+					tt.file, tt.job, job.TimeoutMinutes, githubHostedJobCapMinutes)
+			}
+		})
+	}
+}
+
+// TestGKEBringupGatesBroughtUpOnNodePoolsRunning pins the false-green fix: an
+// actuator exit 0 (e.g. a no-change plan over a retained ERROR pool) must not by
+// itself mark the cluster brought up. The Bringup Infra step must additionally
+// require every node pool to report RUNNING before setting brought_up=true, and
+// must fail closed when it does not. Without this a broken cluster is held on
+// daytime-up/skip_delete and #2067's failure() teardown never fires.
+func TestGKEBringupGatesBroughtUpOnNodePoolsRunning(t *testing.T) {
+	workflow := decodeWorkflow(t, "uat-gcp.yaml")
+	job, ok := workflow.Jobs["uat-gcp"]
+	if !ok {
+		t.Fatal("uat-gcp.yaml: missing job \"uat-gcp\"")
+	}
+	step := uniqueStepNamed(t, job.Steps, "Bringup Infra")
+
+	// The readiness gate: list node-pool statuses and reject unless every line is
+	// exactly RUNNING (grep -qvx RUNNING matches any non-RUNNING/extra line).
+	for _, marker := range []string{
+		"gcloud container node-pools list",
+		"--format='value(status)'",
+		"grep -qvx 'RUNNING'",
+		"brought_up=true",
+	} {
+		if !strings.Contains(step.Run, marker) {
+			t.Errorf("Bringup Infra step must contain %q to gate brought_up on node-pool readiness", marker)
+		}
+	}
+
+	// Fail-closed guard: a run that never set brought_up must exit non-zero so a
+	// docker-run-in-`if` (which does not trip set -e) cannot proceed on exit 0.
+	if !strings.Contains(step.Run, `if [ "$brought_up" != true ]; then`) {
+		t.Error("Bringup Infra step must fail closed (exit non-zero) when brought_up was never set")
 	}
 }
 
@@ -315,8 +403,14 @@ func TestCredentialBearingUATStepsDisableXtrace(t *testing.T) {
 		{
 			"AWS", "uat-aws.yaml", "uat-aws",
 			func(t *testing.T, steps []workflowStep) []workflowStep {
-				selected := make([]workflowStep, 0, len(actuatorStepNames))
+				selected := make([]workflowStep, 0, len(actuatorStepNames)+len(awsTokenBearingStepNames))
 				for _, stepName := range actuatorStepNames {
+					selected = append(selected, uniqueStepNamed(t, steps, stepName))
+				}
+				// Token-bearing steps (env-only credentials) — see the
+				// awsTokenBearingStepNames comment for the argocd deployer
+				// rationale.
+				for _, stepName := range awsTokenBearingStepNames {
 					selected = append(selected, uniqueStepNamed(t, steps, stepName))
 				}
 				return selected
@@ -599,7 +693,7 @@ func actuatorReferenceTokens(value string) ([]string, error) {
 
 func containsActuatorReferenceCandidate(value string) bool {
 	candidateValue := strings.ReplaceAll(value, "\\\n", "")
-	for _, field := range strings.Fields(candidateValue) {
+	for field := range strings.FieldsSeq(candidateValue) {
 		if !looksLikeRegistryReference(field) && !strings.Contains(field, "$'") {
 			continue
 		}
@@ -607,10 +701,8 @@ func containsActuatorReferenceCandidate(value string) bool {
 		if err != nil {
 			return true
 		}
-		for _, word := range words {
-			if looksLikeRegistryReference(word) {
-				return true
-			}
+		if slices.ContainsFunc(words, looksLikeRegistryReference) {
+			return true
 		}
 	}
 	return false
@@ -642,10 +734,8 @@ func shellEnablesXtrace(text string) bool {
 		if segmentErr != nil {
 			return true
 		}
-		for _, segment := range segments {
-			if shellSegmentEnablesXtrace(segment) {
-				return true
-			}
+		if slices.ContainsFunc(segments, shellSegmentEnablesXtrace) {
+			return true
 		}
 		for _, word := range lineWords {
 			if !strings.Contains(word, "$(") && !strings.ContainsRune(word, '`') {
@@ -655,10 +745,8 @@ func shellEnablesXtrace(text string) bool {
 			if nestedErr != nil {
 				return true
 			}
-			for _, segment := range nestedSegments {
-				if shellSegmentEnablesXtrace(segment) {
-					return true
-				}
+			if slices.ContainsFunc(nestedSegments, shellSegmentEnablesXtrace) {
+				return true
 			}
 		}
 	}
@@ -864,7 +952,7 @@ func parseDockerInvocations(script string) ([]dockerInvocation, error) {
 
 		dockerIndex := -1
 		imageIndex := -1
-		for index := 0; index < len(arguments); index++ {
+		for index := range arguments {
 			if filepath.Base(arguments[index]) != "docker" {
 				continue
 			}

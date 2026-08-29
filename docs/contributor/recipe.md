@@ -96,11 +96,12 @@ components:
 | `nodeScheduling` | `NodeSchedulingConfig` | no | Helm value paths for injecting selectors/tolerations/taints (`system`, `accelerated`, plus `nodeCountPaths`) |
 | `podScheduling` | `PodSchedulingConfig` | no | Helm value paths for workload pod scheduling injection |
 | `storageClassPaths` | []string | no | Helm value paths where `--storage-class` is written |
+| `sharedStorageClassPaths` | []string | no | Helm value paths where `--shared-storage-class` is written for shared filesystem PVCs |
 | `validations` | []`ComponentValidationConfig` | no | Bundle-time validation checks (function, severity, conditions, message) |
-| `healthCheck.assertFile` | string | **yes** | Chainsaw assert YAML (relative to data dir) consumed by `aicr validate --phase deployment` (runtime — #1220) and by `make check-health` locally. Content is restricted to the read-only `assert` / `error` operation allowlist. Enforced at PR time by `pkg/recipe.TestComponentRegistry_RequiresHealthCheck` (every component must declare a path) and `validators/chainsaw.TestValidateTestReadOnly_RegistryContent` (every declared path must pass the allowlist) — see #1223. |
+| `healthCheck.assertFile` | string | **yes** | Chainsaw assert YAML (relative to data dir) consumed by `aicr validate --phase deployment` (runtime — #1220) and by `make check-health` locally. Content is restricted to the read-only `assert` / `error` operation allowlist. Enforced at PR time by `pkg/recipe.TestComponentRegistry_RequiresHealthCheck` (every component must declare a path) and `pkg/chainsaw.TestValidateTestReadOnly_RegistryContent` (every declared path must pass the allowlist) — see #1223. |
 | `gkeCriticalPriority` | bool | no | Synthesize ResourceQuota on GKE so `system-*-critical` pods admit |
 | `hasSelfRefCRDs` | bool | no | Tells helmfile to emit `disableValidation: true` (chart ships CRD + CR in same release) |
-| `manifestsUseChartCRDs` | bool | no | Tells helmfile to emit `disableValidation: true` on the release carrying the attached manifests — the injected `-post` wrapper, or the collapsed vendored folder under `--vendor-charts` (manifests create CRs of CRDs the chart installs) |
+| `manifestsUseChartCRDs` | bool | no | Tells helmfile to emit `disableValidation: true` on the release carrying the attached manifests — the injected `-post` wrapper under both vendored and non-vendored layouts (manifests create CRs of CRDs the chart installs) |
 
 `HelmConfig`: `defaultRepository`, `defaultChart`, `defaultVersion`,
 `defaultNamespace`. `KustomizeConfig`: `defaultSource`, `defaultPath`,
@@ -155,8 +156,8 @@ Criteria fields (see `pkg/recipe/criteria.go` `type Criteria`):
 
 | Field | Type | Wildcard | Static OSS values |
 |---|---|---|---|
-| `service` | `CriteriaServiceType` | `any` or empty | `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm` |
-| `accelerator` | `CriteriaAcceleratorType` | `any` or empty | `h100`, `h200`, `gb200`, `b200`, `a100`, `l40`, `l40s`, `rtx-pro-6000` |
+| `service` | `CriteriaServiceType` | `any` or empty | `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm`, `metal3` |
+| `accelerator` | `CriteriaAcceleratorType` | `any` or empty | `h100`, `h200`, `gb200`, `gb300`, `b200`, `a100`, `l40`, `l40s`, `rtx-pro-6000` |
 | `intent` | `CriteriaIntentType` | `any` or empty | `training`, `inference` |
 | `os` | `CriteriaOSType` | `any` or empty | `ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos` |
 | `platform` | `CriteriaPlatformType` | `any` or empty | `dynamo`, `kubeflow`, `nim`, `runai`, `slurm` |
@@ -172,7 +173,13 @@ fast-path `switch` in `Parse<X>`. Adding a new value to a Go enum
 the count of non-`any`, non-empty fields. The current `Specificity()`
 in `criteria.go` counts six fields: `service`, `accelerator`,
 `intent`, `os`, `platform`, `nodes`. Overlays are sorted by
-specificity ascending, so less-specific overlays merge first.
+specificity ascending, so less-specific overlays merge first. Note:
+`nodes` is included in `Specificity()` to allow nodes-only CLI queries
+to pass the guard, but it does **not** participate in `Matches()` — no
+overlay in the **embedded catalog** gates on node count (see #1781).
+External `--data` catalogs that set `criteria.nodes` on an overlay are
+rejected at load time (`ErrCodeInvalidRequest`); operators must remove
+or zero that field before upgrading.
 
 **Matching is asymmetric.** Recipe-side `any` is a wildcard (matches
 anything in the query); query-side `any` is *not* a wildcard (matches
@@ -202,16 +209,31 @@ names the ones at the end of a chain.
 
 `RecipeMetadata.Spec.Profile` declares one overlay-scoped enum for qualified
 configuration ownership modes. A declaration requires recipe apiVersion
-`aicr.run/v1alpha3`; that version without a declaration, or a declaration on
-the legacy version, is rejected. Profile-version metadata and recipe
-artifacts are strictly decoded so an unknown field cannot silently disappear.
+`aicr.run/v1alpha3` or its ADR-022 target `aicr.run/v1beta2`; either profile
+track without a declaration, or a declaration on a default-track version, is
+rejected. Profile-version metadata and recipe artifacts are strictly decoded
+so an unknown field cannot silently disappear.
 
-The core `ProfileValue` contract is closed to `constraints` and
-`componentRefs{name,overrides}`. It rejects `valuesFile`, component
+The core `ProfileValue` contract is closed to `advertiser`, `constraints`,
+`readinessConstraints`, and `componentRefs{name,overrides}`. It rejects `valuesFile`, component
 identity/deployment fields, root `overrides.enabled`, literal dotted keys,
-nested empty maps, and allocation-policy selector paths. The `advertiser`
-wire field is reserved for the later GKE extension and is rejected by the
-core validator. Value-bearing ownership is limited to Helm components;
+and nested empty maps. The `advertiser` field accepts exactly one non-empty
+value, `external` (validated against `pkg/allocpolicy`, the canonical
+append-only #1327 descriptor). A profile that owns advertisement — a
+declared `advertiser: external`, or explicit ownership of a non-synthetic
+policy-selector path (`devicePlugin.enabled`, DRA `resources.gpus.enabled`
+/ `gpuResourcesEnabledOverride`)
+— triggers the recomputed policy closure: every enabled descriptor
+component's selector paths plus its synthetic `enabled` join the
+**effective lock set** (`RecipeResult.EffectiveLockSet()`), which the
+bundle/mirror lock, the argocd-helm guard, and the hydrating gate all
+consume. The closure is recomputed at every artifact boundary and never
+persisted in `ownedPaths`. The hydrating gate additionally runs the shared
+tuple-coherence rules (external + `devicePlugin.enabled=true` and external
++ DRA `gpus.enabled=true` both reject). Profiles that do not own
+advertisement (the AKS shape) trigger no closure and leave
+allocation-policy keys on the bundle-time WARN semantics.
+Value-bearing ownership is limited to Helm components;
 Kustomize components do not consume values overrides and support only a
 valueless reference for presence locking.
 
@@ -230,6 +252,12 @@ Resolution enforces these invariants:
    collisions.
 5. Evaluate selected profile constraints fail closed. A missing reading has a
    distinct invalid-request diagnostic; other evaluator failures propagate.
+   A value's `readinessConstraints` are exempt from this step by design:
+   they name post-deployment properties (ADR-015 DD5) and route into
+   `spec.validation.readiness.constraints`, where the `aicr validate`
+   readiness pre-flight evaluates them fail closed. Names deduplicate
+   per phase — the same measurement path may carry a generation-time
+   pre-condition and a readiness-time post-deployment state.
 6. Stamp the result `aicr.run/v1alpha3` and persist
    `metadata.selectedProfile`. Its sorted `ownedPaths` is the
    declaration-wide path union plus synthetic `enabled` for each referenced
@@ -240,8 +268,13 @@ profile-owned values. Bundle and mirror compare final candidate state with the
 hydrated recipe before creating output. Exact, ancestor, or descendant dynamic
 paths reject unconditionally; static writes reject only when the effective
 three-state observation (present bytes, absent, or blocked) diverges.
-Argocd-helm emits the corresponding structural template-time guard. Other
-deployers have no supported install-time value surface.
+That bundle-time rejection is the whole enforcement for `helm`, `flux`, and
+`helmfile`, whose install-time surface is closed — only the paths `--dynamic`
+declares. The `argocd-helm` deployer additionally emits a structural
+template-time guard, because it exposes component values through the parent
+chart's `.Values`, an open-ended surface the bundle-time gate cannot
+enumerate. Plain `argocd` rejects `--dynamic` and has no install-time value
+surface.
 
 Unprofiled compositions retain the legacy apiVersion and byte shape.
 Generation-side driver auto-detection skips a path owned by the selected
@@ -323,6 +356,22 @@ spec:
         - name: Deployment.gpu-operator.version
           value: ">= v25.10.0"
 ```
+
+Host-managed driver floors (GKE COS / A4X Max and similar platforms where
+`driver.enabled: false`) use a separate deployment constraint,
+`Deployment.gpu-driver.version` (e.g. `">= 580.95.05"`).
+`check-nvidia-smi` evaluates it against the nvidia-smi banner on each
+verified node; when the constraint is absent the check keeps its
+banner-presence behavior and does not invent a floor (#1995).
+When the constraint is set but the host driver cannot be measured —
+unreadable nvidia-smi banner, no GPU nodes, all GPU nodes cordoned, or
+GPU nodes busy with workloads — the check fails closed rather than
+Skip. Skip on those paths is preserved only when no floor is
+configured. The value must carry a comparison operator (`>=`, `>`,
+`<=`, `<`) to behave as a floor; a bare version is exact string match,
+so a newer driver would fail. The constraint name is an exact match;
+a typo silently disables the floor (shared with
+`Deployment.gpu-operator.version`).
 
 For a query `{service: eks, accelerator: gb200, intent: training}`,
 the resolver returns three independent maximal leaves —
@@ -445,18 +494,54 @@ The error's `uncovered` context entries (`dimension`, `requestedValue`,
 `validCompletions`) are computed from the maximal set of overlays that carry
 the requested value without conflicting with any other stated dimension —
 see `completionTuplesFor` / `minimalTuples`. `nodes` is deliberately excluded
-from `coverageDimensions`: no overlay gates on node count, so covering it
-would reject every `--nodes` query. It remains a matching dimension (present
-in `Criteria.Matches`) but carries no coverage guarantee — it is advisory.
+from `coverageDimensions`: no overlay in the embedded catalog gates on
+node count, so covering it would reject every `--nodes` query. It does
+not participate in `Criteria.Matches()` (removed in #1781), but is
+retained in `Criteria.Specificity()` so that nodes-only CLI queries pass
+the minimum-specificity guard. It carries no coverage guarantee — it is
+advisory metadata. External `--data` catalogs that set `criteria.nodes`
+on any overlay are rejected at load time (`ErrCodeInvalidRequest`) to
+prevent silent match-all behaviour; operators must remove or zero that
+field before upgrading.
 
-**Composition with the OS guard.** `requireOSIfNeeded` (the joint
-service+accelerator OS gate) is a separate, pre-existing check and runs
-*first*, before the merge. It is **not subsumed** by the coverage
-post-condition: coverage is satisfied when service and accelerator are each
-honored by *some* overlay independently, while the OS guard demands *one*
-overlay carry both service and accelerator together before it will consider
-the OS-agnostic tier served. Both checks apply; a request can trip either
-one independently.
+**Joint sufficiency.** Per-dimension coverage is necessary but not
+sufficient. It is satisfied when `service` and `accelerator` are each honored
+by *some* overlay independently, even when no single overlay carries the
+combination and the combination's content lives only on an OS-gated leaf. The
+caller then receives a recipe that silently omits that OS-gated content.
+`verifyCriteriaCoverage` therefore also enforces a second condition
+(issue #1782): resolution fails when **no applied overlay jointly carries
+every stated dimension** *and* stating a strict dimension would reach an
+overlay currently being skipped.
+
+Both halves matter. The first is the escape hatch that keeps the generic tier
+valid: `--service eks` resolves through `eks.yaml`, which carries the whole
+stated combination, and is never asked for an OS. The second is what detects
+the loss.
+
+`os` is the only **strict** dimension, and `coverage.go` records why. Every
+other dimension degrades to a smaller but coherent recipe when omitted: no
+`--platform` yields no Slurm or Kubeflow layer, no `--intent` yields untuned
+GPU Operator values. `os` decides whether the driver can be installed at all.
+On Ubuntu the GPU Operator installs it, so an OS-agnostic recipe is a real
+answer and `eks.yaml` carries no `os`; on COS the operator installs no driver
+and the device-plugin owner differs, which is why every `gke` overlay is
+OS-gated and no OS-agnostic GKE recipe exists to return. That is a property of
+installing NVIDIA drivers on Linux rather than of this catalog's shape, so it
+holds for external `--data` catalogs too.
+
+This condition replaced the `requireOSIfNeeded` guard, which ran before the
+merge and hardcoded three separate scopes: it only fired when `service` was
+stated, only compared `service`+`accelerator` regardless of what the caller
+asked for, and only ever demanded `os`. Only the last survives.
+`coverage_subsumption_test.go` keeps the retired guard as a test-only oracle
+and asserts over generated catalogs that every query it would have rejected is
+still rejected.
+
+A joint-sufficiency failure carries `details.strictDimensions`, **not**
+`details.uncovered`. The distinction is load-bearing: `pkg/client/v1`
+relaxation clears uncovered dimensions and retries, which here would discard
+the check and return the partial recipe that #1542 fixed.
 
 **Evaluator error classification is fail-closed.** During constraint
 evaluation on the snapshot-driven path, `ErrCodeNotFound` (the evaluator's
@@ -472,21 +557,53 @@ non-`NotFound` error through `aicrerrors.PropagateOrWrap(..., ErrCodeInternal,
 ...)` before returning it — an evaluator that hasn't adopted `pkg/errors`
 still surfaces a coded error instead of an uncoded 500 at the server layer.
 
-**The engine stays strict; the CLI's snapshot path relaxes derived-only
+**The engine stays strict; the SDK's snapshot path can relax derived-only
 failures.** Everything above describes `pkg/recipe`'s behavior, which never
 relaxes the post-condition — a coverage failure there is always terminal.
-The CLI's `--snapshot` flow (`pkg/cli/query.go`) layers a caller-side
-retry on top: `service`, `accelerator`, and `os` can be derived from the
-snapshot fingerprint rather than stated by the user (`intent` and
-`platform` are always user-stated — the fingerprint never derives them).
-If a coverage error's uncovered dimensions are *all* fingerprint-derived
-(none came from `--config` or a CLI flag), the CLI clears those dimensions
-to unstated and retries resolution once, logging a warning per relaxed
-dimension; if any uncovered dimension was user-stated, the error still
-propagates unchanged. This lets an overlay tree that is deliberately
-agnostic to a dimension (e.g. Kind's OS-agnostic overlays) tolerate a
-snapshot that still reports a concrete value for it, without weakening the
-post-condition for anyone who asked for that dimension explicitly.
+The relax-and-retry lives one layer up, in `pkg/client/v1`
+(`relax.go`), behind an opt-in resolve option:
+
+```go
+result, err := client.ResolveRecipeFromSnapshotWithOptions(ctx, criteria, snap,
+    aicr.WithSnapshotCriteriaRelaxation(aicr.DimensionIntent))
+```
+
+`service`, `accelerator`, and `os` can be derived from the snapshot
+fingerprint rather than stated by the user (`intent` and `platform` are
+always user-stated — the fingerprint never derives them). The option's
+arguments name the dimensions the *caller* stated; everything else is
+treated as derived. If a coverage error's uncovered dimensions are *all*
+safely relaxable, the facade clears them to unstated and retries resolution
+once, logging a warning per relaxed dimension and reporting them in
+`pkg/client/v1.RecipeResult.RelaxedDimensions` — the facade's result type,
+not the resolver's `RecipeResult` documented under
+[Observable RecipeResult Surfaces](#observable-reciperesult-surfaces) below.
+
+**Not every uncovered dimension is relaxable**, and the distinction is why
+`verifyCriteriaCoverage` records `constraintExcluded` per entry. A dimension
+no overlay states at all is safe to clear — nothing in the recipe
+distinguishes the detected value. A dimension whose only provider was
+removed by constraint evaluation is not: clearing it converts a real
+incompatibility (the cluster failed that overlay's constraints) into a
+broader recipe that resolves at exit 0. The facade refuses in that case, and
+refuses again if clearing would leave no stated *coverage* dimension, which
+would match every overlay and resolve the generic fallback — the same
+fail-open as issue #1888. That check counts only the five coverage
+dimensions, not `Specificity()`, because `nodes` scores a specificity point
+while participating in no overlay match (#1781). A stated dimension is never
+relaxed either way.
+
+This lets an overlay tree that is deliberately agnostic to a dimension
+(e.g. Kind's OS-agnostic overlays) tolerate a snapshot that still reports a
+concrete value for it, without weakening the post-condition for anyone who
+asked for that dimension explicitly.
+
+Omitting the option keeps the strict behavior, so the coverage
+post-condition is unchanged for every caller that does not opt in — the
+REST recipe endpoint among them. `pkg/cli/query.go` passes the option and
+supplies the stated set from its `touched` map; declaring which dimensions
+a user typed is the one part of the policy that has to stay in the CLI,
+since only that layer knows a flag was set (issue #2027).
 
 ## Determinism
 
@@ -565,9 +682,9 @@ externally-visible product. Fields beyond `ComponentRefs` and
    `recipes/checks/<name>/health-check.yaml`, and that file MUST use
    only the read-only `assert` / `error` operation allowlist (no
    `script`, `apply`, `wait`, `command`, etc. — see
-   `validators/chainsaw/allowlist.go`). The contract is enforced at
+   `pkg/chainsaw/allowlist.go`). The contract is enforced at
    PR time by `pkg/recipe.TestComponentRegistry_RequiresHealthCheck`
-   and `validators/chainsaw.TestValidateTestReadOnly_RegistryContent`
+   and `pkg/chainsaw.TestValidateTestReadOnly_RegistryContent`
    — both gate `make qualify`. See #1223 and the
    [chainsaw health check section in validator.md](validator.md#chainsaw-health-checks)
    for the assertion patterns currently in use (DaemonSet
@@ -721,6 +838,24 @@ prevents.
   advisory; trust-bearing consumers recompute via
   `fingerprint.FromMeasurements(...)` before acting. See the
   collector docs and ADR-007 for details.
+- **Adding a collector subtype or closed-space key without updating the
+  constraint path catalog.** `pkg/measurement/catalog.go` enumerates
+  every addressable path, and recipe loading rejects anything it cannot
+  address (#1783). Each subtype declares *two* independent key spaces,
+  because extraction reads them from different places:
+  `{Type}.{Subtype}.{Key}` resolves against `Subtype.Data` (scalar), and
+  `{Type}.{Subtype}[<selector>].{Key}` resolves against
+  `ItemEntry.Data` then `ItemEntry.Context` (item). Register a new key
+  in whichever space emits it — an item-only subtype needs its keys in
+  the item space, or every selector path through it is rejected. An
+  entry is required for a new subtype (unless the Type is open-subtype)
+  and for a new key in a *closed* space; a new key in an *open* space
+  needs nothing. A missing entry does not weaken a check — it makes a
+  legitimate constraint path fail at load for whoever first writes it.
+  Declare a key space open when it is not provably fixed (image names,
+  sysctl paths, label keys). Note that `ItemEntry.Context` keys **are**
+  addressable and belong in the item space; only `Subtype.Context` is
+  never addressable, so do not list those.
 
 ## See Also
 

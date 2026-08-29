@@ -22,14 +22,22 @@ navigation:
     contents:
       - page: Installation
         path: user/installation.md
+      - page: End-to-End Tutorial
+        path: user/tutorial.md
       - page: CLI Reference
         path: user/cli-reference.md
+      - page: Generating Bundles
+        path: user/bundling.md
+      - page: Fabric-Attached Training
+        path: user/fabric-attached-training.md
       - page: CLI Configuration File
         path: user/cli-config.md
       - page: Artifact Verification
         path: user/artifact-verification.md
       - page: API Reference
         path: user/api-reference.md
+      - page: Deprecations
+        path: user/deprecations.md
       - page: Agent Deployment
         path: user/agent-deployment.md
       - page: Air-Gapped Mirroring
@@ -48,6 +56,10 @@ navigation:
         path: user/coverage-matrix.md
       - page: Slurm Accounting
         path: user/slinky-slurm-accounting.md
+      - page: Slurm Enroot Configuration
+        path: user/slinky-slurm-enroot.md
+      - page: Slurm Shared Storage
+        path: user/slinky-slurm-storage.md
 
   - section: Integrator Guide
     contents:
@@ -59,6 +71,8 @@ navigation:
         path: integrator/kubernetes-deployment.md
       - page: AKS GPU Setup
         path: integrator/aks-gpu-setup.md
+      - page: GKE GPU Setup
+        path: integrator/gke-gpu-setup.md
       - page: EKS Dynamo Networking
         path: integrator/eks-dynamo-networking.md
       - page: GKE TCPXO Networking
@@ -108,6 +122,8 @@ navigation:
         path: contributor/api-server.md
       - page: Testing
         path: contributor/tests.md
+      - page: Registry Egress
+        path: contributor/registry-egress.md
       - page: Claude Skills
         path: contributor/skills.md
       - page: Maintaining AICR
@@ -116,5 +132,7 @@ navigation:
         path: contributor/rekor-v2-signing.md
       - page: Publishing Recipe Evidence
         path: contributor/evidence-publishing.md
+      - page: Publishing the Evidence Dashboard
+        path: contributor/evidence-dashboard-publish.md
       - page: UAT Day/Night Cycle
         path: contributor/uat.md

@@ -273,12 +273,14 @@ cd "${REPO_ROOT}"
 
 GO_VERSION=$(yq '.languages.go' .settings.yaml)
 GOLANGCI_LINT_VERSION=$(yq '.linting.golangci_lint' .settings.yaml)
+APIDIFF_VERSION=$(yq '.linting.apidiff' .settings.yaml)
 YAMLLINT_VERSION=$(yq '.linting.yamllint' .settings.yaml)
 ADDLICENSE_VERSION=$(yq '.linting.addlicense' .settings.yaml)
 GO_LICENSES_VERSION=$(yq '.linting.go_licenses' .settings.yaml)
 GRYPE_VERSION=$(yq '.security_tools.grype' .settings.yaml)
 COSIGN_VERSION=$(yq '.security_tools.cosign' .settings.yaml)
 SYFT_VERSION=$(yq '.security_tools.syft' .settings.yaml)
+ORAS_VERSION=$(yq '.security_tools.oras' .settings.yaml)
 KIND_VERSION=$(yq '.testing_tools.kind' .settings.yaml)
 KUBECTL_VERSION=$(yq '.testing_tools.kubectl' .settings.yaml)
 CTLPTL_VERSION=$(yq '.testing_tools.ctlptl' .settings.yaml)
@@ -300,6 +302,7 @@ echo ""
 log_info "Target Versions:"
 echo "  Go:              ${GO_VERSION}"
 echo "  golangci-lint:   ${GOLANGCI_LINT_VERSION}"
+echo "  apidiff:         ${APIDIFF_VERSION}"
 echo "  grype:           ${GRYPE_VERSION}"
 echo "  cosign:          ${COSIGN_VERSION}"
 echo "  syft:            ${SYFT_VERSION}"
@@ -375,7 +378,10 @@ if [[ "${SKIP_TOOLS}" == "false" ]]; then
     echo "════════════════════════════════════════════════════════"
 
     GRYPE_INSTALL_SHA256=${GRYPE_INSTALL_SHA256:-"8646f06a90b10ca64992c1809b4aa00c44e30b4f551f63c309b0b0ab66873556"}
-    GOLANGCI_LINT_INSTALL_SHA256=${GOLANGCI_LINT_INSTALL_SHA256:-"d32d3534af96cfd59546a084d22b213e8a47541cada5013aa8a84c4fa2589905"}
+    # install.sh is fetched from the golangci-lint tag in .settings.yaml, so this
+    # hash is version-specific: re-pin it whenever linting.golangci_lint is bumped.
+    #   curl -fsSL "https://raw.githubusercontent.com/golangci/golangci-lint/$(yq '.linting.golangci_lint' .settings.yaml)/install.sh" | shasum -a 256
+    GOLANGCI_LINT_INSTALL_SHA256=${GOLANGCI_LINT_INSTALL_SHA256:-"1022ddb4d87ed252350ed03fc9677e250a4ae95cc6bcd4658c2a20a8a23d390f"}
 
     if command_exists helm && [[ "${UPGRADE}" != "true" ]]; then
         log_success "Helm already installed: $(helm version --short)"
@@ -696,6 +702,34 @@ if [[ "${SKIP_TOOLS}" == "false" ]]; then
         fi
     fi
 
+    # oras (attaches the aiperf-bench third-party source archive as an OCI
+    # referrer; see tools/generate-aiperf-source. Cosign cannot attach arbitrary
+    # artifacts, so this is a separate dependency from the signing path.)
+    if command_exists oras && [[ "${UPGRADE}" != "true" ]]; then
+        log_success "oras already installed: $(oras version 2>/dev/null | grep -E '^Version:' | awk '{print $2}')"
+    else
+        log_info "Installing oras ${ORAS_VERSION}..."
+        if prompt_continue; then
+            if [[ "${OS}" == "darwin" ]]; then
+                brew install oras
+            elif [[ "${OS}" == "linux" ]]; then
+                ORAS_VER="${ORAS_VERSION#v}"
+                ORAS_TMP=$(mktemp -d)
+                ORAS_URL="https://github.com/oras-project/oras/releases/download/v${ORAS_VER}/oras_${ORAS_VER}_linux_${GO_ARCH}.tar.gz"
+                if verify_download_url "$ORAS_URL" "oras ${ORAS_VERSION} for Linux ${GO_ARCH}"; then
+                    curl -fsSL "$ORAS_URL" | tar -xzC "$ORAS_TMP"
+                    sudo mv "$ORAS_TMP/oras" /usr/local/bin/oras
+                    sudo chmod +x /usr/local/bin/oras
+                    rm -rf "$ORAS_TMP"
+                else
+                    log_error "Failed to install oras. Please install manually."
+                    rm -rf "$ORAS_TMP"
+                fi
+            fi
+            log_success "oras installed"
+        fi
+    fi
+
     # Tilt
     if command_exists tilt && [[ "${UPGRADE}" != "true" ]]; then
         log_success "Tilt already installed: $(tilt version)"
@@ -756,7 +790,7 @@ if [[ "${SKIP_TOOLS}" == "false" ]]; then
                 brew install tilt-dev/tap/ctlptl
             elif [[ "${OS}" == "linux" ]]; then
                 if command_exists go; then
-                    go install github.com/tilt-dev/ctlptl/cmd/ctlptl@v"${CTLPTL_VERSION}"
+                    GOFLAGS= go install github.com/tilt-dev/ctlptl/cmd/ctlptl@v"${CTLPTL_VERSION}"
                     sudo cp "$(go env GOPATH)/bin/ctlptl" /usr/local/bin/
                 else
                     log_warning "Go not installed, skipping ctlptl"
@@ -900,7 +934,7 @@ if [[ "${SKIP_TOOLS}" == "false" ]]; then
                 brew install goreleaser
             elif [[ "${OS}" == "linux" ]]; then
                 if command_exists go; then
-                    go install github.com/goreleaser/goreleaser/v2@"${GORELEASER_VERSION}"
+                    GOFLAGS= go install github.com/goreleaser/goreleaser/v2@"${GORELEASER_VERSION}"
                     sudo cp "$(go env GOPATH)/bin/goreleaser" /usr/local/bin/
                 else
                     log_warning "Go not installed, skipping goreleaser"
@@ -966,13 +1000,37 @@ if [[ "${SKIP_TOOLS}" == "false" ]] && command_exists go; then
         fi
     fi
 
+    # apidiff
+    APIDIFF_CURRENT_VERSION=""
+    if command_exists apidiff && [[ "${UPGRADE}" != "true" ]]; then
+        APIDIFF_PATH=$(command -v apidiff)
+        APIDIFF_CURRENT_VERSION=$(go_binary_module_version "${APIDIFF_PATH}" golang.org/x/exp || true)
+    fi
+
+    if [[ "${UPGRADE}" != "true" && "${APIDIFF_CURRENT_VERSION}" == "${APIDIFF_VERSION}" ]]; then
+        log_success "apidiff ${APIDIFF_VERSION} already installed"
+    else
+        if command_exists apidiff && [[ "${UPGRADE}" != "true" ]]; then
+            if [[ -n "${APIDIFF_CURRENT_VERSION}" ]]; then
+                log_warning "apidiff version mismatch at ${APIDIFF_PATH} (installed: ${APIDIFF_CURRENT_VERSION}, required: ${APIDIFF_VERSION}); reinstalling pinned version"
+            else
+                log_warning "Unable to verify apidiff module version at ${APIDIFF_PATH}; reinstalling pinned version ${APIDIFF_VERSION}"
+            fi
+        fi
+        log_info "Installing apidiff ${APIDIFF_VERSION}..."
+        if prompt_continue; then
+            GOFLAGS= go install golang.org/x/exp/cmd/apidiff@"${APIDIFF_VERSION}"
+            log_success "apidiff ${APIDIFF_VERSION} installed"
+        fi
+    fi
+
     # addlicense
     if command_exists addlicense && [[ "${UPGRADE}" != "true" ]]; then
         log_success "addlicense already installed"
     else
         log_info "Installing addlicense ${ADDLICENSE_VERSION}..."
         if prompt_continue; then
-            go install github.com/google/addlicense@"${ADDLICENSE_VERSION}"
+            GOFLAGS= go install github.com/google/addlicense@"${ADDLICENSE_VERSION}"
             log_success "addlicense installed"
         fi
     fi
@@ -983,7 +1041,7 @@ if [[ "${SKIP_TOOLS}" == "false" ]] && command_exists go; then
     else
         log_info "Installing go-licenses ${GO_LICENSES_VERSION}..."
         if prompt_continue; then
-            go install github.com/google/go-licenses/v2@"${GO_LICENSES_VERSION}"
+            GOFLAGS= go install github.com/google/go-licenses/v2@"${GO_LICENSES_VERSION}"
             log_success "go-licenses installed"
         fi
     fi

@@ -800,11 +800,65 @@ generate_bundle() {
     #   set. Disabling persistence lets the controller pod bind.
     log_info "Generating bundle (deployer=${DEPLOYER})..."
 
+    # Component-scoped overrides, shared by EVERY deployer branch below:
+    # aicr bundle rejects a --set whose component is absent from the
+    # generated bundle (it could never take effect), so each override is
+    # passed only when the component is actually in the bundle —
+    # deploymentOrder lists exactly the enabled components. Blanket flags
+    # on every invocation relied on the silent discard that rejection
+    # removed. The set depends only on the recipe (and its criteria), not
+    # on the deployer, so it is computed once here.
+    local bundled_components
+    bundled_components=$(yq eval '.deploymentOrder[]' "${WORK_DIR}/recipe.yaml")
+    local conditional_sets=()
+    if grep -qx "cert-manager" <<< "$bundled_components"; then
+        conditional_sets+=(--set "certmanager:startupapicheck.enabled=false")
+    fi
+    if grep -qx "kube-prometheus-stack" <<< "$bundled_components"; then
+        conditional_sets+=(
+            --set "kubeprometheusstack:defaultRules.create=false"
+            --set "kubeprometheusstack:alertmanager.enabled=false"
+        )
+    fi
+    if grep -qx "nodewright-customizations" <<< "$bundled_components"; then
+        conditional_sets+=(--set "nodewright-customizations:enabled=false")
+    fi
+    if grep -qx "slinky-slurm-operator" <<< "$bundled_components"; then
+        conditional_sets+=(
+            --set "slinkyslurmoperator:webhook.enabled=false"
+            --set "slinkyslurmoperator:certManager.enabled=false"
+        )
+    fi
+    if grep -qx "slinky-slurm" <<< "$bundled_components"; then
+        conditional_sets+=(
+            --set "slurmcluster:controller.persistence.enabled=false"
+        )
+    fi
+    if grep -qx "dynamo-platform" <<< "$bundled_components"; then
+        conditional_sets+=(
+            --set "dynamoplatform:etcd.persistence.enabled=false"
+            --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false"
+        )
+    fi
+
+    # No NVSentinel --set remedies here. The recipes assign
+    # labeler.assumeDriverInstalled and, on AKS,
+    # metadata-collector.runtimeClassName themselves — from the gpuStack
+    # profile on AKS and GKE-COS, at overlay level on OKE and Kind
+    # (#2181). KWOK recipes are criteria-only, so those profiles sit at
+    # their affected defaults (AKS azure-managed, GKE-COS gke-default),
+    # which makes these lanes the check that the recipes satisfy both
+    # blocking gates (CheckNVSentinelDriverLabelDetectable / #2175,
+    # CheckNVSentinelRuntimeClassCoherence / #2176) unaided. Re-adding
+    # the overrides would let the lanes pass without proving that.
+
     local bundle_output
     case "$DEPLOYER" in
         helm)
-            # Original Helm path — DO NOT change this invocation. Byte-identical
-            # to pre-#843 behavior is a non-regression requirement.
+            # Historical Helm path (pre-#843 lane). The invocation shape is
+            # preserved; the component-scoped conditional_sets computed above
+            # replaced the former blanket --set flags, which the bundler now
+            # rejects on recipes not declaring those components.
             if ! bundle_output=$("$AICR_BIN" bundle \
                 --recipe "${WORK_DIR}/recipe.yaml" \
                 --output "${WORK_DIR}/bundle" \
@@ -813,15 +867,7 @@ generate_bundle() {
                 --system-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
                 --accelerated-node-toleration "nvidia.com/gpu=present:NoSchedule" \
                 --accelerated-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
-                --set "certmanager:startupapicheck.enabled=false" \
-                --set "slinkyslurmoperator:webhook.enabled=false" \
-                --set "slinkyslurmoperator:certManager.enabled=false" \
-                --set "slurmcluster:controller.persistence.enabled=false" \
-                --set "kubeprometheusstack:defaultRules.create=false" \
-                --set "kubeprometheusstack:alertmanager.enabled=false" \
-                --set "nodewright-customizations:enabled=false" \
-                --set "dynamoplatform:etcd.persistence.enabled=false" \
-                --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false" 2>&1); then
+                ${conditional_sets[@]+"${conditional_sets[@]}"} 2>&1); then
                 log_error "Bundle generation failed"
                 log_error "Bundle command output:"
                 echo "$bundle_output"
@@ -942,15 +988,7 @@ generate_bundle() {
                 --system-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
                 --accelerated-node-toleration "nvidia.com/gpu=present:NoSchedule" \
                 --accelerated-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
-                --set "certmanager:startupapicheck.enabled=false" \
-                --set "slinkyslurmoperator:webhook.enabled=false" \
-                --set "slinkyslurmoperator:certManager.enabled=false" \
-                --set "slurmcluster:controller.persistence.enabled=false" \
-                --set "kubeprometheusstack:defaultRules.create=false" \
-                --set "kubeprometheusstack:alertmanager.enabled=false" \
-                --set "nodewright-customizations:enabled=false" \
-                --set "dynamoplatform:etcd.persistence.enabled=false" \
-                --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false" 2>&1); then
+                ${conditional_sets[@]+"${conditional_sets[@]}"} 2>&1); then
                 log_error "Bundle generation failed"
                 log_error "Bundle command output:"
                 echo "$bundle_output"
@@ -1008,15 +1046,7 @@ generate_bundle() {
                 --system-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
                 --accelerated-node-toleration "nvidia.com/gpu=present:NoSchedule" \
                 --accelerated-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
-                --set "certmanager:startupapicheck.enabled=false" \
-                --set "slinkyslurmoperator:webhook.enabled=false" \
-                --set "slinkyslurmoperator:certManager.enabled=false" \
-                --set "slurmcluster:controller.persistence.enabled=false" \
-                --set "kubeprometheusstack:defaultRules.create=false" \
-                --set "kubeprometheusstack:alertmanager.enabled=false" \
-                --set "nodewright-customizations:enabled=false" \
-                --set "dynamoplatform:etcd.persistence.enabled=false" \
-                --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false" 2>&1); then
+                ${conditional_sets[@]+"${conditional_sets[@]}"} 2>&1); then
                 log_error "Bundle generation failed"
                 log_error "Bundle command output:"
                 echo "$bundle_output"
@@ -1060,15 +1090,7 @@ generate_bundle() {
                 --system-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
                 --accelerated-node-toleration "nvidia.com/gpu=present:NoSchedule" \
                 --accelerated-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
-                --set "certmanager:startupapicheck.enabled=false" \
-                --set "slinkyslurmoperator:webhook.enabled=false" \
-                --set "slinkyslurmoperator:certManager.enabled=false" \
-                --set "slurmcluster:controller.persistence.enabled=false" \
-                --set "kubeprometheusstack:defaultRules.create=false" \
-                --set "kubeprometheusstack:alertmanager.enabled=false" \
-                --set "nodewright-customizations:enabled=false" \
-                --set "dynamoplatform:etcd.persistence.enabled=false" \
-                --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false" 2>&1); then
+                ${conditional_sets[@]+"${conditional_sets[@]}"} 2>&1); then
                 log_error "Bundle generation failed"
                 log_error "Bundle command output:"
                 echo "$bundle_output"
@@ -1126,15 +1148,7 @@ generate_bundle() {
                 --system-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
                 --accelerated-node-toleration "nvidia.com/gpu=present:NoSchedule" \
                 --accelerated-node-toleration "kwok.x-k8s.io/node=fake:NoSchedule" \
-                --set "certmanager:startupapicheck.enabled=false" \
-                --set "slinkyslurmoperator:webhook.enabled=false" \
-                --set "slinkyslurmoperator:certManager.enabled=false" \
-                --set "slurmcluster:controller.persistence.enabled=false" \
-                --set "kubeprometheusstack:defaultRules.create=false" \
-                --set "kubeprometheusstack:alertmanager.enabled=false" \
-                --set "nodewright-customizations:enabled=false" \
-                --set "dynamoplatform:etcd.persistence.enabled=false" \
-                --set "dynamoplatform:nats.config.jetstream.fileStore.enabled=false" 2>&1); then
+                ${conditional_sets[@]+"${conditional_sets[@]}"} 2>&1); then
                 log_error "Bundle generation failed"
                 log_error "Bundle command output:"
                 echo "$bundle_output"

@@ -34,6 +34,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/validators"
 	"github.com/NVIDIA/aicr/validators/helper"
+	"github.com/NVIDIA/aicr/validators/internal/gkenet"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -473,27 +474,26 @@ func validateNcclAllReduceBw(ctx *validators.Context, constraint recipe.Constrai
 // pod to complete, and returns the benchmark logs.
 func runNCCLTrainJob(ctx *validators.Context, gpuConfig *gpuConfiguration,
 	accelerator recipe.CriteriaAcceleratorType, service recipe.CriteriaServiceType, variant ncclVariant, fabric ncclFabricType,
-	customRuntime string) (string, error) {
+	customRuntime string) (logs string, err error) {
 
 	dynamicClient := ctx.DynamicClient
 
-	// Ensure Kubeflow Trainer is installed. If it is already present we leave it
-	// alone; if we install it we clean it up after the test completes.
-	trainerInstalled, err := isTrainerInstalled(ctx.Ctx, dynamicClient)
+	// Ensure a usable Kubeflow Trainer. Whether an incomplete installation is a
+	// failure or something to install over is decided by the recipe, not by what
+	// happens to be on the cluster: a recipe that ships the component must have a
+	// working one, while a recipe that does not reuses whatever is present and
+	// installs an ephemeral fixture only when nothing is. Anything we install is
+	// ours to clean up after the test completes.
+	recipeDeclaresTrainer := validators.RecipeDeclares(ctx, kubeflowTrainerComponent)
+	installedResources, err := ensureTrainerInstalled(ctx.Ctx, dynamicClient,
+		ctx.Clientset.Discovery(), recipeDeclaresTrainer)
 	if err != nil {
-		return "", aicrErrors.Wrap(aicrErrors.ErrCodeInternal, "failed to check Kubeflow Trainer installation", err)
+		return "", err
 	}
-	if !trainerInstalled {
-		slog.Info("Kubeflow Trainer not found, installing...")
-		var installedResources []trainerResourceRef
-		installedResources, err = installTrainer(ctx.Ctx, dynamicClient, ctx.Clientset.Discovery())
-		if err != nil {
-			return "", aicrErrors.Wrap(aicrErrors.ErrCodeInternal, "failed to install Kubeflow Trainer", err)
-		}
-		defer deleteTrainer(dynamicClient, installedResources)
-		slog.Info("Kubeflow Trainer installed", "resources", len(installedResources))
-	} else {
-		slog.Info("Kubeflow Trainer already installed, proceeding")
+	if len(installedResources) > 0 {
+		defer func() {
+			err = foldCleanupError(err, deleteTrainer(dynamicClient, installedResources))
+		}()
 	}
 
 	// Clean up NCCL resources on every exit path. Registered after the trainer
@@ -520,7 +520,7 @@ func runNCCLTrainJob(ctx *validators.Context, gpuConfig *gpuConfiguration,
 	}
 
 	// Wait for launcher pod and get logs.
-	logs, err := waitForLauncherPodAndGetLogs(ctx, podHelper)
+	logs, err = waitForLauncherPodAndGetLogs(ctx, podHelper)
 	if err != nil {
 		return "", aicrErrors.Wrap(aicrErrors.ErrCodeInternal, "failed to get launcher logs", err)
 	}
@@ -840,13 +840,14 @@ func applyNCCLResources(ctx *validators.Context, dynamicClient dynamic.Interface
 	// For GKE, discover GPU NIC network names (cluster-specific prefixes).
 	// Skipped for a recipe-supplied runtime, which owns its own fabric wiring.
 	if customRuntime == "" && service == recipe.CriteriaServiceGKE {
-		gpuNICs, err := discoverGKEGPUNICNetworks(ctx.Ctx, dynamicClient)
+		gpuNICs, err := gkenet.DiscoverGPUNICNetworks(ctx.Ctx, dynamicClient)
 		if err != nil {
 			return aicrErrors.Wrap(aicrErrors.ErrCodeInternal, "failed to discover GKE GPU NIC networks", err)
 		}
-		if len(gpuNICs) < 8 {
+		if len(gpuNICs) < gkenet.RequiredGPUNICNetworks {
 			return aicrErrors.New(aicrErrors.ErrCodeInternal,
-				fmt.Sprintf("expected 8 GPU NIC networks, found %d — cluster may not have multi-NIC networking configured", len(gpuNICs)))
+				fmt.Sprintf("expected %d GPU NIC networks, found %d — cluster may not have multi-NIC networking configured",
+					gkenet.RequiredGPUNICNetworks, len(gpuNICs)))
 		}
 		templateData["GKE_NETWORK_INTERFACES"] = buildGKENetworkInterfacesAnnotation(gpuNICs)
 		templateData["NRI_DEVICE_ANNOTATION"] = buildNRIDeviceAnnotation(config.GPUCountPerNode)
@@ -1011,7 +1012,7 @@ func applyTrainJobWithRetry(ctx context.Context, dynamicClient dynamic.Interface
 		if retryCtx.Err() != nil {
 			return aicrErrors.WrapWithContext(aicrErrors.ErrCodeTimeout,
 				"timed out applying NCCL TrainJob: Trainer webhook did not admit it within the retry budget",
-				createErr, map[string]interface{}{"attempts": attempt})
+				createErr, map[string]any{"attempts": attempt})
 		}
 		if !isTrainingRuntimeNotYetVisible(createErr) {
 			// A real failure (or a genuinely missing runtime) — do not mask it.
@@ -1023,7 +1024,7 @@ func applyTrainJobWithRetry(ctx context.Context, dynamicClient dynamic.Interface
 		case <-retryCtx.Done():
 			return aicrErrors.WrapWithContext(aicrErrors.ErrCodeTimeout,
 				"timed out applying NCCL TrainJob: Trainer webhook did not admit it within the retry budget",
-				createErr, map[string]interface{}{"attempts": attempt})
+				createErr, map[string]any{"attempts": attempt})
 		case <-time.After(defaults.TrainJobAdmissionRetryInterval):
 		}
 	}
@@ -1063,18 +1064,18 @@ func isTrainingRuntimeNotYetVisible(err error) bool {
 //   - channel.resourceClaimTemplate.name is stable and matches what
 //     runtime-nvls.yaml expects to reference.
 func buildComputeDomain(namespace string) *unstructured.Unstructured {
-	return &unstructured.Unstructured{Object: map[string]interface{}{
+	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": "resource.nvidia.com/v1beta1",
 		"kind":       "ComputeDomain",
-		"metadata": map[string]interface{}{
+		"metadata": map[string]any{
 			keyName:     ncclComputeDomainName,
 			"namespace": namespace,
 		},
-		"spec": map[string]interface{}{
+		"spec": map[string]any{
 			"numNodes": int64(0),
-			"channel": map[string]interface{}{
+			"channel": map[string]any{
 				"allocationMode": "Single",
-				"resourceClaimTemplate": map[string]interface{}{
+				"resourceClaimTemplate": map[string]any{
 					"name": ncclIMEXClaimTemplateName,
 				},
 			},
@@ -1421,7 +1422,7 @@ func applyNCCLWorkerScheduling(obj *unstructured.Unstructured, nodeSelector map[
 
 	nodeJobFound := false
 	for i, jobRaw := range replicatedJobs {
-		jobMap, ok := jobRaw.(map[string]interface{})
+		jobMap, ok := jobRaw.(map[string]any)
 		if !ok {
 			continue
 		}
@@ -1438,7 +1439,7 @@ func applyNCCLWorkerScheduling(obj *unstructured.Unstructured, nodeSelector map[
 		}
 
 		if len(nodeSelector) > 0 {
-			ns := make(map[string]interface{}, len(nodeSelector))
+			ns := make(map[string]any, len(nodeSelector))
 			for k, v := range nodeSelector {
 				ns[k] = v
 			}
@@ -1447,10 +1448,10 @@ func applyNCCLWorkerScheduling(obj *unstructured.Unstructured, nodeSelector map[
 		}
 
 		if len(tolerations) > 0 {
-			tolList := make([]interface{}, 0, len(tolerations))
+			tolList := make([]any, 0, len(tolerations))
 			for _, t := range tolerations {
-				tolMap := map[string]interface{}{
-					"operator": string(t.Operator),
+				tolMap := map[string]any{
+					keyOperator: string(t.Operator),
 				}
 				if t.Key != "" {
 					tolMap["key"] = t.Key
@@ -1478,16 +1479,16 @@ func applyNCCLWorkerScheduling(obj *unstructured.Unstructured, nodeSelector map[
 	return unstructured.SetNestedSlice(obj.Object, replicatedJobs, "spec", "template", "spec", "replicatedJobs")
 }
 
-// nestedMap navigates a chain of string keys through nested map[string]interface{} values.
+// nestedMap navigates a chain of string keys through nested map[string]any values.
 // Returns the target map and true if found, nil and false otherwise.
-func nestedMap(m map[string]interface{}, keys ...string) (map[string]interface{}, bool) {
+func nestedMap(m map[string]any, keys ...string) (map[string]any, bool) {
 	current := m
 	for _, key := range keys {
 		next, ok := current[key]
 		if !ok {
 			return nil, false
 		}
-		nextMap, ok := next.(map[string]interface{})
+		nextMap, ok := next.(map[string]any)
 		if !ok {
 			return nil, false
 		}
@@ -1695,7 +1696,7 @@ func emitDiagnosticBlock(label, block string) {
 		slog.Error("diagnostics", "section", label, "line", "(empty)")
 		return
 	}
-	for _, line := range strings.Split(trimmed, "\n") {
+	for line := range strings.SplitSeq(trimmed, "\n") {
 		slog.Error("diagnostics", "section", label, "line", line)
 	}
 }

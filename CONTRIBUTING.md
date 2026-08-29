@@ -4,7 +4,7 @@ We welcome contributions from developers of all backgrounds and experience level
 
 ## Code of Conduct
 
-This project follows NVIDIA's commitment to fostering an open and welcoming environment. Please be respectful and professional in all interactions. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for details.
+This project adopts the Contributor Covenant v2.1. Please be respectful and professional in all interactions. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for details.
 
 ## Getting Started
 
@@ -47,9 +47,11 @@ Before contributing:
 - Ensure all tests pass and code meets quality standards
 - Write tests for new functionality
 
-#### Go dependencies (vendor)
+#### Go dependencies
 
-This project vendors Go dependencies. After changing `go.mod` or `go.sum`, run `make tidy` (which runs `go mod vendor`) and commit `go.mod`, `go.sum`, and the `vendor/` directory. CI will fail if `vendor/` is out of sync.
+Dependencies resolve through the Go module proxy; this project does not vendor them (see ADR-023). After changing imports, run `make tidy` and commit `go.mod`, `go.sum`, and the regenerated `THIRD_PARTY_NOTICES.md`. CI fails if the manifests are not tidy (`go mod tidy -diff`) or the notices are stale.
+
+Module integrity comes from `go.sum` plus `sum.golang.org`, verified by Go on every build. A first build after a dependency change needs network access to a Go proxy; afterwards it is served from your local module cache.
 
 #### Adding Validation Constraints
 
@@ -138,7 +140,7 @@ More specific recipes are never matched unless explicitly requested. Generic int
 
 Trust is established through evidence, not assertions. Every released artifact carries verifiable proof of origin and build process.
 
-**What:** All releases include SLSA build provenance (build level under review, #1536), SBOM attestations, and Sigstore signatures. Users can verify exactly which commit, workflow, and build produced any artifact.
+**What:** Releases include SLSA Build Level 3 provenance for container images (via the reusable attestation workflow, since v0.17.0) and SLSA Build Provenance v1 for CLI binaries, plus SBOM attestations and Sigstore signatures. Users can verify exactly which commit, workflow, and build produced any artifact.
 
 **Why:** This underpins supply-chain security, compliance, and confidence. "Trust us" is not a security model.
 
@@ -170,7 +172,7 @@ Trust is established through evidence, not assertions. Every released artifact c
 
 ### Review Process
 
-1. **Automated Checks** run via GitHub Actions — the same gate `make qualify` runs locally (tests with race detector, golangci-lint, YAML linting, security scan, coverage, E2E). See [Full Qualification](DEVELOPMENT.md#7-full-qualification) in the development guide.
+1. **Automated Checks** run via GitHub Actions — the same gate `make qualify` runs locally. See [Full Qualification](DEVELOPMENT.md#7-full-qualification) and the [Make Targets Reference](DEVELOPMENT.md#make-targets-reference) in the development guide.
 
 2. **Maintainer Review** covers:
    - Correctness and functionality
@@ -183,6 +185,17 @@ Trust is established through evidence, not assertions. Every released artifact c
    git commit -s -S -m "address review: improve error handling"
    git push origin your-branch
    ```
+
+   Append commits rather than amending or rebasing while the PR is open for review.
+   The exceptions are narrow: a catch-up rebase onto `main` that the merge gate
+   requires when your branch falls behind, a missing signature or sign-off, a wrong
+   base branch, or a committed secret. Say on the PR whenever you do any of them.
+   A force-push outdates every inline comment and drops the anchors reviewers left,
+   which makes "was this addressed?" a manual diff. There is no need to tidy the
+   history first: pull requests merge by squash, so the branch's commits become one
+   commit on `main` regardless. Keep the PR in draft while you are still reshaping
+   it — draft PRs do not page reviewers, and that is the phase where rewriting
+   history is free.
 
 4. **Merge**: Once approved and CI passes, a maintainer will merge
 
@@ -284,15 +297,36 @@ Fix the most recent commit and re-push:
 
 ```bash
 git commit --amend -s -S --no-edit
-git push --force-with-lease origin your-branch
+git push --force-with-lease --force-if-includes origin your-branch
 ```
 
 For an entire branch, re-sign every commit at once:
 
 ```bash
 git rebase --exec 'git commit --amend -s -S --no-edit' origin/main
-git push --force-with-lease origin your-branch
+git push --force-with-lease --force-if-includes origin your-branch
 ```
+
+`--force-if-includes` checks your local **branch reflog**, so in a fresh clone it can
+reject the push even when nothing is wrong — the clone's only reflog entry is the
+clone itself, which is not a valid rewrite base. It fails safe. Fetching does not
+help, because what is missing is a local reflog entry rather than remote data; push
+once with a pinned lease instead. Read the remote's current tip first and check it is
+the commit you meant to replace, then pass that recorded value explicitly:
+
+```bash
+git ls-remote origin your-branch          # note the SHA, and confirm it is yours
+git push --force-with-lease=your-branch:<that-sha> origin your-branch
+```
+
+Do not inline the lookup into the push (`--force-with-lease=your-branch:$(git ls-remote …)`).
+That re-reads the remote at push time, so a commit someone else pushed in the meantime
+becomes the expected value and is silently overwritten — the same failure the pinned
+lease exists to prevent.
+
+If the PR is already under review, say on the PR that you force-pushed and name the
+old and new SHA, since re-signing rewrites every commit and outdates the inline
+comments.
 
 ### What You're Certifying
 
@@ -357,6 +391,30 @@ Explain the problem being solved and why this approach was chosen.
 
 Signed-off-by: Your Name <your@email.com>
 ```
+
+**Where this text ends up.** Pull requests merge by squash, and the repo composes the
+merged commit from the **PR title** with an empty body, so a branch commit's body is
+discarded at merge — only the title and trailers reach `main`. Write the body for
+your reviewers, and put anything that needs to outlive the PR in the PR title and
+description.
+
+**PR titles are linted.** Because the title becomes the whole commit message on
+`main` and cannot be corrected after merge, CI checks it against Conventional
+Commits format:
+
+```text
+type: subject            # scope optional
+type(scope): subject
+type!: subject           # "!" marks a breaking change
+type(scope)!: subject
+```
+
+Valid types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`,
+`revert`, `style`, `test`. A malformed title fails the check; editing the title
+re-runs it automatically, so no new commit is needed. Titles over 70 characters
+produce a warning but do not block: dependency-bot titles embed pseudo-versions
+that cannot be shortened. Titles of 70 characters or fewer pass without a
+warning.
 
 ### Code Style
 

@@ -23,13 +23,14 @@ This section is for integrators who:
 | [EKS Dynamo Networking](eks-dynamo-networking.md) | Security group prerequisites for Dynamo overlays on EKS |
 | [GKE TCPXO Networking](gke-tcpxo-networking.md) | GPUDirect TCPXO prerequisites for GKE training overlays |
 | [AKS GPU Setup](aks-gpu-setup.md) | AKS prerequisites: Kubernetes 1.34+ (DRA GA), GPU driver setup, DRA configuration |
+| [GKE GPU Setup](gke-gpu-setup.md) | GKE device-plugin ownership: the `gpuStack` profile, node-pool setup for both values, verification, and troubleshooting |
 | [Talos Integration](talos-integration.md) | Running AICR on Talos Linux |
 | [OpenShift Deployment](openshift.md) | OpenShift/OCP-specific Helm and OLM integration and two-phase operator deployment |
 | [Recipe Development](recipe-development.md) | Creating and modifying recipe metadata for custom environments |
 | [Data Extension](data-extension.md) | Extending the embedded catalog via `--data` — overlays, components, and runtime criteria values without a rebuild |
 | [Validator Extension](validator-extension.md) | Adding custom validators and overriding embedded ones via `--data` |
 | [Supply Chain Verification](supply-chain-verification.md) | Verifying SLSA provenance, SBOMs, and attestations; admission policies; offline verification |
-| [NodeWright Component](components/nodewright.md) | NodeWright component reference and configuration |
+| [Nodewright Component](components/nodewright.md) | Nodewright component reference and configuration |
 
 ## Quick Start
 

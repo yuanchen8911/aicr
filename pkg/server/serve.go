@@ -114,6 +114,18 @@ func Serve() error {
 			slog.Warn("aicr client close failed", "error", closeErr)
 		}
 	}()
+
+	// Load the recipe catalog eagerly. NewClient only builds the
+	// DataProvider; without this the first request pays the load and a data
+	// defect — a malformed overlay, a non-addressable constraint measurement
+	// path (#1783) — surfaces as a 5xx on an arbitrary later request instead
+	// of refusing to start. EmbeddedSource() is CI-gated so this cannot fail
+	// on a released binary today; it becomes load-bearing the moment the
+	// server is wired to an external --data overlay.
+	if catalogErr := client.LoadCatalog(ctx); catalogErr != nil {
+		return errors.PropagateOrWrap(catalogErr, errors.ErrCodeInternal, "failed to load recipe catalog")
+	}
+
 	h := newRecipeHandler(client, allowLists)
 
 	// Parse the operator-configured server signing identity from the
@@ -140,10 +152,22 @@ func Serve() error {
 	// Setup bundle handler backed by the same aicr.Client facade. server.go
 	// no longer constructs a bundler.Bundler (or a recipe.Builder) directly —
 	// the Client owns both, completing #1077 acceptance criterion #2.
-	bh := newBundleHandler(client, allowLists, signing)
+	// Vendor-charts is a network-egress surface; an operator opts in via
+	// defaults.EnvAllowVendorCharts. Off by default (see issue #2118). Read
+	// through the parsed config so parseConfig() remains the single site
+	// that consults the environment for this flag.
+	cfg := parseConfig()
+	if cfg.AllowVendorCharts {
+		slog.Info("bundle vendor-charts enabled — server will perform helm pull against request-supplied URLs")
+	}
+	bh := newBundleHandler(client, allowLists, signing, cfg.AllowVendorCharts)
 
-	// Create and run server
+	// Create and run server. withConfig hands the pre-parsed cfg to New so
+	// the environment is not consulted a second time on the New() -> parseConfig()
+	// path; every field above (Address, Port, etc.) is what parseConfig()
+	// resolved once, right here.
 	s := New(
+		withConfig(cfg),
 		WithName(name),
 		WithVersion(version),
 		WithHandler(newRoutes(h, bh)),

@@ -25,11 +25,17 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
 
-// TestMake_DRAChartVersionAnnotation_GeneratedArtifactParity is the
-// generated-artifact acceptance test the issue calls out. It bundles
+// draBundleMakeTimeout bounds each Make call this file's parity tests issue —
+// generous for a local render into a temp dir, short enough that a wedged
+// bundler fails the test instead of stalling the suite.
+const draBundleMakeTimeout = 30 * time.Second
+
+// TestMake_DRAIntegration_GeneratedArtifactParity is the generated-artifact
+// acceptance test for the bundler-derived DRA/GPU Operator values. It bundles
 // the same recipe through two deployer code paths — the default Helm
 // deployer AND the helmfile (GitOps-style) deployer — and asserts the
 // bundler-derived aicr.run/gpu-operator-chart-version
@@ -41,11 +47,10 @@ import (
 // values land in a known `<order>-<name>/values.yaml` layout. Coverage
 // for Flux / Argo CD / argocd-helm (which emit different file shapes,
 // e.g. configmap-values.yaml or Application sources) lives in
-// TestMake_DRAChartVersionAnnotation_AllDeployersCarryAnnotation
-// below — that test asserts the annotation reaches *some* file in the
-// rendered bundle for every supported deployer, without coupling to
-// per-deployer layout conventions.
-func TestMake_DRAChartVersionAnnotation_GeneratedArtifactParity(t *testing.T) {
+// TestMake_DRAIntegration_AllDeployersCarryDerivedValues below — that test
+// asserts both derived contracts reach the rendered bundle for every
+// supported deployer without coupling to per-deployer layout conventions.
+func TestMake_DRAIntegration_GeneratedArtifactParity(t *testing.T) {
 	const (
 		gpuOpVersion       = "v26.4.0"
 		expectedAnnotation = "aicr.run/gpu-operator-chart-version"
@@ -114,7 +119,7 @@ func TestMake_DRAChartVersionAnnotation_GeneratedArtifactParity(t *testing.T) {
 			}
 
 			tmpDir := t.TempDir()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
 			defer cancel()
 			if _, err := b.Make(ctx, rr, tmpDir); err != nil {
 				t.Fatalf("Make() error = %v", err)
@@ -135,12 +140,26 @@ func TestMake_DRAChartVersionAnnotation_GeneratedArtifactParity(t *testing.T) {
 						string(valuesBytes))
 				}
 			}
+			if got := dig(values, "kubeletPlugin", "nodeSelector", defaults.DRAEvictionNodeLabelKey); got != defaults.DRAEvictionNodeLabelValue {
+				t.Errorf("%s: kubeletPlugin.nodeSelector[%s] = %v, want %s",
+					tc.name, defaults.DRAEvictionNodeLabelKey, got, defaults.DRAEvictionNodeLabelValue)
+			}
+
+			gpuValuesBytes := readBundleValues(t, tmpDir, "001-gpu-operator/values.yaml")
+			var gpuValues map[string]any
+			if err := yaml.Unmarshal(gpuValuesBytes, &gpuValues); err != nil {
+				t.Fatalf("rendered GPU Operator values not valid YAML: %v\n%s", err, string(gpuValuesBytes))
+			}
+			if got := driverManagerEnvValues(gpuValues, draEvictionEnvName); len(got) != 1 || got[0] != defaults.DRAEvictionNodeLabelKey {
+				t.Errorf("%s: Driver Manager eviction env values = %v, want [%s]",
+					tc.name, got, defaults.DRAEvictionNodeLabelKey)
+			}
 		})
 	}
 }
 
-// TestMake_DRAChartVersionAnnotation_AllDeployersCarryAnnotation
-// extends parity coverage to all five supported deployers — Helm,
+// TestMake_DRAIntegration_AllDeployersCarryDerivedValues extends parity
+// coverage to all five supported deployers — Helm,
 // helmfile, Flux, Argo CD, and argocd-helm. Each deployer renders the
 // shared componentValues map differently (values.yaml under a numbered
 // subdir for Helm/helmfile; configmap-values.yaml for Flux; embedded
@@ -156,7 +175,7 @@ func TestMake_DRAChartVersionAnnotation_GeneratedArtifactParity(t *testing.T) {
 // from disk instead of consuming the injected componentValues map)
 // fails this assertion immediately. Catches the bundle-layout-drift
 // case Mark called out on PR #1033.
-func TestMake_DRAChartVersionAnnotation_AllDeployersCarryAnnotation(t *testing.T) {
+func TestMake_DRAIntegration_AllDeployersCarryDerivedValues(t *testing.T) {
 	const (
 		gpuOpVersion       = "v26.4.0"
 		expectedAnnotation = "aicr.run/gpu-operator-chart-version"
@@ -215,7 +234,7 @@ func TestMake_DRAChartVersionAnnotation_AllDeployersCarryAnnotation(t *testing.T
 			}
 
 			tmpDir := t.TempDir()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
 			defer cancel()
 			if _, err := b.Make(ctx, rr, tmpDir); err != nil {
 				t.Fatalf("Make() error = %v", err)
@@ -229,6 +248,9 @@ func TestMake_DRAChartVersionAnnotation_AllDeployersCarryAnnotation(t *testing.T
 			if !found {
 				t.Errorf("%s: no rendered bundle file contains both %q and %q",
 					tc.name, expectedAnnotation, gpuOpVersion)
+			}
+			if !bundleContainsBoth(t, tmpDir, draEvictionEnvName, defaults.DRAEvictionNodeLabelKey) {
+				t.Errorf("%s: no rendered bundle file contains the Driver Manager eviction contract", tc.name)
 			}
 		})
 	}
@@ -301,7 +323,7 @@ func TestMake_DRAChartVersionAnnotation_DisabledRecipeUnaffected(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
 	defer cancel()
 	if _, err := b.Make(ctx, rr, tmpDir); err != nil {
 		t.Fatalf("Make() error = %v", err)
@@ -317,6 +339,10 @@ func TestMake_DRAChartVersionAnnotation_DisabledRecipeUnaffected(t *testing.T) {
 	gpuValues := readBundleValues(t, tmpDir, "001-gpu-operator/values.yaml")
 	if strings.Contains(string(gpuValues), "aicr.run/gpu-operator-chart-version") {
 		t.Errorf("gpu-operator values unexpectedly contain the DRA chart-version annotation:\n%s",
+			string(gpuValues))
+	}
+	if strings.Contains(string(gpuValues), draEvictionEnvName) {
+		t.Errorf("gpu-operator values unexpectedly contain the DRA eviction environment variable:\n%s",
 			string(gpuValues))
 	}
 }

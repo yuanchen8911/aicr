@@ -16,13 +16,16 @@ package attestation
 
 import (
 	"bytes"
-	"io"
+	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/evidence/internal/boundedio"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 )
 
@@ -48,17 +51,23 @@ type PointerInputs struct {
 
 // BuildPointer assembles the pointer YAML schema 1.0 from a built bundle
 // plus optional post-push/sign claims. Empty BundleOCI/BundleHash signal
-// "not yet published".
+// "not yet published". The bundle's recipe-derived profile selection and
+// its predicate profile block must cohere — the pointer derives its
+// predicateType from the predicate but copies its profile from the recipe,
+// so an incoherent bundle would emit a pointer the verifier itself rejects.
 func BuildPointer(in PointerInputs) (*Pointer, error) {
 	if in.Bundle == nil || in.Bundle.Predicate == nil {
 		return nil, errors.New(errors.ErrCodeInvalidRequest, "bundle and predicate are required")
+	}
+	if err := ValidateBundleProfileCoherence(in.Bundle); err != nil {
+		return nil, err
 	}
 
 	att := PointerAttestation{
 		Bundle: PointerBundle{
 			OCI:           in.BundleOCI,
 			Digest:        in.BundleHash,
-			PredicateType: PredicateTypeV1,
+			PredicateType: StatementPredicateType(in.Bundle.Predicate),
 		},
 		Signer:     in.Signer,
 		AttestedAt: in.Bundle.Predicate.AttestedAt.UTC().Truncate(time.Second),
@@ -70,6 +79,70 @@ func BuildPointer(in PointerInputs) (*Pointer, error) {
 		Profile:       in.Bundle.Profile,
 		Attestations:  []PointerAttestation{att},
 	}, nil
+}
+
+// ValidateBundleProfileCoherence rejects (ErrCodeInvalidRequest) a bundle
+// whose recipe-derived profile selection and predicate profile block
+// disagree: a profiled recipe requires a v2 predicate carrying the same
+// name=value selection, the same declared advertiser, AND the same
+// recipe-scoped policy-descriptor identity; an unprofiled recipe requires
+// no profile block.
+// BuildPointer runs it before assembling a pointer, and Publish runs it at
+// bundle load — BEFORE the Fulcio/Rekor sign and the OCI push — so an
+// incoherent on-disk bundle (e.g. a profiled recipe.yaml paired with a v1
+// statement) fails closed without registry side effects instead of emitting
+// a pointer its own verifier rejects.
+func ValidateBundleProfileCoherence(b *Bundle) error {
+	if b == nil || b.Predicate == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, "bundle and predicate are required")
+	}
+	// The predicate itself must satisfy the shared type contract before the
+	// bundle-vs-predicate comparison: a profile block missing selection or
+	// policyDescriptorIdentity would otherwise slip through the equality
+	// cases below (both sides empty) and emit a v2 pointer every consumer
+	// rejects. In-repo constructors never build that shape — IdentityFor is
+	// a sha256 digest, so a profiled bundle's identity is never empty — but
+	// this is an exported entry point.
+	if err := ValidatePredicateTypeCoherence(StatementPredicateType(b.Predicate), b.Predicate); err != nil {
+		return err
+	}
+	switch {
+	case b.Profile == "" && b.Predicate.Profile != nil:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle recipe is unprofiled but the predicate carries a profile block ("+
+				b.Predicate.Profile.Selection+") — the statement does not attest this recipe")
+	case b.Profile != "" && b.Predicate.Profile == nil:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle recipe carries profile selection "+b.Profile+
+				" but the predicate has no profile block — profiled evidence requires "+
+				PredicateTypeV2+"; re-emit the bundle")
+	case b.Profile != "" && b.Predicate.Profile.Selection != b.Profile:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle recipe profile selection "+b.Profile+
+				" does not match the predicate profile selection "+b.Predicate.Profile.Selection)
+	case b.Profile != "" && b.Predicate.Profile.Advertiser != b.Advertiser:
+		// The verifier compares the full profile tuple
+		// (pkg/evidence/verifier/identity.go), so an advertiser mismatch
+		// must fail here too — otherwise a matching selection would sign
+		// and push a bundle whose pointer the verifier rejects.
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"bundle recipe advertiser "+strconv.Quote(b.Advertiser)+
+				" does not match the predicate profile advertiser "+
+				strconv.Quote(b.Predicate.Profile.Advertiser))
+	case b.Profile != "" && b.Predicate.Profile.PolicyDescriptorIdentity != b.PolicyDescriptorIdentity:
+		// The verifier also recomputes the recipe-scoped policy-descriptor
+		// identity and rejects a mismatch as historical-only (ADR-015
+		// descriptor-currentness), so the split-leg publish must fail here
+		// too — otherwise a bundle emitted before a descriptor expansion
+		// would spend a Fulcio cert, a Rekor entry, and an OCI push on
+		// evidence its own verifier then rejects.
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"predicate policy-descriptor identity "+b.Predicate.Profile.PolicyDescriptorIdentity+
+				" does not match the recipe-scoped identity recomputed from the bundle recipe ("+
+				b.PolicyDescriptorIdentity+") — the evidence is historical-only; regenerate and re-sign it "+
+				"(ADR-015 descriptor-currentness)")
+	}
+	return nil
 }
 
 // MarshalPointer renders a pointer as deterministic YAML (recursively
@@ -200,7 +273,19 @@ func isHexDigest(d string) bool {
 // canonical path already holds a file with DIFFERENT content (the per-source
 // pointer is immutable, so that is a genuine conflict for the operator to
 // resolve, not something to overwrite).
+//
+// Deprecated: prefer RelocatePointerToCanonicalContext. This form derives its
+// own defaults.FileReadTimeout-bounded context; retained for source compatibility.
 func RelocatePointerToCanonical(currentPath string, p *Pointer) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.FileReadTimeout)
+	defer cancel()
+	return RelocatePointerToCanonicalContext(ctx, currentPath, p)
+}
+
+// RelocatePointerToCanonicalContext is RelocatePointerToCanonical bounded by
+// the caller's context: the comparison reads below run against operator-owned
+// paths that may sit on a network mount.
+func RelocatePointerToCanonicalContext(ctx context.Context, currentPath string, p *Pointer) (string, error) {
 	// canonicalPointerSuffix fails closed when the pointer is unsigned or has
 	// no pushed digest — the two states with no derivable canonical home.
 	relSuffix, err := canonicalPointerSuffix(p)
@@ -241,7 +326,7 @@ func RelocatePointerToCanonical(currentPath string, p *Pointer) (string, error) 
 			//     would wrongly report a conflict.
 			// Only a dest holding DIFFERENT bytes is a real immutable-pointer
 			// conflict for the operator to resolve.
-			placed, eqErr := pointerAlreadyPlaced(currentPath, dest)
+			placed, eqErr := pointerAlreadyPlaced(ctx, currentPath, dest)
 			if eqErr != nil {
 				return "", eqErr
 			}
@@ -272,15 +357,19 @@ func RelocatePointerToCanonical(currentPath string, p *Pointer) (string, error) 
 // round trip leaves distinct inodes). It returns an error rather than a bool on
 // a read failure so the caller fails closed instead of silently treating an
 // unreadable dest as a match or a conflict.
-func pointerAlreadyPlaced(currentPath, dest string) (bool, error) {
-	if sameInode(currentPath, dest) {
-		return true, nil
-	}
-	srcBytes, err := readPointerBytes(currentPath)
+func pointerAlreadyPlaced(ctx context.Context, currentPath, dest string) (bool, error) {
+	same, err := sameInode(ctx, currentPath, dest)
 	if err != nil {
 		return false, err
 	}
-	destBytes, err := readPointerBytes(dest)
+	if same {
+		return true, nil
+	}
+	srcBytes, err := readPointerBytes(ctx, currentPath)
+	if err != nil {
+		return false, err
+	}
+	destBytes, err := readPointerBytes(ctx, dest)
 	if err != nil {
 		return false, err
 	}
@@ -288,37 +377,47 @@ func pointerAlreadyPlaced(currentPath, dest string) (bool, error) {
 }
 
 // sameInode reports whether a and b are the same underlying file (e.g. two
-// hard links to one inode). A stat failure on either path reports false (treat
-// as not-same; fail safe).
-func sameInode(a, b string) bool {
-	fa, err := os.Stat(a)
-	if err != nil {
-		return false
+// hard links to one inode). A confirmed absence on either path reports false
+// (treat as not-same; fail safe); a storage fault reports an error, because a
+// mount that could not answer has not told us the paths differ.
+func sameInode(ctx context.Context, a, b string) (bool, error) {
+	var fa, fb os.FileInfo
+	var same bool
+	var statErr error
+	// The boundary error MUST be propagated, not discarded: reading `same`
+	// after an abandoned worker is a data race (the worker may still be
+	// writing it).
+	if err := boundedio.Do(ctx, "pointer comparison stat", func() error {
+		var err error
+		if fa, err = os.Stat(a); err != nil {
+			statErr = err
+			return nil
+		}
+		if fb, err = os.Stat(b); err != nil {
+			statErr = err
+			return nil
+		}
+		same = os.SameFile(fa, fb)
+		return nil
+	}); err != nil {
+		return false, err
 	}
-	fb, err := os.Stat(b)
-	if err != nil {
-		return false
+	// Classify the fault at its source. The caller does fail closed either way
+	// (readPointerBytes reports the same mount a moment later), but attributing
+	// a wedged mount to the read rather than to the stat that first hit it
+	// makes the operator-facing error name the wrong operation.
+	if statErr != nil && boundedio.IsStorageFault(statErr) {
+		return false, errors.Wrap(errors.ErrCodeUnavailable,
+			"could not compare pointer paths (storage fault)", statErr)
 	}
-	return os.SameFile(fa, fb)
+	return same, nil
 }
 
 // readPointerBytes reads a pointer file, bounded to maxPointerReadBytes so a
 // bloated or hostile path cannot exhaust memory during the equality check. A
-// file at or past the cap is rejected (a pointer is never that large).
-func readPointerBytes(path string) ([]byte, error) {
-	f, err := os.Open(path) //nolint:gosec // operator-supplied path
-	if err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to open pointer for comparison", err)
-	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, maxPointerReadBytes+1))
-	if err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to read pointer for comparison", err)
-	}
-	if int64(len(data)) > maxPointerReadBytes {
-		return nil, errors.New(errors.ErrCodeInvalidRequest, "pointer file exceeds size limit: "+path)
-	}
-	return data, nil
+// file over the cap is rejected (a pointer is never that large).
+func readPointerBytes(ctx context.Context, path string) ([]byte, error) {
+	return boundedio.ReadFile(ctx, path, "pointer for comparison "+path, maxPointerReadBytes)
 }
 
 // WritePointer writes the pointer file to outputDir/pointer.yaml.

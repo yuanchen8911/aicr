@@ -93,15 +93,29 @@ jobs:
           persist-credentials: false
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Authenticate to registry
         uses: ./.github/actions/ghcr-login
 
-      - name: Read Go version
-        id: go
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        if: matrix.phase != 'aiperf-bench'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+
+      - name: Build validator binary
+        if: matrix.phase != 'aiperf-bench'
         shell: bash
-        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+        env:
+          VALIDATOR_ARCHES: ${{ matrix.arch }}
+          VALIDATOR_PHASES: ${{ matrix.phase }}
+        run: ./tools/build-validator-binaries
 
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
@@ -110,17 +124,19 @@ jobs:
           file: ${{ matrix.dockerfile || format('validators/{0}/Dockerfile', matrix.phase) }}
           platforms: ${{ matrix.platform }}
           push: true
-          # CHAINSAW_* args were dropped in #1236 — the deployment validator
-          # no longer ships /usr/local/bin/chainsaw; it executes Chainsaw
-          # Test format in-process via validators/chainsaw/inprocess.go.
-          build-args: |
-            GO_VERSION=${{ steps.go.outputs.version }}
           tags: |
             ${{ env.VALIDATOR_IMAGE_PREFIX }}/${{ matrix.phase }}:sha-${{ github.sha }}-${{ matrix.arch }}
             ${{ env.VALIDATOR_IMAGE_PREFIX }}/${{ matrix.phase }}:edge-${{ matrix.arch }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # aiperf-bench builds without the layer cache on purpose (#2086).
+          # Its requirements.txt is deliberately unpinned so each rebuild
+          # resolves patched transitive versions, but `pip install` is opaque
+          # to BuildKit: neither the base image nor the COPY'd requirements.txt
+          # changes between releases, so a cache hit replays the old closure
+          # verbatim and the image silently stops picking up CVE fixes. The Go
+          # validators have no resolution step, so they keep the cache.
+          cache-from: ${{ matrix.phase != 'aiperf-bench' && 'type=gha' || '' }}
+          cache-to: ${{ matrix.phase != 'aiperf-bench' && 'type=gha,mode=max' || '' }}
           labels: |
             org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
             org.opencontainers.image.title=${{ matrix.image_title || format('aicr-validator-{0}', matrix.phase) }}
@@ -147,7 +163,7 @@ jobs:
         uses: ./.github/actions/ghcr-login
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Create multi-arch manifests for validator images
         env:

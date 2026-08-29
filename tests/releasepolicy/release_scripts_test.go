@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,6 +33,7 @@ func TestReleaseScriptsStructure(t *testing.T) {
 	for _, relative := range []string{
 		".github/scripts/release-images.sh",
 		".github/scripts/publish-homebrew.sh",
+		".github/scripts/sign-sbom.sh",
 	} {
 		t.Run(filepath.Base(relative), func(t *testing.T) {
 			path := repositoryPath(t, relative)
@@ -52,6 +54,261 @@ func TestReleaseScriptsStructure(t *testing.T) {
 			}
 			if firstExecutable(lines) != "set -euo pipefail" {
 				t.Errorf("first executable statement = %q, want strict mode", firstExecutable(lines))
+			}
+		})
+	}
+}
+
+// TestReleaseSbomSignaturesAreAllowlisted ties the goreleaser `signs:` stanza
+// to the publish-time asset allowlist. GoReleaser types the bundles that stanza
+// writes as Signature artifacts, which are release-uploadable, and
+// .goreleaser.yaml sets no `release.ids` filter, so every one of them lands on
+// the release. `publish-release` validates the asset set in exact mode, so an
+// unlisted bundle fails the publish job after promote-images has already
+// mutated registry aliases. Deriving the expected names from the stanza's own
+// `signature:` template keeps the two from drifting apart.
+func TestReleaseSbomSignaturesAreAllowlisted(t *testing.T) {
+	t.Parallel()
+	config := loadYAML(t, ".goreleaser.yaml")
+
+	sboms, ok := config["sboms"].([]any)
+	if !ok || len(sboms) != 1 {
+		t.Fatalf("goreleaser must declare exactly one sboms stanza, got %T", config["sboms"])
+	}
+	sbom, ok := sboms[0].(map[string]any)
+	if !ok {
+		t.Fatalf("sboms entry must be a map, got %T", sboms[0])
+	}
+	if artifacts := fmt.Sprint(sbom["artifacts"]); artifacts != "binary" {
+		t.Fatalf("sboms artifacts = %q, want binary", artifacts)
+	}
+
+	signs, ok := config["signs"].([]any)
+	if !ok {
+		t.Fatal("goreleaser must sign the binary SBOMs")
+	}
+	const artifactPlaceholder = "${artifact}"
+	suffix := ""
+	for _, raw := range signs {
+		entry, ok := raw.(map[string]any)
+		if !ok || fmt.Sprint(entry["artifacts"]) != "sbom" {
+			continue
+		}
+		signature := fmt.Sprint(entry["signature"])
+		if !strings.HasPrefix(signature, artifactPlaceholder) {
+			t.Fatalf("sbom signature template %q must extend %s", signature, artifactPlaceholder)
+		}
+		suffix = strings.TrimPrefix(signature, artifactPlaceholder)
+		if suffix == "" || strings.ContainsAny(suffix, "${}") {
+			t.Fatalf("sbom signature suffix %q must be a literal so the asset name is predictable", suffix)
+		}
+		command := fmt.Sprint(entry["cmd"])
+		info, err := os.Stat(repositoryPath(t, command))
+		if err != nil {
+			t.Fatalf("sbom signing command %s: %v", command, err)
+		}
+		if info.Mode().Perm() != 0o755 {
+			t.Errorf("sbom signing command %s mode = %o, want 755", command, info.Mode().Perm())
+		}
+	}
+	if suffix == "" {
+		t.Fatal("goreleaser signs stanza must cover artifacts: sbom")
+	}
+
+	const tag = "v1.2.3-rc1"
+	names := shellReleaseAssetNames(t, tag)
+	allowed := make(map[string]bool, len(names))
+	for _, name := range names {
+		allowed[name] = true
+	}
+
+	documents := 0
+	for _, name := range names {
+		if !strings.HasSuffix(name, ".sbom.json") {
+			continue
+		}
+		documents++
+		if !allowed[name+suffix] {
+			t.Errorf("allowlist has SBOM %s but not the %q bundle the signs stanza writes for it", name, suffix)
+		}
+	}
+	if documents == 0 {
+		t.Fatal("allowlist has no binary SBOM documents to sign")
+	}
+
+	signatures := 0
+	for _, name := range names {
+		document := strings.TrimSuffix(name, suffix)
+		if document == name || !strings.HasSuffix(document, ".sbom.json") {
+			continue
+		}
+		signatures++
+		if !allowed[document] {
+			t.Errorf("allowlist has bundle %s without its %s document", name, document)
+		}
+	}
+	if signatures != documents {
+		t.Errorf("allowlist has %d SBOM bundles for %d SBOM documents", signatures, documents)
+	}
+
+	fixture := make([]string, 0, len(names))
+	for _, asset := range expectedReleaseAssets(tag) {
+		fixture = append(fixture, fmt.Sprint(asset["name"]))
+	}
+	sort.Strings(fixture)
+	if strings.Join(fixture, "\n") != strings.Join(names, "\n") {
+		t.Errorf("test fixture assets\n%s\ndiverge from the shipped allowlist\n%s",
+			strings.Join(fixture, "\n"), strings.Join(names, "\n"))
+	}
+}
+
+// shellReleaseAssetNames evaluates the release script's own
+// expected_release_asset_names definition so the policy check reads the shipped
+// allowlist rather than a copy of it.
+func shellReleaseAssetNames(t *testing.T, tag string) []string {
+	t.Helper()
+	budget := scriptBudget(t)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	text := string(readFile(t, ".github/scripts/release-images.sh"))
+	const marker = "expected_release_asset_names() {"
+	start := strings.Index(text, marker)
+	if start < 0 {
+		t.Fatal("release-images.sh no longer defines expected_release_asset_names")
+	}
+	const terminator = "\n}\n"
+	end := strings.Index(text[start:], terminator)
+	if end < 0 {
+		t.Fatal("expected_release_asset_names has no closing brace")
+	}
+	script := text[start:start+end+len(terminator)] + "\nexpected_release_asset_names\n"
+	command := exec.CommandContext(ctx, "bash", "-c", script)
+	command.Env = append(os.Environ(), "RELEASE_TAG="+tag)
+	output, err := command.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("evaluate expected_release_asset_names exceeded %v budget (derived from -timeout): %v\n%s", budget, ctx.Err(), output)
+	}
+	if err != nil {
+		t.Fatalf("evaluate expected_release_asset_names: %v\n%s", err, output)
+	}
+	var names []string
+	if err := json.Unmarshal(output, &names); err != nil {
+		t.Fatalf("parse allowlist %q: %v", output, err)
+	}
+	return names
+}
+
+// TestReleaseSignSbomBehavior exercises the fail-closed guards and the retry
+// loop in sign-sbom.sh with a mocked cosign. GoReleaser registers the bundle
+// path as a release artifact whether or not the script writes it, so every
+// path that cannot produce a bundle has to exit non-zero.
+func TestReleaseSignSbomBehavior(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		failures     int
+		omitSBOM     bool
+		emptySBOM    bool
+		noPredicate  bool
+		noSigningCfg bool
+		args         []string
+		wantErr      bool
+		wantAttempts int
+		wantBundle   bool
+	}{
+		{name: "signs on the first attempt", wantAttempts: 1, wantBundle: true},
+		{name: "retries and succeeds on the second attempt", failures: 1, wantAttempts: 2, wantBundle: true},
+		{name: "fails after the third attempt", failures: 3, wantErr: true, wantAttempts: 3},
+		{name: "no arguments", args: []string{}, wantErr: true},
+		{name: "missing bundle argument", args: []string{"sbom-only"}, wantErr: true},
+		{name: "missing SBOM document", omitSBOM: true, wantErr: true},
+		{name: "empty SBOM document", emptySBOM: true, wantErr: true},
+		{name: "SLSA_PREDICATE unset", noPredicate: true, wantErr: true},
+		{name: "AICR_SIGNING_CONFIG unset", noSigningCfg: true, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatalf("create fake bin: %v", err)
+			}
+			writeExecutable(t, filepath.Join(bin, "cosign"), fakeCosign)
+			// The retry loop backs off 5s then 10s; a PATH shim keeps the
+			// waits instantaneous so the test stays fast regardless of the
+			// per-script budget.
+			writeExecutable(t, filepath.Join(bin, "sleep"), noopSleep)
+
+			sbomPath := filepath.Join(dir, "aicr_1.2.3_linux_amd64.sbom.json")
+			if !tc.omitSBOM {
+				contents := []byte("{\"spdxVersion\":\"SPDX-2.3\"}\n")
+				if tc.emptySBOM {
+					contents = nil
+				}
+				if err := os.WriteFile(sbomPath, contents, 0o600); err != nil {
+					t.Fatalf("write SBOM: %v", err)
+				}
+			}
+			bundlePath := sbomPath + ".sigstore.json"
+			predicate := filepath.Join(dir, "predicate.json")
+			signingConfig := filepath.Join(dir, "signing-config.json")
+			attempts := filepath.Join(dir, "attempts")
+			invocations := filepath.Join(dir, "invocations")
+
+			environment := []string{
+				"PATH=" + bin + ":" + os.Getenv("PATH"),
+				"FAKE_COSIGN_ATTEMPTS=" + attempts,
+				"FAKE_COSIGN_INVOCATIONS=" + invocations,
+				fmt.Sprintf("FAKE_COSIGN_FAILURES=%d", tc.failures),
+			}
+			if !tc.noPredicate {
+				environment = append(environment, "SLSA_PREDICATE="+predicate)
+			}
+			if !tc.noSigningCfg {
+				environment = append(environment, "AICR_SIGNING_CONFIG="+signingConfig)
+			}
+
+			args := []string{sbomPath, bundlePath}
+			if tc.args != nil {
+				args = tc.args
+			}
+			result := runScript(t, environment, ".github/scripts/sign-sbom.sh", args...)
+			if (result.err != nil) != tc.wantErr {
+				t.Fatalf("sign-sbom error = %v, wantErr %t\n%s", result.err, tc.wantErr, result.output)
+			}
+
+			got := 0
+			if recorded := strings.TrimSpace(readOptional(t, attempts)); recorded != "" {
+				if _, err := fmt.Sscanf(recorded, "%d", &got); err != nil {
+					t.Fatalf("parse attempt counter %q: %v", recorded, err)
+				}
+			}
+			if got != tc.wantAttempts {
+				t.Errorf("cosign attempts = %d, want %d\n%s", got, tc.wantAttempts, result.output)
+			}
+
+			_, err := os.Stat(bundlePath)
+			if tc.wantBundle && err != nil {
+				t.Errorf("successful signing wrote no bundle: %v", err)
+			}
+			if !tc.wantBundle && err == nil {
+				t.Error("failed signing left a bundle behind")
+			}
+			if !tc.wantBundle {
+				return
+			}
+			invoked := readOptional(t, invocations)
+			for _, required := range []string{
+				"--predicate " + predicate,
+				"--type https://slsa.dev/provenance/v1",
+				"--signing-config " + signingConfig,
+				"--bundle " + bundlePath,
+				"--yes " + sbomPath,
+			} {
+				if !strings.Contains(invoked, required) {
+					t.Errorf("cosign invocation missing %q\n%s", required, invoked)
+				}
 			}
 		})
 	}
@@ -96,6 +353,7 @@ func TestReleaseHomebrewScriptIsMutationLimited(t *testing.T) {
 }
 
 func TestReleaseResolverBehavior(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		badLabelRef string
@@ -109,6 +367,7 @@ func TestReleaseResolverBehavior(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newReleaseFixture(t)
 			output := filepath.Join(fixture.dir, "digests.json")
 			env := fixture.environment()
@@ -137,6 +396,7 @@ func TestReleaseResolverBehavior(t *testing.T) {
 }
 
 func TestReleaseRejectsNonCanonicalReleaseTags(t *testing.T) {
+	t.Parallel()
 	for _, tag := range []string{
 		"v01.2.3",
 		"v1.02.3",
@@ -147,6 +407,7 @@ func TestReleaseRejectsNonCanonicalReleaseTags(t *testing.T) {
 		"v1.2.3+build.1",
 	} {
 		t.Run(tag, func(t *testing.T) {
+			t.Parallel()
 			fixture := newReleaseFixture(t)
 			environment := append(fixture.environment(), "RELEASE_TAG="+tag)
 			result := runScript(t, environment, ".github/scripts/release-images.sh", "verify-source")
@@ -158,6 +419,7 @@ func TestReleaseRejectsNonCanonicalReleaseTags(t *testing.T) {
 }
 
 func TestReleaseTargetRerunPolicy(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		releases   [][]map[string]any
@@ -288,6 +550,7 @@ func TestReleaseTargetRerunPolicy(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newReleaseFixture(t)
 			writeJSON(t, fixture.releases, tc.releases)
 			if tc.assets != nil {
@@ -308,6 +571,7 @@ func TestReleaseTargetRerunPolicy(t *testing.T) {
 }
 
 func TestReleasePublishRequiresExactDraftAssetsAndID(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name          string
 		modifyRelease func(map[string]any)
@@ -382,6 +646,7 @@ func TestReleasePublishRequiresExactDraftAssetsAndID(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newReleaseFixture(t)
 			release := map[string]any{
 				"id":         42,
@@ -431,6 +696,7 @@ func TestReleasePublishRequiresExactDraftAssetsAndID(t *testing.T) {
 }
 
 func TestReleasePreflightRejectsConflictingVersionWithoutMutation(t *testing.T) {
+	t.Parallel()
 	fixture := newReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -449,6 +715,7 @@ func TestReleasePreflightRejectsConflictingVersionWithoutMutation(t *testing.T) 
 }
 
 func TestReleasePreflightRejectsDuplicateDigestKeysWithoutMutation(t *testing.T) {
+	t.Parallel()
 	fixture := newReleaseFixture(t)
 	encoded, err := json.Marshal(fixture.digests)
 	if err != nil {
@@ -474,6 +741,7 @@ func TestReleasePreflightRejectsDuplicateDigestKeysWithoutMutation(t *testing.T)
 }
 
 func TestReleasePreflightRejectsReleaseKindMismatchWithoutMutation(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -489,6 +757,7 @@ func TestReleasePreflightRejectsReleaseKindMismatchWithoutMutation(t *testing.T)
 }
 
 func TestReleasePreflightFailureModesHaveNoMutations(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		setup func(*testing.T, releaseFixture, map[string]string) []string
@@ -557,11 +826,10 @@ func TestReleasePreflightFailureModesHaveNoMutations(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newReleaseFixture(t)
 			digests := make(map[string]string, len(fixture.digests))
-			for key, digest := range fixture.digests {
-				digests[key] = digest
-			}
+			maps.Copy(digests, fixture.digests)
 			extraEnv := tc.setup(t, fixture, digests)
 			mapPath := filepath.Join(fixture.dir, "digests.json")
 			writeDigestMap(t, mapPath, digests)
@@ -582,6 +850,7 @@ func TestReleasePreflightFailureModesHaveNoMutations(t *testing.T) {
 }
 
 func TestReleaseStablePreflightFailureModesHaveNoMutations(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name  string
 		setup func(*testing.T, releaseFixture)
@@ -669,6 +938,7 @@ func TestReleaseStablePreflightFailureModesHaveNoMutations(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newStableReleaseFixture(t)
 			tc.setup(t, fixture)
 			mapPath := filepath.Join(fixture.dir, "digests.json")
@@ -689,6 +959,7 @@ func TestReleaseStablePreflightFailureModesHaveNoMutations(t *testing.T) {
 }
 
 func TestReleasePriorSelectionIgnoresNonStableNames(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	writeJSON(t, fixture.releases, [][]map[string]any{{
 		{"tag_name": "v1.2.2", "draft": false, "prerelease": false},
@@ -705,6 +976,7 @@ func TestReleasePriorSelectionIgnoresNonStableNames(t *testing.T) {
 }
 
 func TestReleasePreflightRejectsMovedCurrentTag(t *testing.T) {
+	t.Parallel()
 	fixture := newReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -720,6 +992,7 @@ func TestReleasePreflightRejectsMovedCurrentTag(t *testing.T) {
 }
 
 func TestReleasePromotionRejectsPostPreflightAliasMutationWithoutWrites(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -740,6 +1013,7 @@ func TestReleasePromotionRejectsPostPreflightAliasMutationWithoutWrites(t *testi
 }
 
 func TestReleasePreflightPaginatesAndPeelsAnnotatedTags(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -755,7 +1029,9 @@ func TestReleasePreflightPaginatesAndPeelsAnnotatedTags(t *testing.T) {
 }
 
 func TestReleaseV0170UnlabeledBootstrapIsExact(t *testing.T) {
+	t.Parallel()
 	t.Run("pinned core digests accepted", func(t *testing.T) {
+		t.Parallel()
 		fixture := newV0170BootstrapFixture(t)
 		mapPath := filepath.Join(fixture.dir, "digests.json")
 		writeDigestMap(t, mapPath, fixture.digests)
@@ -767,6 +1043,7 @@ func TestReleaseV0170UnlabeledBootstrapIsExact(t *testing.T) {
 	})
 
 	t.Run("other unlabeled core digest rejected", func(t *testing.T) {
+		t.Parallel()
 		fixture := newV0170BootstrapFixture(t)
 		wrong := "sha256:" + strings.Repeat("f", 64)
 		appendFile(t, fixture.digestState, releaseImages["aicr"]+":v0.17.0\t"+wrong+"\n")
@@ -785,6 +1062,7 @@ func TestReleaseV0170UnlabeledBootstrapIsExact(t *testing.T) {
 }
 
 func TestReleaseStablePromotionConvergesAndRerunsWithoutMutation(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -817,6 +1095,7 @@ func TestReleaseStablePromotionConvergesAndRerunsWithoutMutation(t *testing.T) {
 }
 
 func TestReleasePromotionDefersLatestUntilEveryVersionIsVerified(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		extraEnv func(releaseFixture) string
@@ -837,6 +1116,7 @@ func TestReleasePromotionDefersLatestUntilEveryVersionIsVerified(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := newStableReleaseFixture(t)
 			mapPath := filepath.Join(fixture.dir, "digests.json")
 			writeDigestMap(t, mapPath, fixture.digests)
@@ -851,7 +1131,7 @@ func TestReleasePromotionDefersLatestUntilEveryVersionIsVerified(t *testing.T) {
 			if result.err == nil {
 				t.Fatalf("promotion accepted a failed version phase\n%s", result.output)
 			}
-			for _, line := range strings.Split(strings.TrimSpace(readOptional(t, fixture.mutations)), "\n") {
+			for line := range strings.SplitSeq(strings.TrimSpace(readOptional(t, fixture.mutations)), "\n") {
 				if strings.HasSuffix(line, "\tlatest") {
 					t.Errorf("promotion advanced latest before every version was verified: %s", line)
 				}
@@ -870,6 +1150,7 @@ func TestReleasePromotionHasExplicitVersionThenLatestPhases(t *testing.T) {
 }
 
 func TestReleaseStablePromotionConvergesMixedAliasStates(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	keys := make([]string, 0, len(releaseImages))
 	for key := range releaseImages {
@@ -910,6 +1191,7 @@ func TestReleaseStablePromotionConvergesMixedAliasStates(t *testing.T) {
 }
 
 func TestReleasePromotionRejectsTagMovementAfterPreflightWithoutWrites(t *testing.T) {
+	t.Parallel()
 	fixture := newStableReleaseFixture(t)
 	mapPath := filepath.Join(fixture.dir, "digests.json")
 	writeDigestMap(t, mapPath, fixture.digests)
@@ -929,6 +1211,7 @@ func TestReleasePromotionRejectsTagMovementAfterPreflightWithoutWrites(t *testin
 }
 
 func TestReleasePromotionPrereleaseWritesOnlyVersionAliases(t *testing.T) {
+	t.Parallel()
 	fixture := newReleaseFixture(t)
 	validated := map[string]any{
 		"candidate_tag": fixture.candidateTag,
@@ -971,6 +1254,7 @@ func TestReleasePromotionPrereleaseWritesOnlyVersionAliases(t *testing.T) {
 }
 
 func TestReleaseHomebrewBehavior(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name            string
 		existingTag     string
@@ -1018,6 +1302,7 @@ func TestReleaseHomebrewBehavior(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			dir := t.TempDir()
 			bin := filepath.Join(dir, "bin")
 			tap := filepath.Join(dir, "tap")
@@ -1057,7 +1342,7 @@ func TestReleaseHomebrewBehavior(t *testing.T) {
 				"PATH="+bin+":"+os.Getenv("PATH"),
 				"RELEASE_TAG=v1.2.3",
 				"FAKE_CHECKSUMS="+checksumPath,
-				"AICR_NETWORK_TIMEOUT_SECONDS=5",
+				fmt.Sprintf("AICR_NETWORK_TIMEOUT_SECONDS=%d", networkTimeoutSeconds(scriptBudget(t))),
 			)
 			result := runScript(t, environment, ".github/scripts/publish-homebrew.sh", candidatePath, tap)
 			if (result.err != nil) != tc.wantErr {
@@ -1080,20 +1365,32 @@ func TestReleaseHomebrewBehavior(t *testing.T) {
 	}
 }
 
+// blockedCommandTimeoutSeconds is the AICR_NETWORK_TIMEOUT_SECONDS value the
+// blocked-command subtests configure. blockedCommandBudget scales the wall-clock
+// assertion off it with generous headroom: the elapsed time also covers shell
+// startup and process spawning, so a tight bound only produces flakes under
+// load. The assertion exists solely to catch an indefinite hang — the "script
+// failed" and "artifact not mutated" assertions prove the real behavior.
+const (
+	blockedCommandTimeoutSeconds = 1
+	blockedCommandBudget         = 10 * blockedCommandTimeoutSeconds * time.Second
+)
+
 func TestReleaseNetworkBoundsTerminateBlockedCommands(t *testing.T) {
 	t.Run("candidate resolver", func(t *testing.T) {
 		fixture := newReleaseFixture(t)
 		writeExecutable(t, filepath.Join(fixture.bin, "timeout"), fakeTimeout)
 		writeExecutable(t, filepath.Join(fixture.bin, "crane"), blockingCommand)
 		output := filepath.Join(fixture.dir, "digests.json")
-		environment := append(fixture.environment(), "AICR_NETWORK_TIMEOUT_SECONDS=1")
+		environment := append(fixture.environment(),
+			fmt.Sprintf("AICR_NETWORK_TIMEOUT_SECONDS=%d", blockedCommandTimeoutSeconds))
 		started := time.Now()
 		result := runScript(t, environment, ".github/scripts/release-images.sh", "resolve", output)
 		if result.err == nil {
 			t.Fatal("resolver accepted a blocked registry command")
 		}
-		if elapsed := time.Since(started); elapsed > 4*time.Second {
-			t.Errorf("resolver timeout took %s, want under 4s", elapsed)
+		if elapsed := time.Since(started); elapsed > blockedCommandBudget {
+			t.Errorf("resolver timeout took %s, want under %s", elapsed, blockedCommandBudget)
 		}
 		if _, err := os.Stat(output); !os.IsNotExist(err) {
 			t.Errorf("timed-out resolver published output: %v", err)
@@ -1127,15 +1424,15 @@ func TestReleaseNetworkBoundsTerminateBlockedCommands(t *testing.T) {
 		environment := append(os.Environ(),
 			"PATH="+bin+":"+os.Getenv("PATH"),
 			"RELEASE_TAG=v1.2.3",
-			"AICR_NETWORK_TIMEOUT_SECONDS=1",
+			fmt.Sprintf("AICR_NETWORK_TIMEOUT_SECONDS=%d", blockedCommandTimeoutSeconds),
 		)
 		started := time.Now()
 		result := runScript(t, environment, ".github/scripts/publish-homebrew.sh", candidate, filepath.Join(dir, "tap"))
 		if result.err == nil {
 			t.Fatal("Homebrew publisher accepted a blocked checksum request")
 		}
-		if elapsed := time.Since(started); elapsed > 4*time.Second {
-			t.Errorf("Homebrew timeout took %s, want under 4s", elapsed)
+		if elapsed := time.Since(started); elapsed > blockedCommandBudget {
+			t.Errorf("Homebrew timeout took %s, want under %s", elapsed, blockedCommandBudget)
 		}
 		if got := readOptional(t, destination); got != existing {
 			t.Error("timed-out checksum request modified the tap")
@@ -1197,15 +1494,21 @@ func expectedReleaseAssets(tag string) []map[string]any {
 	version := strings.TrimPrefix(tag, "v")
 	names := []string{
 		"aicr_" + version + "_darwin_amd64.sbom.json",
+		"aicr_" + version + "_darwin_amd64.sbom.json.sigstore.json",
 		"aicr_" + version + "_darwin_amd64.tar.gz",
 		"aicr_" + version + "_darwin_arm64.sbom.json",
+		"aicr_" + version + "_darwin_arm64.sbom.json.sigstore.json",
 		"aicr_" + version + "_darwin_arm64.tar.gz",
 		"aicr_" + version + "_linux_amd64.sbom.json",
+		"aicr_" + version + "_linux_amd64.sbom.json.sigstore.json",
 		"aicr_" + version + "_linux_amd64.tar.gz",
 		"aicr_" + version + "_linux_arm64.sbom.json",
+		"aicr_" + version + "_linux_arm64.sbom.json.sigstore.json",
 		"aicr_" + version + "_linux_arm64.tar.gz",
 		"aicrd_" + version + "_linux_amd64.sbom.json",
+		"aicrd_" + version + "_linux_amd64.sbom.json.sigstore.json",
 		"aicrd_" + version + "_linux_arm64.sbom.json",
+		"aicrd_" + version + "_linux_arm64.sbom.json.sigstore.json",
 		"aicr_checksums.txt",
 		"recipe-catalog.sigstore.json",
 		"THIRD_PARTY_NOTICES.md",
@@ -1222,6 +1525,7 @@ func expectedReleaseAssets(tag string) []map[string]any {
 }
 
 type releaseFixture struct {
+	t             *testing.T
 	dir           string
 	bin           string
 	digestState   string
@@ -1248,6 +1552,7 @@ func newReleaseFixture(t *testing.T) releaseFixture {
 		t.Fatalf("create fake bin: %v", err)
 	}
 	fixture := releaseFixture{
+		t:             t,
 		dir:           dir,
 		bin:           bin,
 		digestState:   filepath.Join(dir, "digests.tsv"),
@@ -1411,7 +1716,7 @@ func (f releaseFixture) environment() []string {
 		"IS_PRERELEASE="+isPrerelease,
 		"GITHUB_SHA="+f.revision,
 		"GH_TOKEN=test-token",
-		"AICR_NETWORK_TIMEOUT_SECONDS=5",
+		fmt.Sprintf("AICR_NETWORK_TIMEOUT_SECONDS=%d", networkTimeoutSeconds(scriptBudget(f.t))),
 	)
 }
 
@@ -1420,15 +1725,124 @@ type scriptResult struct {
 	err    error
 }
 
+// scriptHangCap bounds a single script invocation. Genuine hangs (stuck
+// prompt, infinite loop) exceed this by orders of magnitude, while
+// slow-but-correct runs under full-suite -race load stay well inside it
+// (see issue #1974).
+const scriptHangCap = 90 * time.Second
+
+// deadlineReportMargin is reserved from the test binary's -timeout so a
+// killed script still fails via t.Fatalf with its captured output instead
+// of being torn down by the test runner's deadline panic.
+const deadlineReportMargin = 30 * time.Second
+
+// scriptBudget derives the per-script deadline from the test binary's own
+// deadline so the budget inherits whatever -timeout the environment (gate,
+// CI, dev machine) was provisioned with, capped at hang-detection scale.
+func scriptBudget(t *testing.T) time.Duration {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		return scriptHangCap
+	}
+	return scriptBudgetFor(time.Until(deadline))
+}
+
+// scriptBudgetFor computes the budget for the given time remaining before the
+// binary deadline. It reserves deadlineReportMargin for t.Fatalf to report
+// before the runner's deadline panic, but never takes more than half the
+// remaining time as margin — a short -timeout (e.g. 25s on a targeted run)
+// must still yield a usable budget rather than collapse it. Once the deadline
+// has passed the result goes non-positive and the context expires
+// immediately, failing fast with the script-timeout message instead of
+// starting doomed work.
+func scriptBudgetFor(remaining time.Duration) time.Duration {
+	budget := remaining - deadlineReportMargin
+	if half := remaining / 2; budget < half {
+		budget = half
+	}
+	if budget > scriptHangCap {
+		budget = scriptHangCap
+	}
+	return budget
+}
+
+// networkTimeoutSeconds derives the AICR_NETWORK_TIMEOUT_SECONDS a script
+// invocation gets from that invocation's own external per-script deadline
+// (scriptBudget), instead of a fixed constant. A fixed value can't be safe in
+// both directions at once: long enough that scheduling jitter under a
+// parallel -race run doesn't false-trip the script's internal
+// `timeout --foreground` around a fake network command that should return
+// instantly (the identical_formula_is_a_no-op flake), yet short enough that,
+// on a tight -timeout targeted run, runScript's own context can't cancel the
+// whole process before that internal timeout gets a chance to fire and
+// report its own clean "failed to fetch..." error instead. Deriving it as
+// half the live budget keeps the internal timeout strictly under the
+// external one regardless of how tight or generous that budget is.
+func networkTimeoutSeconds(budget time.Duration) int {
+	seconds := int(budget / (2 * time.Second))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
+func TestNetworkTimeoutSeconds(t *testing.T) {
+	tests := []struct {
+		name     string
+		budget   time.Duration
+		expected int
+	}{
+		{"ample budget", 10 * time.Minute, 300},
+		{"hang-cap budget", scriptHangCap, 45},
+		{"tight targeted run", 12500 * time.Millisecond, 6},
+		{"near zero floors at one second", 1500 * time.Millisecond, 1},
+		{"non-positive budget floors at one second", 0, 1},
+		{"expired deadline floors at one second", -5 * time.Second, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := networkTimeoutSeconds(tt.budget); got != tt.expected {
+				t.Errorf("networkTimeoutSeconds(%v) = %d, want %d", tt.budget, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestScriptBudgetFor(t *testing.T) {
+	tests := []struct {
+		name      string
+		remaining time.Duration
+		expected  time.Duration
+	}{
+		{"ample time hits hang cap", 10 * time.Minute, scriptHangCap},
+		{"cap boundary", scriptHangCap + deadlineReportMargin, scriptHangCap},
+		{"full margin reserved", 100 * time.Second, 70 * time.Second},
+		{"full-margin/half tie at 2x margin", 2 * deadlineReportMargin, deadlineReportMargin},
+		{"margin capped at half", 50 * time.Second, 25 * time.Second},
+		{"short targeted -timeout", 25 * time.Second, 12500 * time.Millisecond},
+		{"nearly exhausted", time.Second, 500 * time.Millisecond},
+		{"expired deadline fails fast", -10 * time.Second, -5 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := scriptBudgetFor(tt.remaining); got != tt.expected {
+				t.Errorf("scriptBudgetFor(%v) = %v, want %v", tt.remaining, got, tt.expected)
+			}
+		})
+	}
+}
+
 func runScript(t *testing.T, environment []string, relative string, args ...string) scriptResult {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	budget := scriptBudget(t)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	command := exec.CommandContext(ctx, repositoryPath(t, relative), args...)
 	command.Env = environment
 	output, err := command.CombinedOutput()
 	if ctx.Err() != nil {
-		t.Fatalf("script exceeded test deadline: %v\n%s", ctx.Err(), output)
+		t.Fatalf("script exceeded %v budget (derived from -timeout): %v\n%s", budget, ctx.Err(), output)
 	}
 	return scriptResult{output: string(output), err: err}
 }
@@ -1445,7 +1859,7 @@ func sortedImages() []string {
 func assertVersionAliasesBeforeLatest(t *testing.T, mutations, releaseTag string) {
 	t.Helper()
 	seenLatest := false
-	for _, line := range strings.Split(strings.TrimSpace(mutations), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(mutations), "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) != 3 {
 			t.Fatalf("malformed registry mutation: %q", line)
@@ -1545,7 +1959,7 @@ func lookupDigestState(t *testing.T, path, reference string) string {
 	t.Helper()
 	data := readOptional(t, path)
 	value := ""
-	for _, line := range strings.Split(data, "\n") {
+	for line := range strings.SplitSeq(data, "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) == 2 && fields[0] == reference {
 			value = fields[1]
@@ -1564,7 +1978,7 @@ func rewriteWithout(t *testing.T, path, prefix string) {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	var kept []string
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if line != "" && !strings.HasPrefix(line, prefix) {
 			kept = append(kept, line)
 		}
@@ -1716,6 +2130,34 @@ cat "${FAKE_CHECKSUMS}"
 const blockingCommand = `#!/usr/bin/env bash
 set -euo pipefail
 exec /bin/sleep 60
+`
+
+// fakeCosign records every invocation, fails the first FAKE_COSIGN_FAILURES
+// attempts, and otherwise writes the bundle the caller asked for. It never
+// contacts Fulcio, Rekor, or a registry.
+const fakeCosign = `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${FAKE_COSIGN_INVOCATIONS}"
+attempt="$(( $(cat "${FAKE_COSIGN_ATTEMPTS}" 2>/dev/null || echo 0) + 1 ))"
+printf '%s\n' "${attempt}" > "${FAKE_COSIGN_ATTEMPTS}"
+if [[ "${attempt}" -le "${FAKE_COSIGN_FAILURES:-0}" ]]; then
+  echo "simulated cosign failure ${attempt}" >&2
+  exit 1
+fi
+bundle=""
+while [[ "$#" -gt 0 ]]; do
+  if [[ "$1" == "--bundle" ]]; then bundle="${2:-}"; fi
+  shift
+done
+if [[ -z "${bundle}" ]]; then
+  echo "cosign invoked without --bundle" >&2
+  exit 2
+fi
+printf '{}\n' > "${bundle}"
+`
+
+const noopSleep = `#!/usr/bin/env bash
+exit 0
 `
 
 const fakeTimeout = `#!/usr/bin/env bash

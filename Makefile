@@ -8,7 +8,7 @@ ifeq ($(IMAGE_REGISTRY),)
 IMAGE_REGISTRY     := ghcr.io/nvidia
 endif
 IMAGE_TAG          ?= latest
-YAML_FILES         := $(shell find . -type f \( -iname "*.yml" -o -iname "*.yaml" \) ! -path "./examples/*" ! -path "./bundle/*" ! -path "./bundles/*" ! -path "*/testdata/*")
+YAML_FILES         := $(shell find . -type f \( -iname "*.yml" -o -iname "*.yaml" \) ! -path "./examples/*" ! -path "./bundle/*" ! -path "./bundles/*" ! -path "*/testdata/*" ! -path "*/node_modules/*")
 COMMIT             := $(shell git rev-parse HEAD)
 BRANCH             := $(shell git rev-parse --abbrev-ref HEAD)
 GO_VERSION         := $(shell cat .go-version 2>/dev/null)
@@ -33,6 +33,13 @@ endif
 CTLPTL_CONFIG_FILE = .ctlptl.yaml
 REGISTRY_PORT = 5001
 REGISTRY_NAME = ctlptl-registry
+
+# Kind node image (single source of truth: .settings.yaml testing.kind_node_image).
+# .ctlptl.yaml intentionally does not hardcode this — cluster-create injects it so
+# local dev and CI can never pin a second, drifting copy of the version. No
+# hardcoded fallback here: cluster-create fails closed on an empty read
+# instead of silently degrading to a stale image (see its yq-missing check).
+KIND_NODE_IMAGE ?= $(shell yq -r '.testing.kind_node_image' .settings.yaml 2>/dev/null)
 
 # Default target
 all: help
@@ -79,12 +86,7 @@ tidy: ## Formats code, updates Go module dependencies, and regenerates third-par
 	@set -e; \
 	go fmt ./...; \
 	go mod tidy; \
-	go mod vendor; \
 	$(MAKE) notices
-
-.PHONY: vendor
-vendor: ## Vendors Go module dependencies (run after changing go.mod/go.sum)
-	@go mod vendor
 
 .PHONY: fmt-check
 fmt-check: ## Checks if code is formatted (CI-friendly, no modifications)
@@ -95,18 +97,21 @@ fmt-check: ## Checks if code is formatted (CI-friendly, no modifications)
 upgrade: ## Upgrades all dependencies to latest versions
 	@set -e; \
 	go get -u ./...; \
-	go mod tidy; \
-	go mod vendor
+	go mod tidy
 
 .PHONY: generate
 generate: ## Runs go generate for code generation
 	@echo "Running go generate..."
-	@GOFLAGS="-mod=vendor" go generate ./...
+	@GOFLAGS="-mod=readonly" go generate ./...
 	@echo "Code generation completed"
 
 .PHONY: lint
-lint: lint-go lint-yaml license check-agents-sync check-docs-filenames check-docs-mdx bom-pinning-check ## Lints the entire project (Go, YAML, license headers, and chart-version pins)
+lint: lint-go lint-yaml license check-agents-sync check-docs-filenames check-docs-mdx check-docs-mdx-parse bom-pinning-check check-depproxy-kit ## Lints the entire project (Go, YAML, license headers, chart-version pins, and vendored action digests)
 	@echo "Completed Go and YAML lints and ensured license headers"
+
+.PHONY: check-depproxy-kit
+check-depproxy-kit: ## Verifies the vendored Go proxy action matches upstream digests
+	@./tools/check-depproxy-kit
 
 # Standalone target — NOT part of `make lint` because it requires Docker
 # (the validator runs in the same image renovatebot/github-action wraps).
@@ -141,13 +146,28 @@ check-docs-filenames: ## Enforces lowercase kebab-case filenames in docs/
 check-docs-mdx: ## Checks docs/ markdown for MDX compatibility (void elements, bare braces, HTML comments, autolinks, bare <tags>)
 	@./tools/check-docs-mdx
 
+# Parser-level docs gate — runs the SAME MDX parser Fern does over every
+# published doc, so a construct that would abort `fern generate --docs` at
+# publish time fails here instead. This is the authoritative check;
+# check-docs-mdx above is a fast, dependency-free approximation kept as a
+# strict subset of it.
+#
+# Part of `make lint` (and therefore `make qualify`). It needs Node 20+ and one
+# `npm ci` of the locked tree in tools/mdx. With Node installed, a local
+# `make qualify` predicts CI as usual; WITHOUT it this check warns and skips, so
+# a local pass no longer implies a CI pass and invalid MDX can still be rejected
+# by the merge-gate `docs-mdx` job, where a missing Node is a HARD FAILURE.
+.PHONY: check-docs-mdx-parse
+check-docs-mdx-parse: ## Validates docs/ with the real MDX parser (requires Node; CI-blocking)
+	@./tools/check-docs-mdx-parse
+
 .PHONY: lint-go
 lint-go: ## Lints Go files with golangci-lint and go vet
 	@set -e; \
 	echo "Running go vet..."; \
-	GOFLAGS="-mod=vendor" go vet ./...; \
+	GOFLAGS="-mod=readonly" go vet ./...; \
 	echo "Running golangci-lint..."; \
-	GOFLAGS="-mod=vendor" golangci-lint -c .golangci.yaml run --timeout=$(LINT_TIMEOUT)
+	GOFLAGS="-mod=readonly" golangci-lint -c .golangci.yaml run --timeout=$(LINT_TIMEOUT)
 
 .PHONY: lint-yaml
 lint-yaml: ## Lints YAML files with yamllint
@@ -173,12 +193,14 @@ LICENSE_IGNORES = \
 	-ignore '**/*pb2*' \
 	-ignore 'bundles/**' \
 	-ignore 'dist/**' \
-	-ignore 'vendor/**' \
 	-ignore '**/testdata/**' \
 	-ignore 'recipes/evidence/*.yaml' \
 	-ignore 'recipes/evidence/*/*/*.yaml' \
 	-ignore 'THIRD_PARTY_NOTICES.md' \
-	-ignore '.licenses-cache/**'
+	-ignore 'validators/performance/licenses/**' \
+	-ignore '.licenses-cache/**' \
+	-ignore 'tools/mdx/node_modules/**' \
+	-ignore '.github/actions/setup-dgxc-goproxy/**'
 
 # The two recipes/evidence patterns in LICENSE_IGNORES match exactly the
 # generated, header-less pointer shapes MarshalPointer emits — the transient
@@ -199,9 +221,37 @@ license: ## Add/verify license headers in source files
 #### so unrelated MPL-2.0 deps still fail closed for review. The go-cleanhttp /
 #### go-retryablehttp pair, and the HashiCorp Vault client subtree (#1577, the
 #### hashivault:// KMS signing provider), are the approved exceptions.
+####
+#### go-licenses identifies standard library packages by matching their source
+#### path against go/build's GOROOT, which is empty in a binary linked with
+#### -trimpath. With an empty GOROOT the prefix collapses to "/", EVERY package
+#### looks like stdlib, and this gate inspects nothing yet still exits 0 — a
+#### silent false PASS. Resolve GOROOT explicitly below so the check cannot pass
+#### vacuously regardless of how go-licenses was installed.
+####
+#### STDLIB_IGNORE passes FULL stdlib package paths. It used to pipe through
+#### `cut -d'/' -f1`, keeping only the first path segment — which yields the bare
+#### token `go` (from `go/ast`, `go/build`, ...). `--ignore` matches by PREFIX, so
+#### that token also matched every third-party module under `go.opentelemetry.io`,
+#### `go.yaml.in` and `go.uber.org`: 32 packages silently exempt from this policy
+#### gate. Same bug #2384 fixed in tools/generate-notices; this is the other copy.
+#### Full paths cannot collide that way.
+####
+#### The three in-toto/json-canonicalization ignores below are the counterpart to
+#### that PR's LICENSE_OVERRIDES: go-licenses cannot classify their LICENSE files,
+#### and `check` has no override mechanism. They are NOT undisclosed — `make
+#### notices` emits all three from committed Apache-2.0 copies, and its
+#### completeness gate fails the build if any linked package is missing an entry.
 license-check: ## Check license is approved
 	@echo "Checking license headers..."
-	@STDLIB_IGNORE=$$(go list std 2>/dev/null | cut -d'/' -f1 | sort -u | paste -sd ',' -) && \
+	@set -e; \
+	GOROOT="$$(go env GOROOT)"; \
+	if [ -z "$$GOROOT" ] || [ ! -d "$$GOROOT" ]; then \
+	    echo "ERROR: could not resolve a usable GOROOT via 'go env GOROOT'." >&2; \
+	    exit 1; \
+	fi; \
+	export GOROOT; \
+	STDLIB_IGNORE=$$(go list std 2>/dev/null | sort -u | paste -sd ',' -) && \
 	go-licenses check ./... \
         --allowed_licenses=MIT,BSD-2-Clause,BSD-3-Clause,Apache-2.0,ISC,Zlib \
         --ignore=github.com/hashicorp/go-cleanhttp \
@@ -214,6 +264,9 @@ license-check: ## Check license is approved
         --ignore=github.com/hashicorp/go-secure-stdlib/strutil \
         --ignore=github.com/hashicorp/go-sockaddr \
         --ignore=github.com/hashicorp/hcl \
+        --ignore=github.com/in-toto/attestation \
+        --ignore=github.com/in-toto/in-toto-golang \
+        --ignore=github.com/cyberphone/json-canonicalization \
         --ignore=$$STDLIB_IGNORE
 
 .PHONY: test-shell
@@ -223,13 +276,32 @@ test-shell: ## Runs shell unit tests (tools/*_test.sh; hermetic, no cluster)
 # validators/ tests run as part of `make test` but are excluded from the
 # coverage.out this target emits: per-package coverage there runs 41-92%
 # (see #1752), which would pull the project-wide gate from ~80% to ~75.8%.
+#
+# ---------------------------------------------------------------------------
+# Every `go` invocation in this file sets GOFLAGS explicitly. That looks
+# redundant — `-mod=readonly` is already Go's default — but it is not: assigning
+# GOFLAGS REPLACES whatever the developer has in their environment or in
+# `go env -w`.
+#
+# These recipes carried `GOFLAGS="-mod=vendor"` until #2374 for the vendor mode,
+# and were silently relying on that second effect. Removing the pins outright
+# exposed it: with an ambient `GOFLAGS=-trimpath`, `runtime.Caller` returns
+# trimmed paths, so the `repositoryPath` helper in tests/notices and
+# tests/releasepolicy resolves the repo root to the literal module path
+# "github.com/NVIDIA/aicr" and every file open fails. Reproduced and confirmed —
+# both suites fail with ambient -trimpath and pass with GOFLAGS assigned.
+#
+# So: keep the assignment. It pins the resolution mode AND makes these targets
+# independent of ambient Go configuration, which is what `make test` behaving
+# the same everywhere depends on.
+# ---------------------------------------------------------------------------
 .PHONY: test
 test: test-shell ## Runs unit tests with race detector and coverage (use -short to skip integration tests)
 	@set -e; \
 	echo "Running tests with race detector..."; \
 	KUBEBUILDER_ASSETS=$$(setup-envtest use -p path 2>/dev/null || echo "") \
 	AICR_CRITERIA_STRICT=1 \
-	GOFLAGS="-mod=vendor" go test -short -count=1 -race -timeout=$(TEST_TIMEOUT) -covermode=atomic -coverprofile=coverage.full.out $$(go list ./... | grep -v -e /tests/chainsaw/) || exit 1; \
+	GOFLAGS="-mod=readonly" go test -short -count=1 -race -timeout=$(TEST_TIMEOUT) -covermode=atomic -coverprofile=coverage.full.out $$(go list ./... | grep -v -e /tests/chainsaw/) || exit 1; \
 	grep -v '^github.com/NVIDIA/aicr/validators/' coverage.full.out > coverage.out; \
 	echo "Test coverage:"; \
 	go tool cover -func=coverage.out | tail -1
@@ -261,7 +333,7 @@ test-coverage: check-coverage-threshold test ## Runs tests and enforces coverage
 .PHONY: bench
 bench: ## Runs benchmarks
 	@echo "Running benchmarks..."
-	@GOFLAGS="-mod=vendor" go test -bench=. -benchmem ./...
+	@GOFLAGS="-mod=readonly" go test -bench=. -benchmem ./...
 
 .PHONY: e2e
 e2e: ## Runs end-to-end integration tests (CLI only)
@@ -287,8 +359,12 @@ scan: ## Scans for vulnerabilities with grype
 	echo "Running vulnerability scan..."; \
 	grype dir:. --config .grype.yaml --fail-on high --quiet
 
+.PHONY: api-diff
+api-diff: ## Checks pkg/client/v1 and transparent-alias target compatibility against the latest stable release
+	@bash tools/api-diff
+
 .PHONY: qualify
-qualify: test-coverage lint tuning-check e2e scan license-check ## Qualifies the codebase (test-coverage, lint, tuning-check, e2e, scan)
+qualify: test-coverage lint tuning-check coverage-check e2e scan license-check api-diff ## Qualifies the codebase (test-coverage, lint, tuning-check, coverage-check, e2e, scan, API compatibility)
 	@echo "Codebase qualification completed"
 
 .PHONY: bom
@@ -298,7 +374,7 @@ bom: ## Generates container image BOM (CycloneDX 1.6 + Markdown) at $(BOM_OUT_DI
 	AICR_VERSION="$${AICR_VERSION:-$$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"; \
 	mkdir -p "$${BOM_OUT_DIR}"; \
 	echo "Generating BOM into $${BOM_OUT_DIR}..."; \
-	GOFLAGS="-mod=vendor" go run ./tools/bom \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
 	  -repo-root "$(CURDIR)" \
 	  -out-dir "$(CURDIR)/$${BOM_OUT_DIR}" \
 	  -aicr-version "$${AICR_VERSION}" \
@@ -323,7 +399,7 @@ bom-docs: ## Regenerates the auto-generated section of $(BOM_DOC_PATH) from the 
 	TMP="$$(mktemp -d)"; \
 	trap 'rm -rf "$$TMP"' EXIT; \
 	echo "Regenerating auto-generated section of $(BOM_DOC_PATH) (helm rendering, ~30s)..."; \
-	GOFLAGS="-mod=vendor" go run ./tools/bom \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
 	  -repo-root "$(CURDIR)" \
 	  -out-dir "$$TMP" \
 	  -aicr-version "main" \
@@ -351,20 +427,28 @@ bom-check: ## Verifies $(BOM_DOC_PATH) is up to date with the live registry (opt
 # Path of the committed CUJ/CLI coverage matrix. Fully regenerated by
 # `make coverage-docs`, checked-fresh by `make coverage-check`, and refreshed
 # weekly by the coverage-matrix-refresh GitHub Action.
+#
+# The generator reads only in-repo signals (no network, no cluster), so the
+# freshness check is cheap enough to gate directly — unlike `bom-check`, which
+# re-renders every Helm chart. It runs in `make qualify` and, on PRs touching its
+# inputs, in the merge gate's coverage-freshness job. An enrolled cloud whose
+# uat-<cloud>.yaml has no enabled runner step fails the generator (and therefore
+# qualify); opt that cloud out with `nightly-intents: []` in
+# infra/uat/reservations.yaml.
 COVERAGE_DOC_PATH := docs/user/coverage-matrix.md
 
 .PHONY: coverage-docs
 coverage-docs: ## Regenerates $(COVERAGE_DOC_PATH) from the CLI registry and in-repo test signals
 	@set -e; \
 	echo "Regenerating $(COVERAGE_DOC_PATH) from the CLI registry and test signals..."; \
-	GOFLAGS="-mod=vendor" go run ./tools/coverage \
+	GOFLAGS="-mod=readonly" go run ./tools/coverage \
 	  -repo-root "$(CURDIR)" \
 	  -out "$(CURDIR)/$(COVERAGE_DOC_PATH)" \
 	  -deterministic; \
 	echo "Updated $(COVERAGE_DOC_PATH)"
 
 .PHONY: coverage-check
-coverage-check: ## Verifies $(COVERAGE_DOC_PATH) is up to date (opt-in; not wired into qualify/lint/merge gate)
+coverage-check: ## Verifies $(COVERAGE_DOC_PATH) is up to date (run by qualify and the merge gate)
 	@set -e; \
 	$(MAKE) coverage-docs; \
 	if ! git diff --quiet -- $(COVERAGE_DOC_PATH); then \
@@ -374,18 +458,58 @@ coverage-check: ## Verifies $(COVERAGE_DOC_PATH) is up to date (opt-in; not wire
 	fi; \
 	echo "$(COVERAGE_DOC_PATH) is up to date"
 
+VERSION_MATRIX_DOC_PATH := docs/user/component-version-matrix.md
+
+.PHONY: version-matrix-docs
+version-matrix-docs: ## Regenerates the component version matrix in $(VERSION_MATRIX_DOC_PATH) from git history
+	@set -e; \
+	if ! grep -q '<!-- BEGIN AICR-VERSION-MATRIX -->' $(VERSION_MATRIX_DOC_PATH) || \
+	   ! grep -q '<!-- END AICR-VERSION-MATRIX -->' $(VERSION_MATRIX_DOC_PATH); then \
+	   echo "ERROR: $(VERSION_MATRIX_DOC_PATH) is missing AICR-VERSION-MATRIX markers." >&2; exit 1; \
+	fi; \
+	TMP="$$(mktemp -d)"; \
+	trap 'rm -rf "$$TMP"' EXIT; \
+	{ ./tools/upgrade-matrix --releases 8; echo; echo "## Transitions"; echo; \
+	  ./tools/upgrade-matrix --releases 8 --transitions; } > "$$TMP/matrix.md"; \
+	awk -v body="$$TMP/matrix.md" ' \
+	  /<!-- BEGIN AICR-VERSION-MATRIX -->/ { print; while ((getline line < body) > 0) print line; close(body); skip = 1; next } \
+	  /<!-- END AICR-VERSION-MATRIX -->/   { skip = 0 } \
+	  !skip                                { print } \
+	' $(VERSION_MATRIX_DOC_PATH) > "$$TMP/merged.md"; \
+	mv "$$TMP/merged.md" $(VERSION_MATRIX_DOC_PATH); \
+	echo "Updated $(VERSION_MATRIX_DOC_PATH)"
+
 .PHONY: bom-pinning-check
 bom-pinning-check: ## Verifies every Helm component in the registry has a pinned chart version (per ADR-006)
 	@set -e; \
 	echo "Verifying chart-version pins (ADR-006)..."; \
 	TMP="$$(mktemp -d)"; \
 	trap 'rm -rf "$$TMP"' EXIT; \
-	GOFLAGS="-mod=vendor" go run ./tools/bom \
+	GOFLAGS="-mod=readonly" go run ./tools/bom \
 	  -repo-root "$(CURDIR)" \
 	  -out-dir "$$TMP" \
 	  -aicr-version "qualify" \
 	  -strict \
 	  -skip-helm
+
+.PHONY: registry-inventory
+registry-inventory: ## Extracts the build/CI registry & package egress inventory (YAML + Markdown) from structured sources
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory \
+	  -repo-root "$(CURDIR)" \
+	  -out-dir "$${REGISTRY_OUT_DIR:-dist/registry-inventory}"
+
+.PHONY: registry-check
+registry-check: ## Fails if a build/CI source reaches a registry host absent from tools/registry-inventory/registry-allowlist.yaml
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory -repo-root "$(CURDIR)" -check
+
+# Committed host-level egress doc. Regenerated by `make registry-docs`, checked
+# fresh by TestCommittedRegistryEgressDocFresh under `make test`.
+REGISTRY_DOC_PATH := docs/contributor/registry-egress.md
+
+.PHONY: registry-docs
+registry-docs: ## Regenerates $(REGISTRY_DOC_PATH) from the live build/CI sources
+	@GOFLAGS="-mod=readonly" go run ./tools/registry-inventory \
+	  -repo-root "$(CURDIR)" -doc-out "$(REGISTRY_DOC_PATH)"
 
 # Path of the committed recipe-health matrix doc. Regenerated by
 # `make recipe-health-docs`, checked-fresh by `make recipe-health-check`.
@@ -399,7 +523,7 @@ HEALTH_DOC_PATH := docs/user/recipe-health.md
 SUMMARY_OUT ?= /dev/stdout
 
 .PHONY: recipe-health-docs
-recipe-health-docs: ## Regenerates the auto-generated section of $(HEALTH_DOC_PATH) from the recipe catalog (hermetic, no network)
+recipe-health-docs: ## Regenerates the auto-generated section of $(HEALTH_DOC_PATH) from the recipe catalog
 	@set -e; \
 	if [ ! -f $(HEALTH_DOC_PATH) ]; then \
 	   echo "ERROR: $(HEALTH_DOC_PATH) does not exist; cannot splice." >&2; exit 1; \
@@ -410,8 +534,8 @@ recipe-health-docs: ## Regenerates the auto-generated section of $(HEALTH_DOC_PA
 	fi; \
 	TMP="$$(mktemp -d)"; \
 	trap 'rm -rf "$$TMP"' EXIT; \
-	echo "Regenerating auto-generated section of $(HEALTH_DOC_PATH) (hermetic, no network)..."; \
-	GOFLAGS="-mod=vendor" go run ./tools/health \
+	echo "Regenerating auto-generated section of $(HEALTH_DOC_PATH)..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/health \
 	  -out-dir "$$TMP" \
 	  -aicr-version "main" \
 	  -deterministic \
@@ -429,7 +553,7 @@ recipe-health-summary: ## Renders the per-dimension structural detail to $(SUMMA
 	@set -e; \
 	TMP="$$(mktemp -d)"; \
 	trap 'rm -rf "$$TMP"' EXIT; \
-	GOFLAGS="-mod=vendor" go run ./tools/health \
+	GOFLAGS="-mod=readonly" go run ./tools/health \
 	  -out-dir "$$TMP" \
 	  -summary-out "$(SUMMARY_OUT)" \
 	  -aicr-version "main" \
@@ -448,11 +572,11 @@ recipe-health-check: ## Verifies $(HEALTH_DOC_PATH) is up to date with the recip
 	echo "$(HEALTH_DOC_PATH) is up to date"
 
 # Path of the committed nodewright tuning-status doc. Regenerated by
-# `make tuning-docs`, checked-fresh by `make tuning-check`. Hermetic (no network).
+# `make tuning-docs`, checked-fresh by `make tuning-check`.
 TUNING_DOC_PATH := docs/integrator/components/nodewright.md
 
 .PHONY: tuning-docs
-tuning-docs: ## Regenerates the auto-generated tuning-status table in $(TUNING_DOC_PATH) from the recipe catalog (hermetic, no network)
+tuning-docs: ## Regenerates the auto-generated tuning-status table in $(TUNING_DOC_PATH) from the recipe catalog
 	@set -e; \
 	if [ ! -f $(TUNING_DOC_PATH) ]; then \
 	   echo "ERROR: $(TUNING_DOC_PATH) does not exist; cannot splice." >&2; exit 1; \
@@ -463,8 +587,8 @@ tuning-docs: ## Regenerates the auto-generated tuning-status table in $(TUNING_D
 	fi; \
 	TMP="$$(mktemp -d)"; \
 	trap 'rm -rf "$$TMP"' EXIT; \
-	echo "Regenerating tuning-status table in $(TUNING_DOC_PATH) (hermetic, no network)..."; \
-	GOFLAGS="-mod=vendor" go run ./tools/tuning \
+	echo "Regenerating tuning-status table in $(TUNING_DOC_PATH)..."; \
+	GOFLAGS="-mod=readonly" go run ./tools/tuning \
 	  -out-dir "$$TMP" \
 	  -aicr-version "main" \
 	  -deterministic \
@@ -492,7 +616,7 @@ tuning-check: ## Verifies $(TUNING_DOC_PATH) tuning-status table is up to date (
 server: ## Starts a local development server with debug logging
 	@set -e; \
 	echo "Starting local development server..."; \
-	GOFLAGS="-mod=vendor" LOG_LEVEL=debug go run cmd/aicrd/main.go
+	GOFLAGS="-mod=readonly" LOG_LEVEL=debug go run cmd/aicrd/main.go
 
 .PHONY: docs
 docs: ## Serves Go documentation on http://localhost:6060
@@ -505,7 +629,7 @@ docs: ## Serves Go documentation on http://localhost:6060
 .PHONY: testgrid-publish
 testgrid-publish: ## Build testgrid-publish binary to ./dist/testgrid-publish
 	@mkdir -p ./dist
-	GOFLAGS="-mod=vendor" go build -o ./dist/testgrid-publish ./tools/testgrid-publish
+	GOFLAGS="-mod=readonly" go build -o ./dist/testgrid-publish ./tools/testgrid-publish
 
 .PHONY: testgrid-publish-dryrun
 testgrid-publish-dryrun: testgrid-publish ## Dry-run testgrid-publish against BUNDLE_DIR (usage: make testgrid-publish-dryrun BUNDLE_DIR=<path>)
@@ -524,13 +648,20 @@ image: ## Builds and pushes container image (IMAGE_REGISTRY, IMAGE_TAG)
 	echo "Building and pushing image to $(IMAGE_REGISTRY)/aicr:$(IMAGE_TAG)"; \
 	KO_DOCKER_REPO=$(IMAGE_REGISTRY) ko build --bare --sbom=none --tags=$(IMAGE_TAG) ./cmd/aicr
 
+.PHONY: validator-binaries
+validator-binaries: ## Builds Linux validator binaries (VALIDATOR_PHASES, VALIDATOR_ARCHES)
+	@VALIDATOR_PHASES="$(VALIDATOR_PHASES)" VALIDATOR_ARCHES="$(VALIDATOR_ARCHES)" \
+		./tools/build-validator-binaries
+
 .PHONY: image-validators
 image-validators: build ## Builds per-phase validator images (IMAGE_REGISTRY, IMAGE_TAG)
 	@set -e; \
+	arch="$$(go env GOARCH)"; \
+	VALIDATOR_ARCHES="$${arch}" ./tools/build-validator-binaries; \
 	for phase in deployment performance conformance; do \
 		echo "Building validator image: $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG)"; \
 		docker build -f validators/$${phase}/Dockerfile \
-			--build-arg GO_VERSION=$(GO_VERSION) \
+			--build-arg TARGETARCH=$${arch} \
 			-t $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG) .; \
 		if [ -n "$(IMAGE_REGISTRY)" ] && [ "$(IMAGE_REGISTRY)" != "localhost:5005" ]; then \
 			echo "Pushing: $(IMAGE_REGISTRY)/aicr-validators/$${phase}:$(IMAGE_TAG)"; \
@@ -609,6 +740,10 @@ validate-local: image-validators ## Builds validator images and runs validation 
 	AICR_VALIDATOR_IMAGE_REGISTRY=$(IMAGE_REGISTRY) $$AICR_BIN validate \
 		--recipe "$(RECIPE)" \
 		--phase deployment
+
+.PHONY: python-licenses
+python-licenses: ## Refreshes the committed Python license section for the aiperf-bench image (needs network)
+	@python3 tools/generate-python-licenses
 
 .PHONY: notices
 notices: ## Generates THIRD_PARTY_NOTICES.md aggregating every dependency's license
@@ -753,7 +888,19 @@ cluster-create: ## Creates local Kind cluster with registry
 		echo "     or: go install sigs.k8s.io/kind@latest"; \
 		exit 1; \
 	fi
-	ctlptl apply -f $(CTLPTL_CONFIG_FILE)
+	@if ! command -v yq >/dev/null 2>&1; then \
+		echo "Error: yq is not installed."; \
+		echo "Install: brew install yq"; \
+		echo "     or: go install github.com/mikefarah/yq/v4@latest"; \
+		exit 1; \
+	fi
+	@if [ -z "$(KIND_NODE_IMAGE)" ]; then \
+		echo "Error: could not resolve testing.kind_node_image from .settings.yaml."; \
+		echo "Check the key exists and .settings.yaml is valid YAML."; \
+		exit 1; \
+	fi
+	@echo "Pinning Kind node image: $(KIND_NODE_IMAGE) (from .settings.yaml)"
+	img="$(KIND_NODE_IMAGE)" yq eval-all '(select(.kind == "Cluster") | .kindV1Alpha4Cluster.nodes[]).image = strenv(img)' $(CTLPTL_CONFIG_FILE) | ctlptl apply -f -
 	@echo "Waiting for nodes to be ready..."
 	@kubectl wait --for=condition=ready nodes --all --timeout=300s
 	@echo "Cluster created. Registry at localhost:$(REGISTRY_PORT)"
@@ -787,10 +934,6 @@ cluster-status: ## Shows cluster and registry status
 KWOK_VERSION ?= $(shell yq -r '.testing_tools.kwok' .settings.yaml 2>/dev/null)
 ifeq ($(KWOK_VERSION),)
 KWOK_VERSION := v0.7.0
-endif
-KIND_NODE_IMAGE ?= $(shell yq -r '.testing.kind_node_image' .settings.yaml 2>/dev/null)
-ifeq ($(KIND_NODE_IMAGE),)
-KIND_NODE_IMAGE := kindest/node:v1.32.0
 endif
 CTLPTL_KWOK_CONFIG_FILE := .ctlptl-kwok.yaml
 
@@ -1001,6 +1144,10 @@ endif
 .PHONY: component-cleanup
 component-cleanup: ## Clean up component test resources (COMPONENT=cert-manager [DELETE_CLUSTER=true])
 	@COMPONENT=$${COMPONENT:-} DELETE_CLUSTER=$${DELETE_CLUSTER:-false} KEEP_CLUSTER=$${KEEP_CLUSTER:-false} bash tools/component-test/cleanup.sh
+
+.PHONY: k8s-aibom-test
+k8s-aibom-test: build ## Prove k8s-aibom AIBOM generation, reconciliation, and cleanup on Kind
+	@bash tools/k8s-aibom-test/run.sh
 
 # =============================================================================
 # Combined Development Targets

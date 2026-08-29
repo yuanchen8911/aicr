@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/NVIDIA/aicr/pkg/allocpolicy"
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/recipe"
@@ -59,32 +60,22 @@ const (
 )
 
 // Component names and hydrated-value paths the policy resolution reads.
+// The vocabulary is owned by the canonical descriptor (pkg/allocpolicy) —
+// these are aliases, not a second copy, so a descriptor expansion cannot
+// silently diverge from what resolution reads (ADR-015 GKE amendment).
 const (
-	// draDriverGPUComponentName is the registry name of the NVIDIA DRA
-	// driver component whose resources.gpus.enabled value is THE whole-GPU
-	// allocation switch.
-	draDriverGPUComponentName = "nvidia-dra-driver-gpu"
-	// gpuOperatorComponentName is the registry name of the GPU operator
-	// component whose devicePlugin.enabled value pins the device-plugin
-	// advertiser.
-	gpuOperatorComponentName = "gpu-operator"
-	// gpuOperatorOCPComponentName is the OpenShift GPU operator component:
-	// OCP recipes disable gpu-operator and carry this instead; its values
-	// pin devicePlugin.enabled the same way.
-	gpuOperatorOCPComponentName = "gpu-operator-ocp"
+	draDriverGPUComponentName    = allocpolicy.ComponentDRADriver
+	draDriverGPUOCPComponentName = allocpolicy.ComponentDRADriverOCP
+	gpuOperatorComponentName     = allocpolicy.ComponentGPUOperator
+	gpuOperatorOCPComponentName  = allocpolicy.ComponentGPUOperatorOCP
 
-	// valuePathGPUsEnabled is the DRA driver's full-GPU allocation switch.
-	valuePathGPUsEnabled = "resources.gpus.enabled"
-	// valuePathGPUsEnabledOverride is the DRA driver chart's install-guard
-	// waiver. It is NOT a mode input — only a validity gate: the upstream
-	// chart refuses gpus.enabled=true without it.
-	valuePathGPUsEnabledOverride = "gpuResourcesEnabledOverride"
-	// valuePathDevicePluginEnabled is the GPU operator's device-plugin
-	// toggle (the whole-GPU extended-resource advertiser).
-	valuePathDevicePluginEnabled = "devicePlugin.enabled"
+	valuePathGPUsEnabled         = allocpolicy.PathDRAGPUsEnabled
+	valuePathGPUsEnabledOverride = allocpolicy.PathDRAGPUsEnabledOverride
+	valuePathDevicePluginEnabled = allocpolicy.PathDevicePluginEnabled
 	// valuePathComputeDomainsEnabled is the DRA driver's ComputeDomain/IMEX
 	// toggle. Not a policy input — pinned true in every allocation policy
-	// (load-bearing for GB200/MNNVL); the catalog sweep guards the pin.
+	// (load-bearing for GB200/MNNVL); the catalog sweep guards the pin. It
+	// is deliberately NOT a descriptor selector path.
 	valuePathComputeDomainsEnabled = "resources.computeDomains.enabled"
 )
 
@@ -102,23 +93,40 @@ const (
 //
 // The device-plugin advertiser is read from an enabled gpu-operator OR
 // gpu-operator-ocp componentRef (OCP recipes disable the former and carry the
-// latter); if both are enabled, gpu-operator wins with a warning. When
-// NEITHER is present and enabled, there is no device-plugin advertiser at all
-// — externally managed advertisers are an explicit #1327 non-goal.
+// latter); if both are enabled then ErrCodeInvalidRequest (#1685) — two GPU
+// operators collide at the operand level regardless of allocation policy,
+// and failing closed beats silently preferring one (a divergent
+// devicePlugin.enabled across the two would otherwise slip through).
+//
+// When NEITHER is present and enabled, there is
+// no device-plugin advertiser at all — INFERRING an externally managed
+// advertiser from that absence is an explicit #1327 non-goal. An advertiser
+// declared explicitly via metadata.selectedProfile.advertiser: external
+// (ADR-015 GKE amendment) IS supported and handled by the external-advertiser
+// branch below.
 //
 // Validity gates (ErrCodeInvalidRequest, fail closed at resolution time):
+//
+//   - an ENABLED gpu-operator and an ENABLED gpu-operator-ocp causes
+//     automatic rejection. Both GPU operators enabled: reject (#1685) — two
+//     operators collide at the operand level.
+//
 //   - an ENABLED nvidia-dra-driver-gpu component with resources.gpus.enabled
 //     ABSENT: the chart's declared default (true) would diverge from any
 //     silent resolution — the switch must be explicitly true or false.
+//
 //   - gpus.enabled=true with gpuResourcesEnabledOverride=false: the upstream
 //     chart install guard rejects this combination.
+//
 //   - no whole-GPU advertiser: gpus.enabled explicitly false (or the DRA
 //     component absent/disabled) AND no usable device-plugin advertiser
 //     (devicePlugin.enabled=false, or no enabled GPU operator component).
+//
 //   - gpus.enabled=true with devicePlugin.enabled=true: dual advertisement —
 //     both mechanisms advertising whole GPUs on the same nodes risks GPU
 //     over-admission; exactly one advertiser is required. (Transitional
 //     warning until the production-default flip; an error since.)
+//
 //   - gpus.enabled=false with gpuResourcesEnabledOverride=true: the inert
 //     waiver disarms the chart-guard tripwire that protects the
 //     device-plugin default. (Transitional warning until the
@@ -140,6 +148,18 @@ func ResolveGPUAllocationPolicy(parent context.Context, r *recipe.RecipeResult) 
 		return GPUAllocationPolicyUnspecified, nil
 	}
 
+	// Validate the advertiser vocabulary up front: typed Go callers can hand
+	// the resolver a RecipeResult that never passed artifact decoding (where
+	// the vocabulary gate otherwise lives), and only the exact "external"
+	// string reaches the declared-advertiser branch below — an unknown
+	// non-empty advertiser ("External", "csp") must fail closed here, not
+	// fall through and resolve as an ordinary undeclared recipe (ADR-015).
+	if r.Metadata.SelectedProfile != nil {
+		if err := allocpolicy.ValidateAdvertiser(r.Metadata.SelectedProfile.Advertiser); err != nil {
+			return "", err
+		}
+	}
+
 	// Hydration reads through the recipe's DataProvider (embedded data or a
 	// --data directory); bound it so a hung backing store cannot stall the
 	// caller indefinitely.
@@ -149,6 +169,14 @@ func ResolveGPUAllocationPolicy(parent context.Context, r *recipe.RecipeResult) 
 	gpusEnabled := false
 	overrideWaiver := false
 	draRef := enabledComponentRef(r, draDriverGPUComponentName)
+	if ocpRef := enabledComponentRef(r, draDriverGPUOCPComponentName); ocpRef != nil {
+		if draRef != nil {
+			slog.Warn("both nvidia-dra-driver-gpu and nvidia-dra-driver-gpu-ocp are enabled in the recipe; resolving resources.gpus.enabled from nvidia-dra-driver-gpu",
+				"preferred", draDriverGPUComponentName, "ignored", draDriverGPUOCPComponentName)
+		} else {
+			draRef = ocpRef
+		}
+	}
 	if draRef != nil {
 		values, err := r.GetValuesForComponentWithContext(ctx, draRef.Name)
 		if err != nil {
@@ -180,24 +208,33 @@ func ResolveGPUAllocationPolicy(parent context.Context, r *recipe.RecipeResult) 
 	// The device-plugin advertiser comes from an ENABLED GPU operator
 	// component — gpu-operator, or gpu-operator-ocp on OpenShift recipes
 	// (which disable gpu-operator). No enabled operator component means no
-	// device-plugin advertiser: externally managed advertisers are an
-	// explicit #1327 non-goal, so devicePluginEnabled stays false and the
-	// row-6 gate below fails closed when DRA is not the configured
-	// mechanism either.
+	// device-plugin advertiser: INFERRING an external advertiser from that
+	// absence is an explicit #1327 non-goal (a DECLARED advertiser:
+	// external takes the dedicated branch below instead), so
+	// devicePluginEnabled stays false and the row-6 gate below fails
+	// closed when DRA is not the configured mechanism either.
 	devicePluginEnabled := false
 	// operatorName feeds diagnostics: on OpenShift recipes the advertiser is
 	// gpu-operator-ocp, and error guidance must name the component actually
 	// carrying devicePlugin.enabled.
 	operatorName := gpuOperatorComponentName
+	// A declared external advertiser takes the dedicated branch below.
+	// The #1685 rejection above guarantees at most one operator component
+	// is enabled by the time either path reads devicePlugin.enabled.
+	externalAdvertiser := r.Metadata.SelectedProfile != nil &&
+		r.Metadata.SelectedProfile.Advertiser == allocpolicy.AdvertiserExternal
 	opRef := enabledComponentRef(r, gpuOperatorComponentName)
-	if ocpRef := enabledComponentRef(r, gpuOperatorOCPComponentName); ocpRef != nil {
+	ocpRef := enabledComponentRef(r, gpuOperatorOCPComponentName)
+	if ocpRef != nil {
 		if opRef != nil {
-			slog.Warn("both gpu-operator and gpu-operator-ocp are enabled in the recipe; resolving devicePlugin.enabled from gpu-operator",
-				"preferred", gpuOperatorComponentName, "ignored", gpuOperatorOCPComponentName)
-		} else {
-			opRef = ocpRef
-			operatorName = gpuOperatorOCPComponentName
+			// Both GPU operators enabled: reject (#1685) — two operators collide at the operand level.
+			return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+				"invalid GPU allocation configuration: components %q and %q are both enabled — two GPU operators collide at the operand level; enable exactly one (OpenShift recipes disable %q and carry %q) (issue #1685)",
+				gpuOperatorComponentName, gpuOperatorOCPComponentName,
+				gpuOperatorComponentName, gpuOperatorOCPComponentName))
 		}
+		opRef = ocpRef
+		operatorName = gpuOperatorOCPComponentName
 	}
 	if opRef != nil {
 		values, err := r.GetValuesForComponentWithContext(ctx, opRef.Name)
@@ -212,39 +249,58 @@ func ResolveGPUAllocationPolicy(parent context.Context, r *recipe.RecipeResult) 
 		}
 	}
 
+	// A declared external advertiser (ADR-015 GKE amendment) counts as THE
+	// advertiser in the exactly-one invariant. The dual-advertisement gates
+	// extend to it through the shared tuple evaluator, fail closed; the
+	// resolved policy value is unchanged — the external plugin still
+	// provides nvidia.com/gpu through a device plugin, and the policy enum
+	// names the request mechanism, not provider ownership. Never inferred:
+	// only metadata.selectedProfile.advertiser produces this branch.
+	if externalAdvertiser {
+		// Under a declared external advertiser EVERY enabled operator
+		// component is a potential second advertiser, so the reading is
+		// the devicePlugin.enabled of any enabled operator component. The
+		// #1685 reject above guarantees at most one operator component is
+		// enabled here, so devicePluginEnabled — read from the surviving
+		// opRef above — already carries the aggregation the pre-#1685
+		// code performed across both components.
+		externalDevicePluginEnabled := devicePluginEnabled
+
+		observation := allocpolicy.Observation{
+			Advertiser:          allocpolicy.AdvertiserExternal,
+			DevicePluginEnabled: &externalDevicePluginEnabled,
+			DRAGPUsEnabled:      &gpusEnabled,
+		}
+		if draRef != nil {
+			observation.DRAGPUsEnabledOverride = &overrideWaiver
+		}
+		if err := allocpolicy.CheckCoherence(observation); err != nil {
+			return "", err
+		}
+		return GPUAllocationPolicyDevicePluginExtendedResource, nil
+	}
+
+	// Verdicts (chart guard, dual advertisement, no advertiser, inert
+	// waiver) come from the single shared #1327 tuple evaluator, so the
+	// hydrating artifact gate (pkg/recipe checkAdvertiserCoherence) and
+	// this resolver apply the same #1327 tuple verdicts — an artifact the
+	// gate emits passes the same tuple rows this resolver accepts
+	// (ADR-015 gate/resolver symmetry over the shared tuple rows; the
+	// #1685 dual-operator rejection above is resolver-side only and not
+	// mirrored at the gate). Only the policy SELECTION below stays here.
+	observation := allocpolicy.Observation{
+		DevicePluginEnabled:  &devicePluginEnabled,
+		GPUOperatorComponent: operatorName,
+	}
+	if draRef != nil {
+		observation.DRAGPUsEnabled = &gpusEnabled
+		observation.DRAGPUsEnabledOverride = &overrideWaiver
+	}
+	if err := allocpolicy.CheckCoherence(observation); err != nil {
+		return "", err
+	}
 	if gpusEnabled {
-		if !overrideWaiver {
-			return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
-				"invalid GPU allocation configuration: %s %s=true requires %s=true — the upstream chart install guard rejects this combination; set both in the recipe overlay (issue #1327)",
-				draDriverGPUComponentName, valuePathGPUsEnabled, valuePathGPUsEnabledOverride))
-		}
-		if devicePluginEnabled {
-			return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
-				"invalid GPU allocation configuration: dual advertisement — %s %s=true and %s %s=true both advertise whole GPUs, risking GPU over-admission; exactly one advertiser is required. For the production default set %s=false (with %s=false); for the experimental DRA opt-in flip all three values together: %s=true, %s=true, and %s %s=false (issue #1327)",
-				draDriverGPUComponentName, valuePathGPUsEnabled,
-				operatorName, valuePathDevicePluginEnabled,
-				valuePathGPUsEnabled, valuePathGPUsEnabledOverride,
-				valuePathGPUsEnabled, valuePathGPUsEnabledOverride,
-				operatorName, valuePathDevicePluginEnabled))
-		}
 		return GPUAllocationPolicyDRAResourceClaim, nil
-	}
-
-	if !devicePluginEnabled {
-		return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
-			"invalid GPU allocation configuration: no whole-GPU advertiser — %s %s is false/absent, and the device plugin is unavailable (%s/%s absent or disabled in the recipe, or %s=false); enable exactly one mechanism in the recipe overlay (issue #1327)",
-			draDriverGPUComponentName, valuePathGPUsEnabled,
-			gpuOperatorComponentName, gpuOperatorOCPComponentName,
-			valuePathDevicePluginEnabled))
-	}
-
-	if draRef != nil && overrideWaiver {
-		return "", errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
-			"invalid GPU allocation configuration: %s %s=true with %s=false is an inert waiver that disarms the upstream chart's install-guard tripwire protecting the device-plugin default; set %s=false for the production default, or — for the experimental DRA opt-in — flip all three values together: %s=true, %s=true, and %s %s=false (issue #1327)",
-			draDriverGPUComponentName, valuePathGPUsEnabledOverride, valuePathGPUsEnabled,
-			valuePathGPUsEnabledOverride,
-			valuePathGPUsEnabled, valuePathGPUsEnabledOverride,
-			operatorName, valuePathDevicePluginEnabled))
 	}
 	return GPUAllocationPolicyDevicePluginExtendedResource, nil
 }

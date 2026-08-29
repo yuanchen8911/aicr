@@ -30,8 +30,7 @@ import (
 
 // hasErrorCode checks if an error contains a StructuredError with the given code.
 func hasErrorCode(err error, code errors.ErrorCode) bool {
-	var structuredErr *errors.StructuredError
-	if stderrors.As(err, &structuredErr) {
+	if structuredErr, ok := stderrors.AsType[*errors.StructuredError](err); ok {
 		return structuredErr.Code == code
 	}
 	return false
@@ -341,8 +340,14 @@ func TestTemplateWriter_ContextCanceled(t *testing.T) {
 		t.Fatal("expected error for canceled context")
 	}
 
-	if !hasErrorCode(err, errors.ErrCodeTimeout) {
-		t.Errorf("expected ErrCodeTimeout, got: %v", err)
+	// CANCELED, not TIMEOUT: this test previously pinned the latter, which
+	// made a deliberate abort report transient and re-enterable by a caller's
+	// retry loop. errors.IsTransient is the property that actually matters.
+	if !hasErrorCode(err, errors.ErrCodeCanceled) {
+		t.Errorf("expected ErrCodeCanceled, got: %v", err)
+	}
+	if errors.IsTransient(err) {
+		t.Error("a canceled template execution reports transient; a retry loop would re-enter on an operator abort")
 	}
 }
 

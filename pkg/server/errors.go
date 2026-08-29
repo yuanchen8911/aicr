@@ -16,6 +16,7 @@ package server
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"time"
 
@@ -76,6 +77,11 @@ func httpStatusFromCode(code aicrerrors.ErrorCode) int {
 		return http.StatusGatewayTimeout
 	case aicrerrors.ErrCodeConflict:
 		return http.StatusConflict
+	case aicrerrors.ErrCodeCanceled:
+		// Client-closed-request semantics; 499 is non-standard, so the
+		// closest standard code for "the request was abandoned" is used.
+		// This code originates in CLI paths and should not reach a handler.
+		return http.StatusRequestTimeout
 	case aicrerrors.ErrCodeInternal:
 		fallthrough
 	default:
@@ -89,7 +95,9 @@ func retryableFromCode(code aicrerrors.ErrorCode) bool {
 		aicrerrors.ErrCodeUnauthorized,
 		aicrerrors.ErrCodeNotFound,
 		aicrerrors.ErrCodeMethodNotAllowed,
-		aicrerrors.ErrCodeConflict:
+		aicrerrors.ErrCodeConflict,
+		// A deliberate abort is not retryable: the caller asked to stop.
+		aicrerrors.ErrCodeCanceled:
 		return false
 	case aicrerrors.ErrCodeTimeout,
 		aicrerrors.ErrCodeUnavailable,
@@ -107,12 +115,8 @@ func mergeDetails(a, b map[string]any) map[string]any {
 		return nil
 	}
 	out := make(map[string]any, len(a)+len(b))
-	for k, v := range a {
-		out[k] = v
-	}
-	for k, v := range b {
-		out[k] = v
-	}
+	maps.Copy(out, a)
+	maps.Copy(out, b)
 	return out
 }
 
@@ -131,8 +135,7 @@ func WriteErrorFromErr(w http.ResponseWriter, r *http.Request, err error, fallba
 		return
 	}
 
-	var se *aicrerrors.StructuredError
-	if errors.As(err, &se) {
+	if se, ok := errors.AsType[*aicrerrors.StructuredError](err); ok {
 		msg := se.Message
 		if msg == "" {
 			msg = fallbackMessage

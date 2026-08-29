@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,19 @@ func TestBundleCmd(t *testing.T) {
 		if !flagNames[flag] {
 			t.Errorf("expected flag %q to be defined", flag)
 		}
+	}
+}
+
+func TestBundleCmdRejectsRepeatedSharedStorageClass(t *testing.T) {
+	err := bundleCmd().Run(t.Context(), []string{
+		"bundle",
+		"--shared-storage-class", "rwx-one",
+		"--shared-storage-class", "rwx-two",
+	})
+	if err == nil || !strings.Contains(err.Error(),
+		"flag --shared-storage-class can only be specified once") {
+
+		t.Fatalf("bundle command error = %v, want repeated shared storage class rejection", err)
 	}
 }
 
@@ -627,10 +641,8 @@ func TestValidateSigningKeyExclusivity_ConfigSourcedConflict(t *testing.T) {
 func TestBundleCmd_SigningKeyFlag(t *testing.T) {
 	cmd := bundleCmd()
 	for _, flag := range cmd.Flags {
-		for _, name := range flag.Names() {
-			if name == flagSigningKey {
-				return
-			}
+		if slices.Contains(flag.Names(), flagSigningKey) {
+			return
 		}
 	}
 	t.Errorf("expected flag %q to be defined", flagSigningKey)

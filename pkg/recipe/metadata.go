@@ -36,13 +36,26 @@ const RecipeMetadataKind = "RecipeMetadata"
 // RecipeResultKind is the kind value for RecipeResult resources.
 const RecipeResultKind = "RecipeResult"
 
-// RecipeAPIVersion is the API version for recipe metadata and result resources.
-// It aliases the canonical header.GroupVersion (single source of truth).
-const RecipeAPIVersion = header.GroupVersion
+// RecipeResultAPIVersion is the API version stamped on a default resolved
+// RecipeResult. RecipeResult is on the ADR-022 stable artifact track, so this
+// aliases header.StableGroupVersion; the track's target is
+// header.GroupVersionV1.
+const RecipeResultAPIVersion = header.StableGroupVersion
+
+// RecipeMetadataAPIVersion is the API version expected on an authored catalog
+// RecipeMetadata or RecipeMixin. Those are on the ADR-022 authoring track, so
+// this aliases header.AuthoringGroupVersion; the track's target is
+// header.GroupVersionV1Beta1.
+//
+// This is deliberately a separate constant from RecipeResultAPIVersion even
+// though both carry aicr.run/v1alpha2 today: ADR-022 sends the two kinds to
+// different targets, so a single shared constant could not be flipped.
+const RecipeMetadataAPIVersion = header.AuthoringGroupVersion
 
 // ConfiguredRecipeResultAPIVersion is the strict RecipeResult schema used
-// when typed desired-state configuration is present.
-const ConfiguredRecipeResultAPIVersion = header.RecipeResultGroupVersion
+// when typed desired-state configuration is present. It is on the ADR-022
+// profile-bearing track; the track's target is header.GroupVersionV1Beta2.
+const ConfiguredRecipeResultAPIVersion = header.ProfileGroupVersion
 
 // GPUDriverState values recorded in RecipeResult.Metadata.GPUDriverState
 // by snapshot-driven resolution (see pkg/client/v1 gpu_driver_state.go).
@@ -554,6 +567,47 @@ func (r *RecipeResult) backfillComponentTypes() error {
 	return nil
 }
 
+// NormalizeKind canonicalizes the artifact kind of an externally-supplied
+// RecipeResult so the artifact this build emits is always stamped with the
+// canonical kind, whatever legacy shape the caller sent. It is applied at the
+// ingest boundary that adopts a decoded RecipeResult (client adoptRecipe,
+// reached by POST /v1/bundle, POST /v2/bundle, and Client.AdoptRecipe) —
+// never on the resolve path, which stamps the header itself.
+//
+// Accept liberally, emit canonically:
+//   - an absent or empty kind (legacy artifacts predating the discriminator)
+//     and the legacy "Recipe" value this API contract published from v0.14.0
+//     through v0.18.0 are rewritten to RecipeResultKind;
+//   - RecipeResultKind passes through unchanged;
+//   - any other value is rejected with ErrCodeInvalidRequest.
+//
+// Without the rewrite a legacy kind survived into the generated bundle's
+// recipe.yaml (Kind has no omitempty), and LoadFromFileWithProvider rejects
+// "Recipe" — so a bundle generated from such a body could not be fed back
+// through "aicr bundle -r" or "aicr validate -r". Rejecting an unknown kind
+// matches DecodeRecipeResult (the strict v2 decode path) and the kind values
+// LoadFromFileWithProvider accepts for a hydrated artifact, so no boundary
+// silently emits an artifact it would not read back. (The file loader also
+// accepts RecipeMetadata, but as an overlay to hydrate rather than as a
+// RecipeResult; that input shape has no analog on this boundary.) Only Kind is
+// normalized: APIVersion is validated against the kind/schema-scoped read
+// window and never rewritten. See ADR-022 and issue #1953.
+func (r *RecipeResult) NormalizeKind() error {
+	if r == nil {
+		return nil
+	}
+	legacyKind := header.KindRecipe.String()
+	switch r.Kind {
+	case "", RecipeResultKind, legacyKind:
+		r.Kind = RecipeResultKind
+		return nil
+	default:
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("recipe has kind %q, but %q is required; an absent kind and the legacy %q value are accepted and normalized",
+				r.Kind, RecipeResultKind, legacyKind))
+	}
+}
+
 // PrepareAndValidate normalizes a RecipeResult's component refs and rejects
 // incoherent ones, in the required order: validate the profile contract;
 // reject refs named with the reserved deployer override key (all refs, enabled
@@ -956,6 +1010,27 @@ type RecipeResult struct {
 	// via BindDataProvider and consume read-only without going through
 	// ownership-checked entry points.
 	owner *Builder
+
+	// resolvedValues pins per-component effective Helm values for the
+	// duration of one operation, keyed by component name. Set only by
+	// WithResolvedValues (which returns a shallow copy — a builder-produced
+	// result is never pinned in place); nil on every other result, in which
+	// case GetValuesForComponent* resolves through the DataProvider as
+	// before. See WithResolvedValues for why read-once matters.
+	resolvedValues map[string]map[string]any
+
+	// declaredComponents carries the recipe's PRE-filter component union
+	// for the duration of one operation. Set only by
+	// WithDeclaredComponents (shallow copy, like resolvedValues); nil on
+	// every other result, in which case DeclaredComponentRefs falls back
+	// to ComponentRefs. The bundler filters ComponentRefs (recipe
+	// enabled=false, --set enabled=false, the bundlers filter) before
+	// running component validations, so a cross-component gate that
+	// needs another component's declaration as EVIDENCE — not as output
+	// — would otherwise lose it: a bundlers=nvsentinel subset bundle
+	// dropped the gpu-operator ref whose driver.enabled=false is exactly
+	// what the NVSentinel gates key on. See DeclaredComponentRefs.
+	declaredComponents []ComponentRef
 }
 
 // DataProvider returns the DataProvider that produced this result. A
@@ -1075,6 +1150,8 @@ func (r *RecipeResult) DeepCopy() *RecipeResult {
 		// AssertOwnedBy rejects it. The facade's AdoptRecipe path rebinds
 		// the provider but does not rebind owner — adopted recipes can be
 		// read but not consumed via ownership-checked entry points.
+		// resolvedValues intentionally left nil: a pinned snapshot scopes one
+		// operation's read-once view, so an independent copy resolves fresh.
 	}
 
 	// Metadata: scalar fields, the SelectedProfile
@@ -1115,6 +1192,14 @@ func (r *RecipeResult) DeepCopy() *RecipeResult {
 				accounting := *r.Configuration.Slurm.Accounting
 				out.Configuration.Slurm.Accounting = &accounting
 			}
+		}
+		// Every pointer under RecipeConfiguration needs a clause here.
+		// Omitting one does not alias it, it drops it: the copy keeps the
+		// component overrides a selection applied while losing the record
+		// explaining them, and Client.AdoptRecipe always deep-copies.
+		if r.Configuration.RuntimeInventory != nil {
+			runtimeInventory := *r.Configuration.RuntimeInventory
+			out.Configuration.RuntimeInventory = &runtimeInventory
 		}
 	}
 

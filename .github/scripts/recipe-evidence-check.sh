@@ -694,6 +694,24 @@ while IFS= read -r slug; do
           verify_ok=false
           warnings=$((warnings + 1))
           ;;
+        3)
+          # Verification could not complete — the bundle was not readable
+          # (dead mount, unreachable registry). Distinct from exit 2: nothing
+          # was proven about the bundle, so this reports as an infrastructure
+          # condition rather than ":x: invalid", which would read to a
+          # contributor as "your evidence is bad".
+          if [[ "$cause_class" == "canceled" ]]; then
+            verify_cell=":black_square_for_stop: verification aborted (no verdict)"
+          else
+            verify_cell=":hourglass_flowing_sand: not verifiable (infrastructure)"
+          fi
+          if [[ -n "$cause_class" ]]; then
+            verify_cell="${verify_cell} — ${cause_class}"
+            [[ -n "$cause_hint" ]] && verify_cell="${verify_cell}: $(md_escape "$cause_hint")"
+          fi
+          verify_ok=false
+          warnings=$((warnings + 1))
+          ;;
         *)
           verify_cell=":x: verify error (result exit ${result_exit})"
           verify_ok=false
@@ -796,10 +814,11 @@ fi
     echo
     echo '```shell'
     echo "aicr snapshot -o snapshot.yaml"
-    echo "# Profiled families (AKS gpuStack): capture the pool projection and"
-    echo "# hydrate the recipe with the pointer's recorded 'profile:' selection"
-    echo "# first — validating the raw overlay resolves only the declaration"
-    echo "# default, and 'aicr validate' has no --profile flag:"
+    echo "# Profiled families (AKS/GKE gpuStack): hydrate the recipe with the"
+    echo "# pointer's recorded 'profile:' selection first — validating the raw"
+    echo "# overlay resolves only the declaration default, and 'aicr validate'"
+    echo "# has no --profile flag. AKS additionally needs the pool projection"
+    echo "# (GKE uses the plain snapshot above):"
     echo "#   az aks nodepool list -g <rg> --cluster-name <cluster> -o json > pools.json"
     echo "#   aicr snapshot --aks-gpu-pools pools.json -o snapshot.yaml"
     echo "#   aicr recipe -s snapshot.yaml --intent <intent> [--platform <platform>] \\"

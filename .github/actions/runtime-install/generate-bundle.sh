@@ -20,6 +20,13 @@ rm -rf bundle
 BUNDLE_ARGS=(
   --recipe recipe.yaml
   --accelerated-node-toleration nvidia.com/gpu:NoSchedule
+  # No NVSentinel override: the kind overlay assigns
+  # labeler.assumeDriverInstalled itself (#2181). Kind recipes are
+  # deliberately host-installed (nvkind: driver.enabled=false, driver
+  # preinstalled on the host, no driver pod for the NVSentinel labeler to
+  # observe), so the value is required — it is now supplied by the recipe
+  # rather than by this caller, and CheckNVSentinelDriverLabelDetectable
+  # verifies it.
   --output bundle
 )
 

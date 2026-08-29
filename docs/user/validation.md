@@ -38,6 +38,7 @@ any phase. If pre-flight fails, no validator Jobs are deployed.
 - `kubectl` configured for the target cluster (validator dispatches K8s Jobs; pre-flight only needs the snapshot).
 - Cluster service account with RBAC to create Jobs, ConfigMaps, and read cluster state (AICR creates its own `aicr-validation` namespace on first run).
 - **AKS profiled recipes**: the readiness pre-flight re-evaluates the recipe's profile constraint (`K8s.aks-gpu-pools.gpu-driver`), so the snapshot must carry that reading — capture it with `aicr snapshot --aks-gpu-pools <az dump>`, or pass the same flag to `aicr validate` when it captures live. A snapshot without the reading fails readiness closed (exit 2).
+- **GKE recipes**: the readiness pre-flight re-evaluates the recipe's `gpuStack` profile constraint over the GPU-node set (nodes carrying `cloud.google.com/gke-accelerator`): the default `gke-default` value requires that **no** GPU node carries the opt-out label `gke-no-default-nvidia-gpu-device-plugin` (GKE's managed plugin stays the `nvidia.com/gpu` advertiser), while `bundle-installer` requires every GPU node to carry `gke-no-default-nvidia-gpu-device-plugin=true` (so the GPU Operator's plugin is the sole advertiser). The check fails closed (exit 2) on labels contradicting the selected value, mixed labels, malformed or ambiguous label readings, a snapshot with no identifiable GPU nodes, and when `--max-nodes-per-entry` actually truncated a participating label reading (a truncated node list cannot prove set membership — regenerate without the flag; a cap larger than the node count truncates nothing and validates normally). No provider projection flag is needed on GKE — the constraint reads node labels the standard snapshot already carries. See [GKE GPU Setup](../integrator/gke-gpu-setup.md#gpu-device-plugin-ownership) for the full setup and the qualification matrix.
 
 ## Training performance validation
 
@@ -528,7 +529,7 @@ exits 8 by default, and is informational only under `--fail-on-error=false`.)
 | **B** | `inference-perf` is selected but `dynamo-platform` is not in recipe `componentRefs` | `skipped - dynamo-platform not in recipe components` |
 | **C** | `dynamo-platform` is declared but the `DynamoGraphDeployment` CRD is not installed on the cluster (operator not deployed yet) | `skipped - DynamoGraphDeployment CRD not installed on cluster (dynamo-platform component declared but operator not deployed yet)` |
 
-Guards fire before any cluster mutation, so skips are cheap (typically < 10 s).
+Guards fire before any cluster mutation, so skips are cheap (typically `< 10 s`).
 
 ## Configured GPU allocation policy
 
@@ -548,23 +549,32 @@ The `nvidia-dra-driver-gpu` value `resources.gpus.enabled` is the switch:
 absent or disabled — resolves `device-plugin-extended-resource`. On an
 **enabled** DRA component the switch must be explicitly set: the upstream
 chart's declared default is `true`, so an absent value would diverge from
-what Helm deploys. Three configurations are rejected at resolution time with
-an invalid-request error: an enabled `nvidia-dra-driver-gpu` component with
+what Helm deploys. These configurations are rejected at resolution time with
+an invalid-request error:
+
+* an enabled `nvidia-dra-driver-gpu` component with
 `resources.gpus.enabled` absent (pin it explicitly in the recipe; stock
-recipes always do), `gpus.enabled=true` without
-`gpuResourcesEnabledOverride=true` (the upstream chart install guard refuses
-it), and no whole-GPU advertiser remaining — `gpus.enabled` off with the GPU
-operator component (`gpu-operator`, or `gpu-operator-ocp` on OpenShift
-recipes) absent, disabled, or carrying `devicePlugin.enabled=false`. Two
-further states are likewise rejected (they warned during the transition to
-the device-plugin production default and are errors since the flip): dual
-advertisement (both mechanisms enabled — exactly one whole-GPU advertiser is
-required) and an inert `gpuResourcesEnabledOverride=true` with
-`gpus.enabled=false` (the waiver would disarm the upstream chart's
-install-guard tripwire). Stock recipes ship the production default:
-`gpus.enabled=false`, `gpuResourcesEnabledOverride=false`, and
-`devicePlugin.enabled=true`; the experimental DRA opt-in flips all three
-together in a recipe overlay.
+recipes always do).
+* `gpus.enabled=true` without `gpuResourcesEnabledOverride=true` (the upstream
+chart install guard refuses it), and no whole-GPU advertiser remaining.
+* `gpus.enabled` off with the GPU operator component (`gpu-operator`, or
+`gpu-operator-ocp` on OpenShift recipes) absent, disabled, or carrying
+`devicePlugin.enabled=false`.
+* A recipe enabling both `gpu-operator` and `gpu-operator-ocp`; two GPU
+operators collide at the operand level; enable exactly one (OpenShift recipes
+disable gpu-operator and carry gpu-operator-ocp).
+
+Two further states are likewise rejected (they warned during the transition to
+the device-plugin production default and are errors since the flip):
+
+* dual advertisement (both mechanisms enabled — exactly one whole-GPU advertiser
+is required)
+* an inert `gpuResourcesEnabledOverride=true` with `gpus.enabled=false` (the
+waiver would disarm the upstream chart's install-guard tripwire).
+
+Stock recipes ship the production default: `gpus.enabled=false`,
+`gpuResourcesEnabledOverride=false`, and `devicePlugin.enabled=true`; the
+experimental DRA opt-in flips all three together in a recipe overlay.
 
 **Upgrading a cluster from the dual-advertised (pre-flip) configuration:**
 applying the flipped bundle does not drain existing workloads — a running
@@ -843,13 +853,13 @@ error codes (see [`pkg/errors/exitcode.go`](https://github.com/NVIDIA/aicr/blob/
 |------|---------|
 | `0` | All phases reported status `passed` or `skipped` |
 | `2` | Invalid input or request (`ErrCodeInvalidRequest`) — bad CLI flag, malformed argument, a validator rejecting a recipe value (e.g., an inference constraint that uses the wrong comparator direction), or a **readiness pre-flight** constraint not met. The readiness gate always fails closed with this code, even under `--fail-on-error=false` |
-| `5` | CLI-layer timeout *before* a check runs — snapshot-agent Job never completes within `--timeout`, or the validator Job as a whole exceeds its wait deadline |
-| `8` | One or more phases reported status `failed` **or** `other` (a check that crashed, hit an OOM, or exceeded `activeDeadlineSeconds`), including per-check internal timeouts (e.g., DynamoGraphDeployment not ready within `InferenceWorkloadReadyTimeout`). Suppressed by `--fail-on-error=false` |
+| `5` | A structured `ErrCodeTimeout` reached the top-level CLI — for example while loading the recipe or snapshot, waiting on the snapshot-agent Job, or signing evidence under `--emit-attestation --push` (which runs after the checks). A per-validator wait deadline does **not** reach this code: `runPhase` converts that error into a check result, so it surfaces as exit `8` (see note 2) |
+| `8` | One or more phases reported status `failed` (a check that returned a failure verdict — exit code `1` — or, in most cases, a validator Job killed on `activeDeadlineSeconds` — see the note below) **or** `other` (an indeterminate outcome — the check produced no usable verdict; a crash or OOM are the common examples, as is a validator Job that failed for a non-deadline reason with no inspectable pod), including per-check internal timeouts (e.g., DynamoGraphDeployment not ready within `InferenceWorkloadReadyTimeout`). Suppressed by `--fail-on-error=false` |
 
 > **Important:** two subtleties to be aware of when gating a pipeline on exit code:
 >
-> 1. Both `failed` and `other` are blocking. A phase whose status is `other` (check crashed, pod OOM, `activeDeadlineSeconds` exceeded) drives the same non-zero exit as `failed` — an inconclusive check fails closed rather than passing silently. `--fail-on-error=false` suppresses **both** result-driven exits (the run reports the outcomes in the CTRF report and exits 0); it does not distinguish `failed` from `other`.
-> 2. Exit 5 is narrower than it sounds. A timeout **inside** a check's own logic (DynamoGraphDeployment not ready, inference endpoint never healthy, AIPerf Job pod-wait deadline) surfaces as a failed phase, not as a structured `ErrCodeTimeout`, so the CLI exits **8**. Only timeouts at the CLI-to-cluster layer (snapshot-agent wait, validator-Job wait) retain their `ErrCodeTimeout` classification all the way through to exit 5.
+> 1. Both `failed` and `other` are blocking. A phase whose status is `other` — the check produced no usable verdict, e.g. a crash, an OOM, or a Job that failed for a non-deadline reason with its pod already gone — drives the same non-zero exit as `failed` — an inconclusive check fails closed rather than passing silently. `--fail-on-error=false` suppresses **both** result-driven exits (the run reports the outcomes in the CTRF report and exits 0); it does not distinguish `failed` from `other`. A validator Job killed on `activeDeadlineSeconds` normally reports `failed` rather than `other`: its terminal `Failed/DeadlineExceeded` condition is a verdict, so the result names the deadline instead of the missing pod. One narrow exception remains — the CLI waits `activeDeadlineSeconds` plus a 30s buffer for the Job to become terminal, and that buffer equals the validator pod's termination grace period, so a validator that consumes its full grace can exhaust the wait before the condition is stamped. Such a run falls back to the CLI-wait path and still reports `other`.
+> 2. Exit 5 is narrower than it sounds. A timeout **inside** a check's own logic (DynamoGraphDeployment not ready, inference endpoint never healthy, AIPerf Job pod-wait deadline) surfaces as a failed phase, not as a structured `ErrCodeTimeout`, so the CLI exits **8**. So does a per-validator wait deadline: `runPhase` hands that error to the timeout handler and records the outcome as a check result rather than propagating it, which is the same path the full-grace exception in note 1 takes. The rule, rather than a list of sources: exit 5 applies whenever an `ErrCodeTimeout` reaches the top-level CLI. A timeout that is converted into a check result instead — whether raised inside a check or by a per-validator wait — surfaces as exit 8.
 
 Scripts that gate on validation outcome should treat **any non-zero code** as
 failure rather than branching on specific values, and should additionally
@@ -899,7 +909,9 @@ aicr validate \
   --toleration dedicated=worker-workload:NoExecute
 ```
 
-These flags affect the inner benchmark pods that run on GPU nodes (NCCL workers, Dynamo workers), not the validator orchestrator Job itself. For `inference-perf` specifically, `--node-selector` narrows the pool of candidate GPU nodes — the validator then picks the candidate with the most free GPUs (subtracting same-ledger occupancy only — DRA allocations from DRA capacity, device-plugin requests from device-plugin capacity — and skipping DRA candidates that carry scalar `nvidia.com/gpu` workloads) and pins all Dynamo Frontend + worker pods to that node via `kubernetes.io/hostname`. The AIPerf benchmark runner pod is CPU-only, uses a tolerate-all / no-nodeSelector pod spec, and is unaffected by these flags.
+These flags affect the inner benchmark pods that run on GPU nodes (NCCL workers, Dynamo workers). The example above supplies `--snapshot`, so it does not launch the live snapshot agent. When `--snapshot` is omitted, the flags also configure that preliminary agent. With no toleration override, the agent tolerates all taints; an explicit `spec.validate.agent.tolerations: []` clears that default. Neither flag affects the validator orchestrator Job itself.
+
+For `inference-perf` specifically, `--node-selector` narrows the pool of candidate GPU nodes — the validator then picks the candidate with the most free GPUs (subtracting same-ledger occupancy only — DRA allocations from DRA capacity, device-plugin requests from device-plugin capacity — and skipping DRA candidates that carry scalar `nvidia.com/gpu` workloads) and pins all Dynamo Frontend + worker pods to that node via `kubernetes.io/hostname`. The AIPerf benchmark runner pod is CPU-only, uses a tolerate-all / no-nodeSelector pod spec, and is unaffected by these flags.
 
 ### A check reports `skipped` unexpectedly
 

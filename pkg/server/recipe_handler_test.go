@@ -54,7 +54,7 @@ func newProfileTestHandler(t *testing.T) *recipeHandler {
 		t.Fatalf("setup overlays directory: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "registry.yaml"),
-		[]byte("components: []\n"), 0o600); err != nil {
+		[]byte("apiVersion: aicr.run/v1alpha2\nkind: ComponentRegistry\ncomponents: []\n"), 0o600); err != nil {
 		t.Fatalf("setup registry.yaml: %v", err)
 	}
 	overlay := []byte(`apiVersion: aicr.run/v1alpha3
@@ -638,7 +638,7 @@ func TestHandleRecipes_SlurmAccountingModeRoutes(t *testing.T) {
 			method:      http.MethodGet,
 			target:      "/v1/recipe?service=eks&accelerator=h100&intent=training&os=ubuntu&platform=slurm",
 			wantStatus:  http.StatusOK,
-			wantVersion: recipe.RecipeAPIVersion,
+			wantVersion: recipe.RecipeResultAPIVersion,
 		},
 		{
 			name:        "v2 GET accepts accounting mode",
@@ -1002,30 +1002,159 @@ func TestHandleQuery_SelectorNotFound(t *testing.T) {
 	}
 }
 
-// TestHandleQuery_NoSelector verifies a query with no selector returns the
-// entire hydrated recipe structure (as the legacy handler does).
-func TestHandleQuery_NoSelector(t *testing.T) {
+// TestHandleQuery_SelectorPresence verifies an omitted selector is rejected
+// while an explicitly empty selector returns the entire hydrated recipe.
+func TestHandleQuery_SelectorPresence(t *testing.T) {
 	h := newTestHandler(t, nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/query?service=eks&accelerator=h100&intent=training", nil)
-	w := httptest.NewRecorder()
-
-	h.HandleQuery(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	tests := []struct {
+		name       string
+		target     string
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name:       "missing selector",
+			target:     "/v1/query?service=eks&accelerator=h100&intent=training",
+			wantStatus: http.StatusBadRequest,
+			wantError:  "[INVALID_REQUEST] selector is required on /v1/query",
+		},
+		{
+			name:       "explicitly empty selector",
+			target:     "/v1/query?service=eks&accelerator=h100&intent=training&selector=",
+			wantStatus: http.StatusOK,
+		},
 	}
-	var hydrated map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &hydrated); err != nil {
-		t.Fatalf("failed to decode hydrated recipe: %v; body: %s", err, w.Body.String())
-	}
-	if _, ok := hydrated["components"]; !ok {
-		t.Errorf("expected hydrated recipe to contain a components key; got keys %v", keysOf(hydrated))
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.target, nil)
+			w := httptest.NewRecorder()
+
+			h.HandleQuery(w, req)
+
+			if w.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			if tt.wantError != "" {
+				errResp := decodeErrorBody(t, w.Body.Bytes())
+				if errResp.Code != "INVALID_REQUEST" {
+					t.Errorf("code = %q, want INVALID_REQUEST", errResp.Code)
+				}
+				if got := errResp.Details[keyError]; got != tt.wantError {
+					t.Errorf("details.error = %q, want %q", got, tt.wantError)
+				}
+				return
+			}
+
+			var hydrated map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &hydrated); err != nil {
+				t.Fatalf("failed to decode hydrated recipe: %v; body: %s", err, w.Body.String())
+			}
+			if _, ok := hydrated["components"]; !ok {
+				t.Errorf("expected hydrated recipe to contain a components key; got keys %v", keysOf(hydrated))
+			}
+		})
 	}
 }
 
 // TestHandleQuery_MethodNotAllowed verifies non GET/POST returns 405 with an
 // Allow header.
+// TestHandleRecipes_EmptyCriteriaRejected verifies that GET and POST /v1/recipe
+// with no criteria dimensions (Specificity()==0) return 400 "no criteria provided"
+// rather than silently resolving to the base recipe.
+func TestHandleRecipes_EmptyCriteriaRejected(t *testing.T) {
+	h := newTestHandler(t, nil)
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   string
+	}{
+		{
+			name:   "GET with no criteria params",
+			method: http.MethodGet,
+			target: "/v1/recipe",
+		},
+		{
+			name:   "POST with empty criteria object",
+			method: http.MethodPost,
+			target: "/v1/recipe",
+			body:   `{"kind":"RecipeCriteria","spec":{}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req *http.Request
+			if tt.body != "" {
+				req = httptest.NewRequest(tt.method, tt.target, strings.NewReader(tt.body))
+				req.Header.Set("Content-Type", "application/json")
+			} else {
+				req = httptest.NewRequest(tt.method, tt.target, nil)
+			}
+			w := httptest.NewRecorder()
+			h.HandleRecipes(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "no criteria provided") {
+				t.Errorf("body = %q, want it to contain %q", w.Body.String(), "no criteria provided")
+			}
+		})
+	}
+}
+
+// TestHandleQuery_EmptyCriteriaRejected is a regression test that verifies
+// /v1/query applies the same minimum-specificity guard as /v1/recipe and the
+// CLI. A request with no criteria dimensions (Specificity()==0) must return
+// 400 rather than silently resolving and returning the base recipe's value.
+func TestHandleQuery_EmptyCriteriaRejected(t *testing.T) {
+	h := newTestHandler(t, nil)
+
+	tests := []struct {
+		name   string
+		method string
+		target string
+		body   string
+	}{
+		{
+			name:   "GET with only selector — no criteria",
+			method: http.MethodGet,
+			target: "/v1/query?selector=components.gpu-operator.values.driver.version",
+		},
+		{
+			name:   "POST with empty criteria object",
+			method: http.MethodPost,
+			target: "/v1/query",
+			body:   `{"criteria":{},"selector":"components.gpu-operator.values.driver.version"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req *http.Request
+			if tt.body != "" {
+				req = httptest.NewRequest(tt.method, tt.target, strings.NewReader(tt.body))
+				req.Header.Set("Content-Type", "application/json")
+			} else {
+				req = httptest.NewRequest(tt.method, tt.target, nil)
+			}
+			w := httptest.NewRecorder()
+			h.HandleQuery(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "no criteria provided") {
+				t.Errorf("body = %q, want it to contain %q", w.Body.String(), "no criteria provided")
+			}
+		})
+	}
+}
+
 func TestHandleQuery_MethodNotAllowed(t *testing.T) {
 	h := newTestHandler(t, nil)
 
@@ -1093,7 +1222,7 @@ func TestNormalizeLegacyRecipeResultDoesNotMutateBorrowedResult(t *testing.T) {
 
 		t.Fatal("normalizeLegacyRecipeResult() mutated borrowed result")
 	}
-	if projected.Configuration != nil || projected.APIVersion != recipe.RecipeAPIVersion {
+	if projected.Configuration != nil || projected.APIVersion != recipe.RecipeResultAPIVersion {
 		t.Errorf("legacy projection = %#v, want v1alpha2 without configuration", projected)
 	}
 	if projected.DataProvider() != provider {

@@ -8,6 +8,7 @@ Runbooks for testing and demonstrating AICR end-to-end workflows on live cluster
 |------|-------------|
 | [cuj1-training.md](cuj1-training.md) | CUJ1 (training) - EKS + GKE end-to-end, plus a config-driven GKE + signed-evidence variant |
 | [cuj1-slinky-slurm.md](cuj1-slinky-slurm.md) | CUJ1 - Slinky Slurm on EKS / GKE / Kind (recipe → bundle → validate → `srun`) |
+| [slinky-slurm-demo.html](slinky-slurm-demo.html) | CUJ1 Slinky Slurm — slide deck |
 | [cuj2-inference.md](cuj2-inference.md) | CUJ2 (inference) - EKS + GKE end-to-end with the Dynamo platform |
 | [cuj2-demo.md](cuj2-demo.md) | CUJ2 (inference) - Annotated slide-style demo walkthrough (training vs inference) |
 | [recipe-data-architecture.md](recipe-data-architecture.md) | Recipe metadata system: inheritance, criteria matching, deployment order, runtime external data |
@@ -26,6 +27,18 @@ Runbooks for testing and demonstrating AICR end-to-end workflows on live cluster
 | [dynamic.md](dynamic.md) | Dynamic install-time values (cluster-values.yaml split, install-time override, OCI artifact) |
 | [private-signing.md](private-signing.md) | Private/enterprise signing & verification (self-hosted Sigstore, KMS-backed, headless OIDC) |
 | [examples/CUJ2-Test-Report.md](examples/CUJ2-Test-Report.md) | Dated historical capture (2026-03-13) of a CUJ2 inference run — example test report, not a runbook |
+
+## Workload Samples
+
+Deployable manifests used by the demos above and by conformance evidence collection. Each carries its prerequisites and setup commands in its header.
+
+| Sample | Description |
+|--------|-------------|
+| [workloads/inference/vllm-agg.yaml](workloads/inference/vllm-agg.yaml) | Dynamo vLLM aggregated inference (DynamoGraphDeployment); pulls an ungated Hugging Face model, no credential required. **Caution:** also applies a cluster-scoped `Queue/dynamo` with `parentQueue: default-parent-queue` and zeroed quotas. Where `dynamo-platform` is installed it creates that same queue with `parentQueue: dynamo-default` and `quota: -1`, so applying this manifest silently repoints the platform's queue and rescopes every workload in it — and deleting the `dynamo-workload` namespace cannot revert a cluster-scoped object. Remove the `Queue` document from your copy of the manifest before applying on such a cluster (do not delete the live queue — it belongs to the platform). |
+| [workloads/inference/nimservice-llama-3-2-1b.yaml](workloads/inference/nimservice-llama-3-2-1b.yaml) | NIM inference via the NGC model path; requires two secrets as written — `ngc-api-secret` (`authSecret`, holding `NGC_API_KEY` for model download) and `ngc-pull-secret` (`image.pullSecrets`, for the `nvcr.io` pull) |
+| [workloads/inference/nimservice-hf-nocred.yaml](workloads/inference/nimservice-hf-nocred.yaml) | NIM inference via an `hf://` model; no NGC credential required (see [NIM workload credentials](../docs/user/component-catalog.md#nim-workload-credentials)) |
+| [workloads/inference/vllm-metrics-test.yaml](workloads/inference/vllm-metrics-test.yaml) | Standalone vLLM server with a Prometheus ServiceMonitor, used for AI Service Metrics evidence collection; no credential required |
+| [workloads/training/gke-nccl-test-tcpxo.yaml](workloads/training/gke-nccl-test-tcpxo.yaml) | NCCL all-reduce bandwidth test for GKE TCPXO fabric |
 
 ## Recording Test Runs
 

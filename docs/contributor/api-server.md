@@ -122,7 +122,7 @@ and serializes the `ErrorResponse` shape (`code`, `message`, `details`,
 
 Critical rule, enforced at this single chokepoint:
 
-> Embed `Cause.Error()` in `details["error"]` **only when status < 500**.
+> Embed `Cause.Error()` in `details["error"]` **only when `status < 500`**.
 > 4xx errors typically carry validator feedback the client needs;
 > 5xx errors carry internal paths, kubeconfig contents, or upstream
 > service hostnames that must not leak.
@@ -151,7 +151,7 @@ field is wired in one place.
 | `/` | GET | Lists registered routes (unmatched paths route here via `ServeMux`) |
 | `/health` | GET | Liveness — always 200 if the process is running |
 | `/ready` | GET | Readiness — 503 with `reason` until `setReady(true)`, 200 after |
-| `/metrics` | GET | Prometheus exposition (`promhttp.Handler()`) |
+| `/metrics` | GET, HEAD | Prometheus exposition (`promhttp.Handler()` behind `readOnly`, which rejects other methods with a structured 405) |
 | `/v1/recipe` | GET, POST | Resolve recipe from criteria → `RecipeResult` JSON |
 | `/v1/query` | GET, POST | Resolve recipe, hydrate values, return value at `?selector=path` |
 | `/v1/bundle` | POST | Adopt `RecipeResult` body, generate bundle, stream zip |
@@ -183,7 +183,7 @@ Environment variables read at startup:
 | `AICR_SIGNING_CONFIG_PATH` | unset | `parseSigningConfig` (both modes; Rekor v2) |
 | `AICR_TLOG_UPLOAD` | `true` | `parseSigningConfig` (Mode A only) |
 | `AICR_BINARY_ATTESTATION_FILE` | unset → `<executable>-attestation.sigstore.json` next to the binary | `resolveBinaryAttestationPath` (override for ko `KO_DATA_PATH` layouts) |
-| `AICR_BINARY_ATTESTATION_IDENTITY_REGEXP` | unset → `verifier.TrustedRepositoryPattern` (release `on-tag.yaml`) | `resolveBinaryAttestationIdentityPattern` (must contain `NVIDIA/aicr`, validated by `verifier.ValidateIdentityPattern`; retargets the attesting NVIDIA workflow, e.g. an e2e build) |
+| `AICR_BINARY_ATTESTATION_IDENTITY_REGEXP` | unset → `verifier.TrustedRepositoryPattern` (release `on-tag.yaml`) | `resolveBinaryAttestationIdentityPattern` (must be confined to `NVIDIA/aicr` — begins with the repository prefix, no top-level alternation, and no match against foreign-identity canaries — validated by `verifier.ValidateIdentityPattern`; retargets the attesting NVIDIA workflow, e.g. an e2e build) |
 
 See [Server-Side Bundle Signing](#server-side-bundle-signing) for the identity
 model and validation rules behind these variables.
@@ -262,9 +262,12 @@ the running `os.Executable()` binary's digest.
 pattern the attestation is verified against: `verifier.TrustedRepositoryPattern`
 (the release `on-tag.yaml` workflow) by default, or the
 `AICR_BINARY_ATTESTATION_IDENTITY_REGEXP` override when set. The override is
-validated by `verifier.ValidateIdentityPattern`, which requires it to contain
-`NVIDIA/aicr`, so it can only retarget which NVIDIA workflow attested the binary
-(e.g. the server-kms e2e build), never widen the org. A bad override fails
+validated by `verifier.ValidateIdentityPattern`, which requires it to *begin
+with* `https://github.com/NVIDIA/aicr/` (a leading `^` is allowed) and to avoid
+top-level alternation, so it can only retarget which NVIDIA workflow attested
+the binary (e.g. the server-kms e2e build), never widen the org. Merely
+containing `NVIDIA/aicr` is not enough: a pattern that reaches the repository
+down one branch and something else down another is rejected. A bad override fails
 startup fast. This mirrors the CLI's `--certificate-identity-regexp`, and a
 custom pattern is logged because bundles the server then signs will not pass a
 verifier using the default identity.
@@ -293,8 +296,10 @@ contains two contract gates:
 
   Runtime acceptance of the legacy header shapes is pinned separately by
   `TestBundleHandler_LegacyRecipeHeaders`, which posts absent, empty, and
-  `kind: Recipe` bodies to the handler and asserts 200. The spec gate alone
-  would only be checking the spec against itself.
+  `kind: Recipe` bodies to the handler, asserts 200, and round-trips the
+  emitted `recipe.yaml` back through the file loader to prove the ingest
+  normalization holds. The spec gate alone would only be checking the spec
+  against itself.
 
 Drift is a contract bug: clients conforming to the spec will reject
 inputs the server actually accepts, or generate types that reject

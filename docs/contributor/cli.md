@@ -138,9 +138,11 @@ packages (`pkg/recipe`, `pkg/bundler`, `pkg/snapshotter`,
 | `ResolveRecipe(ctx, RecipeRequest)` | `recipe`, `query` (request can hold criteria, file path, or snapshot input) |
 | `ResolveRecipeFromCriteria(ctx, *Criteria)` | criteria-only fast path |
 | `ResolveRecipeFromSnapshot(ctx, *Criteria, *Snapshot)` | `validate`, `recipe --snapshot` |
+| `ResolveRecipeFromSnapshotWithOptions(ctx, *Criteria, *Snapshot, opts...)` | `recipe --snapshot`, `query --snapshot` — with `WithSnapshotCriteriaRelaxation(stated...)` for the derived-criteria retry |
 | `LoadRecipe(ctx, path, kubeconfig)` | `bundle`, `validate`, `diff` (read a previously emitted recipe file) |
 | `BundleComponents(ctx, *RecipeResult)` | `bundle` |
-| `CollectSnapshot(ctx, *AgentConfig)` | `snapshot` |
+| `LoadSnapshot(ctx, path, kubeconfig)` | `validate`, `query`, `diff` (read a previously captured snapshot; file, URL, or `cm://` ConfigMap) |
+| `CollectSnapshot(ctx, *AgentConfig)` | `snapshot`, `validate` (Job-mode capture only; local `AICR_AGENT_MODE` collection deploys no Job and stays on `snapshotter.NodeSnapshotter`) |
 | `ValidateState(ctx, ...)` | `validate` |
 
 Construction in CLI happens via `recipeClientFromCmd(cmd, cfg)` in
@@ -153,6 +155,14 @@ Adding business logic in the handler — recipe resolution loops, bundle
 rendering, validator orchestration, OCI pushes — is a boundary
 violation. If the facade is missing the surface you need, add it to
 `pkg/client/v1` first.
+
+**What `--snapshot` still owns.** `buildRecipeFromCmdWithConfig` in
+`query.go` derives criteria from the snapshot fingerprint, layers config and
+flags on top, and records which of the five coverage dimensions were
+explicitly stated in a `touched` map. That map becomes the argument to
+`aicr.WithSnapshotCriteriaRelaxation` — the relax-and-retry itself lives in
+the facade (issue #2027). Only this layer can know a flag was set, so
+declaring the stated set is the CLI's job; acting on it is not.
 
 ## Output Writers
 
@@ -358,6 +368,49 @@ Rules:
   these have many small permutations and the existing tests
   (`config_helpers_test.go`, `bundle_resolve_helpers_test.go`) are
   the template.
+
+## The CLI Surface Baseline
+
+The CLI is one of the four surfaces frozen at v1
+([ROADMAP §1](https://github.com/NVIDIA/aicr/blob/main/ROADMAP.md#1-defensible-api-stability)).
+`pkg/cli/testdata/cli-surface.golden`
+is its committed inventory — every command, flag, alias, type, default,
+`required`/`hidden` state, and environment variable — and `TestCLISurface`
+(`pkg/cli/surface_test.go`) fails when the live tree stops matching it. It runs
+under `make test`, so it is already inside the merge gate; no separate workflow
+is involved.
+
+**If you added a command or flag,** the addition is compatible. Regenerate and
+commit the result in the same PR:
+
+```bash
+go test ./pkg/cli/ -run TestCLISurface -update
+```
+
+Scope the `-update` flag to `./pkg/cli/` — it is registered only by this test,
+so `go test ./... -update` fails in every other package.
+
+**If you removed or renamed a command, flag, or alias, or changed a default,**
+the test reports it as `BREAKING` rather than telling you to regenerate. That is
+a breaking change to a frozen surface and it owes the notice period in
+[`RELEASING.md`](https://github.com/NVIDIA/aicr/blob/main/RELEASING.md#deprecation-policy): ship the deprecation
+with a warning first, remove it only after the window, and add an entry to
+[`docs/user/deprecations.md`](../user/deprecations.md). Regenerate the golden
+only once the removal is actually due.
+
+**Framework-injected surface is covered separately.** `renderSurface` walks
+`RootCommand()`, which is the tree *before* urfave performs setup, so the
+`completion` command, its four shell subcommands, `--help`, and root
+`--version` never reach the golden. Rendering post-setup is not an option:
+urfave's setup functions are unexported, so reaching them means calling `Run`,
+which mutates parsed state on the instance (see the comment at
+`pkg/cli/root.go:64`) and would bake that state into a committed baseline.
+`pkg/cli/injected_surface_test.go` asserts that surface behaviorally instead —
+that the commands actually run, not that a golden line exists.
+
+Usage strings are deliberately not pinned. They are prose, they change for good
+reasons, and including them would make the gate fail on every wording fix — the
+fastest way to train everyone to run `-update` without reading the diff.
 
 ## Anti-Patterns
 

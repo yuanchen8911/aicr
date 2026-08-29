@@ -1781,7 +1781,7 @@ func TestGenerate_VendorCharts_ManifestOnlyUnaffected(t *testing.T) {
 func extractSourceName(t *testing.T, yamlContent string) string {
 	t.Helper()
 	// Look for "name: <source-name>" under sourceRef.
-	for _, line := range strings.Split(yamlContent, "\n") {
+	for line := range strings.SplitSeq(yamlContent, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "name:") && !strings.Contains(trimmed, "gpu-operator") && !strings.Contains(trimmed, "network-operator") && !strings.Contains(trimmed, "cert-manager") && !strings.Contains(trimmed, "-values") {
 			return strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
@@ -2263,11 +2263,14 @@ func TestGenerate_OCISourceName_SkipsGitSource(t *testing.T) {
 		t.Fatalf("Generate() error = %v", err)
 	}
 
-	// No gitrepo source files should exist.
+	// No gitrepo source files should exist. This component contributes no
+	// HelmRepository source either, so sources/ is not created at all —
+	// asserting its absence subsumes the gitrepo-file count. See issue #1947.
 	sourcesDir := filepath.Join(outputDir, "sources")
-	gitRepoFiles := listFilesWithPrefix(t, sourcesDir, "gitrepo-")
-	if len(gitRepoFiles) != 0 {
-		t.Errorf("expected 0 gitrepo source files when OCISourceName is set, got %d", len(gitRepoFiles))
+	if _, statErr := os.Stat(sourcesDir); !os.IsNotExist(statErr) {
+		gitRepoFiles := listFilesWithPrefix(t, sourcesDir, "gitrepo-")
+		t.Errorf("expected sources/ to be absent when no source CR is written, got stat err = %v, %d gitrepo files",
+			statErr, len(gitRepoFiles))
 	}
 }
 
@@ -2469,6 +2472,313 @@ func TestGenerate_OCISourceName_VendoredChart(t *testing.T) {
 	}
 	if strings.Contains(hrContent, "kind: GitRepository") {
 		t.Error("vendored HelmRelease should NOT reference GitRepository in OCI mode")
+	}
+}
+
+// TestGenerate_SourcesDirCreatedOnlyWhenPopulated verifies that sources/ is
+// emitted only when at least one source CR is written.
+//
+// A component contributes a HelmRepository source only when it resolves to a
+// remote Helm chart (non-empty Source), and --vendor-charts removes even
+// those, since collectHelmSources skips every vendorable ref. GitRepository
+// sources are suppressed entirely under an OCI output reference, where local
+// charts are consumed via ArtifactGenerator + ExternalArtifact. When both
+// filters apply, nothing is contributed and an unconditionally created
+// sources/ would remain empty. The bundle inventory validator walks the
+// finished tree and rejects any directory contributing no files, which failed
+// generation outright. See issue #1947.
+//
+// The cases below model the empty state with source-less components, which is
+// the same state --vendor-charts produces without needing a chart puller.
+//
+// IncludeChecksums is set so the assertion runs through
+// checksum.WriteChecksums → validateExactTree, the check that actually
+// rejected the empty directory, rather than only the proxy that sources/ is
+// absent.
+func TestGenerate_SourcesDirCreatedOnlyWhenPopulated(t *testing.T) {
+	t.Parallel()
+	localManifests := map[string]map[string][]byte{
+		"nfd-ocp": {
+			"nfd.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nfd-ocp\n"),
+		},
+	}
+	localOnlyRefs := []recipe.ComponentRef{
+		{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm},
+	}
+	remoteChartRefs := []recipe.ComponentRef{
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.17.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+	}
+
+	tests := []struct {
+		name string
+		refs []recipe.ComponentRef
+		// manifests supplies local chart content; nil for remote-chart refs.
+		manifests map[string]map[string][]byte
+		// ociSourceName empty selects the local-directory (GitRepository) path.
+		ociSourceName string
+		// preCreateStale plants an empty sources/ before generation, as a
+		// pre-fix run would have left behind.
+		preCreateStale bool
+		wantSourcesDir bool
+	}{
+		{
+			name:           "OCI output, all-local components: no sources dir",
+			refs:           localOnlyRefs,
+			manifests:      localManifests,
+			ociSourceName:  "aicr-bundle",
+			wantSourcesDir: false,
+		},
+		{
+			name:           "OCI output, all-local components, stale empty sources dir removed",
+			refs:           localOnlyRefs,
+			manifests:      localManifests,
+			ociSourceName:  "aicr-bundle",
+			preCreateStale: true,
+			wantSourcesDir: false,
+		},
+		{
+			name:           "control: OCI output with a remote chart keeps sources dir",
+			refs:           remoteChartRefs,
+			ociSourceName:  "aicr-bundle",
+			wantSourcesDir: true,
+		},
+		{
+			name:           "control: local output writes a GitRepository source",
+			refs:           localOnlyRefs,
+			manifests:      localManifests,
+			wantSourcesDir: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			outputDir := t.TempDir()
+			sourcesDir := filepath.Join(outputDir, "sources")
+
+			if tt.preCreateStale {
+				if err := os.MkdirAll(sourcesDir, 0750); err != nil {
+					t.Fatalf("failed to plant stale sources dir: %v", err)
+				}
+			}
+
+			recipeResult := &recipe.RecipeResult{}
+			recipeResult.Metadata.Version = testVersion
+			recipeResult.ComponentRefs = tt.refs
+
+			g := &Generator{
+				RecipeResult:       recipeResult,
+				ComponentManifests: tt.manifests,
+				Version:            testVersion,
+				OCISourceName:      tt.ociSourceName,
+				IncludeChecksums:   true,
+			}
+
+			if _, err := g.Generate(context.Background(), outputDir); err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+
+			info, statErr := os.Stat(sourcesDir)
+			switch {
+			case tt.wantSourcesDir:
+				if statErr != nil {
+					t.Fatalf("expected sources/ to exist, stat error = %v", statErr)
+				}
+				if !info.IsDir() {
+					t.Fatalf("expected sources/ to be a directory, got mode %v", info.Mode())
+				}
+				entries, readErr := os.ReadDir(sourcesDir)
+				if readErr != nil {
+					t.Fatalf("failed to read sources/: %v", readErr)
+				}
+				if len(entries) == 0 {
+					t.Error("expected sources/ to contain at least one source CR")
+				}
+			default:
+				if !os.IsNotExist(statErr) {
+					t.Errorf("expected sources/ to be absent, stat error = %v", statErr)
+				}
+			}
+		})
+	}
+}
+
+// TestGenerate_StaleSourcesPathIsNotDestroyed covers the guard shared by the
+// create and remove routes to the sources path. os.Remove unlinks regular
+// files as readily as it removes empty directories, so removal must not run
+// blind — and both routes must reject the same user error with the same code
+// rather than having the outcome decided by recipe shape.
+func TestGenerate_StaleSourcesPathIsNotDestroyed(t *testing.T) {
+	t.Parallel()
+	localManifests := map[string]map[string][]byte{
+		"nfd-ocp": {
+			"nfd.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: nfd-ocp\n"),
+		},
+	}
+	localOnlyRefs := []recipe.ComponentRef{
+		{Name: "nfd-ocp", Namespace: "nfd", Type: recipe.ComponentTypeHelm},
+	}
+	remoteChartRefs := []recipe.ComponentRef{
+		{
+			Name:      "cert-manager",
+			Namespace: "cert-manager",
+			Chart:     "cert-manager",
+			Version:   "v1.17.2",
+			Type:      recipe.ComponentTypeHelm,
+			Source:    "https://charts.jetstack.io",
+		},
+	}
+
+	const fileContents = "not a directory\n"
+
+	tests := []struct {
+		name string
+		refs []recipe.ComponentRef
+		// plant places something at the sources path before generation.
+		plant     func(t *testing.T, sourcesDir string)
+		manifests map[string]map[string][]byte
+		wantErr   bool
+		// verify asserts the planted object survived generation intact.
+		verify func(t *testing.T, sourcesDir string)
+	}{
+		{
+			name:      "regular file rejected on the remove route",
+			refs:      localOnlyRefs,
+			manifests: localManifests,
+			plant: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				if err := os.WriteFile(sourcesDir, []byte(fileContents), 0600); err != nil {
+					t.Fatalf("failed to plant file: %v", err)
+				}
+			},
+			wantErr: true,
+			verify: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				got, err := os.ReadFile(sourcesDir) //nolint:gosec // test-controlled path
+				if err != nil {
+					t.Fatalf("planted file was destroyed: %v", err)
+				}
+				if string(got) != fileContents {
+					t.Errorf("planted file contents = %q, want %q", got, fileContents)
+				}
+			},
+		},
+		{
+			name: "regular file rejected on the create route",
+			refs: remoteChartRefs,
+			plant: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				if err := os.WriteFile(sourcesDir, []byte(fileContents), 0600); err != nil {
+					t.Fatalf("failed to plant file: %v", err)
+				}
+			},
+			wantErr: true,
+			verify: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				got, err := os.ReadFile(sourcesDir) //nolint:gosec // test-controlled path
+				if err != nil {
+					t.Fatalf("planted file was destroyed: %v", err)
+				}
+				if string(got) != fileContents {
+					t.Errorf("planted file contents = %q, want %q", got, fileContents)
+				}
+			},
+		},
+		{
+			name:      "symlink rejected and left in place",
+			refs:      localOnlyRefs,
+			manifests: localManifests,
+			plant: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				target := filepath.Join(t.TempDir(), "elsewhere")
+				if err := os.MkdirAll(target, 0750); err != nil {
+					t.Fatalf("failed to create symlink target: %v", err)
+				}
+				if err := os.Symlink(target, sourcesDir); err != nil {
+					t.Fatalf("failed to plant symlink: %v", err)
+				}
+			},
+			wantErr: true,
+			verify: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				info, err := os.Lstat(sourcesDir)
+				if err != nil {
+					t.Fatalf("planted symlink was destroyed: %v", err)
+				}
+				if info.Mode()&os.ModeSymlink == 0 {
+					t.Errorf("planted symlink replaced, mode = %v", info.Mode())
+				}
+			},
+		},
+		{
+			name:      "populated stale directory preserved",
+			refs:      localOnlyRefs,
+			manifests: localManifests,
+			plant: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				if err := os.MkdirAll(sourcesDir, 0750); err != nil {
+					t.Fatalf("failed to plant directory: %v", err)
+				}
+				stale := filepath.Join(sourcesDir, "gitrepo-stale.yaml")
+				if err := os.WriteFile(stale, []byte("stale\n"), 0600); err != nil {
+					t.Fatalf("failed to plant stale source CR: %v", err)
+				}
+			},
+			// Generation itself succeeds; the stale file is surfaced by the
+			// inventory validator, which runs only under IncludeChecksums.
+			wantErr: false,
+			verify: func(t *testing.T, sourcesDir string) {
+				t.Helper()
+				stale := filepath.Join(sourcesDir, "gitrepo-stale.yaml")
+				if _, err := os.Stat(stale); err != nil {
+					t.Fatalf("populated stale directory was destroyed: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			outputDir := t.TempDir()
+			sourcesDir := filepath.Join(outputDir, "sources")
+			tt.plant(t, sourcesDir)
+
+			recipeResult := &recipe.RecipeResult{}
+			recipeResult.Metadata.Version = testVersion
+			recipeResult.ComponentRefs = tt.refs
+
+			g := &Generator{
+				RecipeResult:       recipeResult,
+				ComponentManifests: tt.manifests,
+				Version:            testVersion,
+				OCISourceName:      "aicr-bundle",
+			}
+
+			_, err := g.Generate(context.Background(), outputDir)
+			switch {
+			case tt.wantErr && err == nil:
+				t.Fatal("expected Generate() to fail, got nil error")
+			case tt.wantErr:
+				if !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+					t.Errorf("expected ErrCodeInvalidRequest, got: %v", err)
+				}
+				if !strings.Contains(err.Error(), sourcesDir) {
+					t.Errorf("expected error to name %q, got: %v", sourcesDir, err)
+				}
+			case err != nil:
+				t.Fatalf("Generate() error = %v", err)
+			}
+
+			tt.verify(t, sourcesDir)
+		})
 	}
 }
 
@@ -2790,5 +3100,215 @@ func TestGenerate_SourceOnlyRefChartFallsBackToName(t *testing.T) {
 	readme := readFile(t, filepath.Join(outputDir, "README.md"))
 	if !strings.Contains(readme, "gpu-operator-post") {
 		t.Errorf("README should list the gpu-operator-post release for a source-only mixed component, got:\n%s", readme)
+	}
+}
+
+// TestGenerate_HelmReleaseCRDUpgradePolicyIsOptIn covers #2264.
+//
+// helm-controller's spec.upgrade.crds default of Skip means a chart bump whose
+// CRDs changed runs a new controller against the previous schema. The fix is
+// opt-in via the registry ownsCRDs flag, not a blanket default: an audit found
+// 15 components ship CRDs under crds/ and 11 share at least one with another
+// component. nfd, gpu-operator and kai-scheduler all appear together in
+// base.yaml and all ship the NodeFeature CRDs, so replacing unconditionally
+// would have several HelmReleases rewrite the same CRD every reconcile.
+//
+// Refs are built by running ApplyRegistryDefaults over an empty ref, which is
+// what a stock recipe actually resolves to. Constructing them by copying
+// registry fields directly is what an earlier revision did, and it silently
+// diverged: ApplyRegistryDefaults strips a defaultChart to its bare name, so a
+// hand-built ref carrying "gatekeeper/gatekeeper" never matched the real
+// resolved "gatekeeper" and the test could not see that gatekeeper emitted no
+// policy at all. Do not hand-build these refs.
+//
+// The owner cases are discovered from the registry rather than hardcoded, so a
+// component enrolled in ownsCRDs later is covered without touching this test.
+//
+// NOTE ON COVERAGE: this exercises the sourceRef template only. An upstream
+// Helm component renders spec.chart.spec.sourceRef regardless of
+// OCISourceName. TestUsesRegistryChartRejectsRefsWithoutCoordinates covers
+// why the chartRef shape cannot emit the policy today.
+func TestGenerate_HelmReleaseCRDUpgradePolicyIsOptIn(t *testing.T) {
+	registry, regErr := recipe.GetComponentRegistry()
+	if regErr != nil {
+		t.Fatalf("GetComponentRegistry: %v", regErr)
+	}
+
+	// resolvedRef mirrors stock resolution: an empty ref, then registry
+	// defaults. Anything else risks testing a shape the resolver never emits.
+	resolvedRef := func(t *testing.T, name string) recipe.ComponentRef {
+		t.Helper()
+		cfg := registry.Get(name)
+		if cfg == nil {
+			t.Fatalf("%s missing from registry", name)
+		}
+		ref := recipe.ComponentRef{Name: name, Namespace: name, Type: recipe.ComponentTypeHelm}
+		ref.ApplyRegistryDefaults(cfg)
+		return ref
+	}
+
+	// Every enrolled owner, discovered rather than listed.
+	var owners []string
+	for _, name := range registry.Names() {
+		if cfg := registry.Get(name); cfg != nil && cfg.OwnsCRDs {
+			owners = append(owners, name)
+		}
+	}
+	if len(owners) == 0 {
+		t.Fatal("no ownsCRDs components in the registry; this test would prove nothing")
+	}
+
+	t.Run("owners emit the policy", func(t *testing.T) {
+		for _, name := range owners {
+			t.Run(name, func(t *testing.T) {
+				assertCRDPolicy(t, resolvedRef(t, name), name, "CreateReplace")
+			})
+		}
+	})
+
+	// nfd shares the NodeFeature CRDs with gpu-operator and network-operator,
+	// all three of which co-exist in base.yaml.
+	t.Run("sharer does not", func(t *testing.T) {
+		assertCRDPolicy(t, resolvedRef(t, "nfd"), "nfd", "")
+	})
+
+	// ownsCRDs records an audit of the registry's pinned chart. A ref pointing
+	// anywhere else is unaudited, so the policy must not carry over.
+	t.Run("coordinate overrides disable it", func(t *testing.T) {
+		owner := owners[0]
+		for _, tc := range []struct {
+			name   string
+			mutate func(*recipe.ComponentRef)
+		}{
+			{"version", func(r *recipe.ComponentRef) { r.Version = "0.0.1-unaudited" }},
+			{"chart", func(r *recipe.ComponentRef) { r.Chart = "some-fork" }},
+			{"source", func(r *recipe.ComponentRef) { r.Source = "oci://example.invalid/charts" }},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ref := resolvedRef(t, owner)
+				tc.mutate(&ref)
+				assertCRDPolicy(t, ref, owner, "")
+			})
+		}
+	})
+}
+
+// assertCRDPolicy renders one component and asserts spec.upgrade.crds.
+//
+// Decoded as a map, not a typed struct: a string field cannot tell an absent
+// crds key from one explicitly rendered as "", so a negative case would pass
+// against a template emitting an empty value. Presence is the assertion.
+func assertCRDPolicy(t *testing.T, ref recipe.ComponentRef, component, want string) {
+	t.Helper()
+	outputDir := t.TempDir()
+
+	recipeResult := &recipe.RecipeResult{}
+	recipeResult.Metadata.Version = testVersion
+	recipeResult.ComponentRefs = []recipe.ComponentRef{ref}
+
+	g := &Generator{
+		RecipeResult:    recipeResult,
+		ComponentValues: map[string]map[string]any{component: {}},
+		Version:         "v0.9.0",
+	}
+	if _, err := g.Generate(context.Background(), outputDir); err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+
+	raw := readFile(t, filepath.Join(outputDir, component, "helmrelease.yaml"))
+	var doc struct {
+		Spec map[string]any `yaml:"spec"`
+	}
+	if err := yaml.Unmarshal([]byte(raw), &doc); err != nil {
+		t.Fatalf("parse HelmRelease: %v", err)
+	}
+	upgrade, hasUpgrade := doc.Spec["upgrade"]
+
+	if want == "" {
+		if hasUpgrade {
+			t.Errorf("spec.upgrade present (%v), want the key absent entirely\n%s", upgrade, raw)
+		}
+		return
+	}
+	if !hasUpgrade {
+		t.Fatalf("spec.upgrade absent, want crds = %q\n%s", want, raw)
+	}
+	upgradeMap, ok := upgrade.(map[string]any)
+	if !ok {
+		t.Fatalf("spec.upgrade is %T, want a mapping\n%s", upgrade, raw)
+	}
+	crds, hasCRDs := upgradeMap["crds"]
+	if !hasCRDs {
+		t.Fatalf("spec.upgrade.crds absent, want %q\n%s", want, raw)
+	}
+	if crds != want {
+		t.Errorf("spec.upgrade.crds = %v, want %q\n%s", crds, want, raw)
+	}
+}
+
+// TestUsesRegistryChartRejectsRefsWithoutCoordinates pins the property that
+// makes the chartRef template's UpgradeCRDs block unreachable today.
+//
+// chartRef is reached by local, vendored and manifest-backed components. Those
+// carry no registry chart coordinates, so usesRegistryChart is false for them
+// and the policy cannot render. Asserting that directly is preferable to a
+// render test: an attempt at the render route produced a sourceRef HelmRelease
+// instead, so such a test would have passed without exercising anything, which
+// is the ambiguous-condition shape this suite already avoids elsewhere.
+//
+// If a future chartRef path does carry registry coordinates, this test still
+// holds but the block becomes reachable — at which point the chartRef template
+// needs its own render coverage.
+func TestUsesRegistryChartRejectsRefsWithoutCoordinates(t *testing.T) {
+	registry, regErr := recipe.GetComponentRegistry()
+	if regErr != nil {
+		t.Fatalf("GetComponentRegistry: %v", regErr)
+	}
+	cfg := registry.Get("k8s-aibom")
+	if cfg == nil || !cfg.OwnsCRDs {
+		t.Fatal("k8s-aibom must be an ownsCRDs component for this test to mean anything")
+	}
+
+	tests := []struct {
+		name string
+		ref  recipe.ComponentRef
+		want bool
+	}{
+		{
+			name: "manifest-only ref has no chart or source",
+			ref: recipe.ComponentRef{
+				Name: "k8s-aibom", Type: recipe.ComponentTypeHelm,
+				ManifestFiles: []string{"components/k8s-aibom/values.yaml"},
+			},
+			want: false,
+		},
+		{
+			name: "local chart path is not the registry chart",
+			ref: recipe.ComponentRef{
+				Name: "k8s-aibom", Type: recipe.ComponentTypeHelm,
+				Chart: "./k8s-aibom", Version: cfg.Helm.DefaultVersion,
+			},
+			want: false,
+		},
+		{
+			// The control: without this, every case above could pass because
+			// usesRegistryChart always returns false.
+			name: "fully resolved registry ref matches",
+			ref: func() recipe.ComponentRef {
+				r := recipe.ComponentRef{Name: "k8s-aibom", Type: recipe.ComponentTypeHelm}
+				r.ApplyRegistryDefaults(cfg)
+				return r
+			}(),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := usesRegistryChart(tt.ref, cfg); got != tt.want {
+				t.Errorf("usesRegistryChart() = %v, want %v (chart=%q source=%q version=%q)",
+					got, tt.want, tt.ref.EffectiveChart(), tt.ref.Source, tt.ref.Version)
+			}
+		})
 	}
 }

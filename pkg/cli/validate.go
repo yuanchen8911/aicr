@@ -135,7 +135,9 @@ func resolveValidateNodeSelector(cmd *cli.Command, resolved *config.ValidateReso
 // inference-perf that want to mirror the target node's taints by default
 // must distinguish "operator opted into tolerate-all" from "operator said
 // nothing". Returning nil here when neither CLI nor config set the field
-// keeps the env var unset, so the inner validator context sees nil.
+// keeps the env var unset, so the inner validator context sees nil. The live
+// snapshot path consumes that same nil as its signal to apply the agent's
+// tolerate-all default at the Job projection boundary.
 func resolveValidateTolerations(cmd *cli.Command, resolved *config.ValidateResolved) ([]corev1.Toleration, error) {
 	if cmd.IsSet("toleration") {
 		tols, err := snapshotter.ParseTolerations(cmd.StringSlice("toleration"))
@@ -151,37 +153,52 @@ func resolveValidateTolerations(cmd *cli.Command, resolved *config.ValidateResol
 	return resolved.Tolerations, nil
 }
 
+// toAgentConfig projects the validate command's resolved flags onto the
+// facade AgentConfig that Client.CollectSnapshot consumes. Privileged is
+// unconditional here: the validation snapshot needs the GPU and SystemD
+// collectors, which do not work in restricted mode.
+func (c *validateAgentConfig) toAgentConfig() *aicr.AgentConfig {
+	return &aicr.AgentConfig{
+		Kubeconfig:         c.kubeconfig,
+		Namespace:          c.namespace,
+		Image:              c.image,
+		ImagePullSecrets:   c.imagePullSecrets,
+		JobName:            c.jobName,
+		ServiceAccountName: c.serviceAccountName,
+		NodeSelector:       c.nodeSelector,
+		Tolerations:        c.tolerations,
+		Timeout:            c.timeout,
+		Cleanup:            c.cleanup,
+		Debug:              c.debug,
+		Privileged:         true,
+		RequireGPU:         c.requireGPU,
+		AKSGPUPoolsPath:    c.aksGPUPoolsPath,
+	}
+}
+
 // deployAgentForValidation deploys an agent to capture a snapshot and returns the Snapshot.
 // The agent deployer creates the namespace itself (ensureNamespace, with the
 // managed-by label) using the same explicit kubeconfig (#1787), so no
 // pre-create happens here — deployAndWaitForResult's up-front pool-file
 // projection must run before ANY cluster mutation so a malformed
 // --aks-gpu-pools file fails without side effects.
-func deployAgentForValidation(ctx context.Context, cfg *validateAgentConfig) (*snapshotter.Snapshot, error) {
-	agentConfig := &snapshotter.AgentConfig{
-		Kubeconfig:         cfg.kubeconfig,
-		Namespace:          cfg.namespace,
-		Image:              cfg.image,
-		ImagePullSecrets:   cfg.imagePullSecrets,
-		JobName:            cfg.jobName,
-		ServiceAccountName: cfg.serviceAccountName,
-		NodeSelector:       cfg.nodeSelector,
-		Tolerations:        cfg.tolerations,
-		Timeout:            cfg.timeout,
-		Cleanup:            cfg.cleanup,
-		Debug:              cfg.debug,
-		Privileged:         true,
-		RequireGPU:         cfg.requireGPU,
-		AKSGPUPoolsPath:    cfg.aksGPUPoolsPath,
-	}
-
-	snap, err := snapshotter.DeployAndGetSnapshot(ctx, agentConfig)
+//
+// Collection runs through the same Client.CollectSnapshot that `aicr snapshot`
+// uses, rather than a second hand-rolled snapshotter.AgentConfig, so the facade
+// mirror is exercised here too. Output is left empty: validate consumes the
+// snapshot in memory and never writes it out.
+func deployAgentForValidation(ctx context.Context, client *aicr.Client, cfg *validateAgentConfig) (*aicr.Snapshot, error) {
+	snap, err := client.CollectSnapshot(ctx, cfg.toAgentConfig())
 	if err != nil {
 		// PropagateOrWrap: a structured error (e.g. ErrCodeInvalidRequest
 		// from a malformed --aks-gpu-pools file) keeps its code.
 		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to capture snapshot")
 	}
 
+	// Returned in the facade shape rather than unwrapped: both snapshot
+	// sources in this command now produce *aicr.Snapshot, so nothing
+	// downstream has to convert. Unwrapping here and re-wrapping at the
+	// ValidateState call also discarded Snapshot.Raw.
 	return snap, nil
 }
 
@@ -234,7 +251,7 @@ func runValidation(
 	ctx context.Context,
 	client *aicr.Client,
 	rec *aicr.RecipeResult,
-	snap *snapshotter.Snapshot,
+	snap *aicr.Snapshot,
 	cfg validationConfig,
 ) error {
 
@@ -291,7 +308,7 @@ func runValidation(
 		opts = append(opts, aicr.WithValidationPhases(facadePhases...))
 	}
 
-	results, err := client.ValidateState(ctx, rec, aicr.WrapSnapshot(snap), opts...)
+	results, err := client.ValidateState(ctx, rec, snap, opts...)
 	if err != nil {
 		return errors.PropagateOrWrap(err, errors.ErrCodeInternal, "validation failed")
 	}
@@ -450,12 +467,12 @@ func validateCmdFlags() []cli.Flag {
 		},
 		&cli.StringSliceFlag{
 			Name:     "node-selector",
-			Usage:    "Override GPU node selection for validation workloads (format: key=value, can be repeated). Replaces platform-specific selectors on inner workloads (e.g., NCCL benchmark pods). Use when GPU nodes have non-standard labels. Does not affect the validator orchestrator Job.",
+			Usage:    "Override GPU node selection for the live snapshot agent (when --snapshot is omitted) and inner validation workloads (format: key=value, can be repeated). Replaces platform-specific selectors on inner workloads (e.g., NCCL benchmark pods). Does not affect the validator orchestrator Job.",
 			Category: catScheduling,
 		},
 		&cli.StringSliceFlag{
 			Name:     "toleration",
-			Usage:    "Override tolerations for validation workloads (format: key=value:effect, can be repeated). Replaces the default tolerate-all policy on inner workloads. Does not affect the validator orchestrator Job.",
+			Usage:    "Override tolerations for the live snapshot agent (when --snapshot is omitted) and inner validation workloads (format: key=value:effect, can be repeated). When omitted, the snapshot agent tolerates all taints. Does not affect the validator orchestrator Job.",
 			Category: catScheduling,
 		},
 		&cli.DurationFlag{
@@ -500,7 +517,7 @@ func validateCmdFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name: "emit-attestation",
-			Usage: `Directory to write a recipe-evidence v1 attestation bundle (signed when --push is set).
+			Usage: `Directory to write a recipe-evidence attestation bundle (v1, or v2 when the recipe carries a configuration profile; signed when --push is set, unless --no-sign).
 	Produces summary-bundle/, optionally logs-bundle/, and pointer.yaml suitable for copying to recipes/evidence/<recipe>/<source>/<digest>.yaml (see the emit 'copyTo' hint).
 	The bundle is minimized by default (sensitive snapshot fields and CTRF logs removed); use --full to ship raw payloads.
 	See ADR-007 (docs/design/007-recipe-evidence.md).`,
@@ -775,7 +792,7 @@ constraint (e.g. K8s version) is not met — --fail-on-error scopes to phase che
 			// handle to the same directory (dataDir) so SLSA / conformance
 			// evidence resolves files against the command's source rather
 			// than the package global.
-			client, err := recipeClientFromCmd(cmd, cfg)
+			client, err := recipeClientFromCmd(ctx, cmd, cfg)
 			if err != nil {
 				return errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to initialize data provider")
 			}
@@ -788,7 +805,7 @@ constraint (e.g. K8s version) is not met — --fail-on-error scopes to phase che
 				return err
 			}
 
-			var snap *snapshotter.Snapshot
+			var snap *aicr.Snapshot
 
 			// --no-cluster means "do not touch the cluster". The agent-deploy
 			// branch below contradicts that (it creates a Job and captures a
@@ -802,7 +819,7 @@ constraint (e.g. K8s version) is not met — --fail-on-error scopes to phase che
 
 			if snapshotFilePath != "" {
 				slog.Info("loading snapshot", "uri", snapshotFilePath)
-				snap, err = snapshotter.LoadFromFileWithKubeconfig(ctx, snapshotFilePath, kubeconfig)
+				snap, err = client.LoadSnapshot(ctx, snapshotFilePath, kubeconfig)
 				if err != nil {
 					return err
 				}
@@ -812,7 +829,7 @@ constraint (e.g. K8s version) is not met — --fail-on-error scopes to phase che
 				agentCfg := parseValidateAgentConfig(cmd, resolved, shared)
 
 				var deployErr error
-				snap, deployErr = deployAgentForValidation(ctx, agentCfg)
+				snap, deployErr = deployAgentForValidation(ctx, client, agentCfg)
 				if deployErr != nil {
 					return deployErr
 				}
@@ -822,7 +839,10 @@ constraint (e.g. K8s version) is not met — --fail-on-error scopes to phase che
 			// binary, and the snapshot-producing binary report different
 			// release versions. Mixed-version artifacts can cause confusing
 			// validation failures; this does not fail the command.
-			warnVersionSkew(version, rec.Resolved().Metadata.Version, snap.Metadata["version"])
+			// Unwrap for the snapshot's producer version: Metadata is not
+			// projected onto the facade Snapshot, which carries only the
+			// fields the resolve and validate paths consume.
+			warnVersionSkew(version, rec.Resolved().Metadata.Version, snap.Unwrap().Metadata["version"])
 
 			// Warn when a requested phase has no checks defined in the recipe.
 			// The helper reads the full recipe's Validation section, which the
@@ -874,7 +894,7 @@ func resolveCNCFAllocationPolicy(ctx context.Context, cmd *cli.Command, cfg *con
 		return "", nil
 	}
 
-	client, err := recipeClientFromCmd(cmd, cfg)
+	client, err := recipeClientFromCmd(ctx, cmd, cfg)
 	if err != nil {
 		return "", errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to initialize data provider")
 	}

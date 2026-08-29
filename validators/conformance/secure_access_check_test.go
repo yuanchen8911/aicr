@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -378,8 +379,8 @@ func TestCheckSecureAcceleratorAccess_FailurePathsStillFetchLogs(t *testing.T) {
 				dynClient = newDRAFakeDynamicClient(
 					testDeviceClass(draDriverGPU),
 					testResourceSlice("gpu-1", draDriverGPU, "node1", 1, 1,
-						map[string]interface{}{"nodeName": "node1"},
-						[]interface{}{plainDevice("gpu-0")}),
+						map[string]any{"nodeName": "node1"},
+						[]any{plainDevice("gpu-0")}),
 				)
 			}
 			clientset := k8sfake.NewClientset(node)
@@ -555,6 +556,27 @@ func TestCheckSecureAcceleratorAccess_DevicePluginPath(t *testing.T) {
 	if !strings.Contains(grantedScript, "nvidia-smi") || !strings.Contains(grantedScript, "exactly 1 usable GPU") {
 		t.Errorf("granted container script must count GPUs via nvidia-smi and require exactly 1: %q", grantedScript)
 	}
+	// Advertiser-agnostic prologue: under GKE's managed device plugin the
+	// driver tree is mounted at /usr/local/nvidia/{bin,lib64} without
+	// touching the container env, so both exports must precede the first
+	// nvidia-smi invocation or the probe fails as "command not found" even
+	// though the GPU grant succeeded (a no-op under the operator toolkit).
+	// The ${VAR:+${VAR}:} guards are load-bearing: appending to an unset
+	// variable with a bare "${VAR}:..." leaves a leading empty entry, and
+	// an empty ld.so/PATH entry means the current working directory.
+	for _, export := range []string{
+		`export PATH="${PATH:+${PATH}:}/usr/local/nvidia/bin"`,
+		`export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/nvidia/lib64"`,
+	} {
+		idx := strings.Index(grantedScript, export)
+		if idx < 0 {
+			t.Errorf("granted container script must contain %q: %q", export, grantedScript)
+			continue
+		}
+		if smi := strings.Index(grantedScript, "nvidia-smi"); smi >= 0 && idx > smi {
+			t.Errorf("granted container script must export %q before invoking nvidia-smi: %q", export, grantedScript)
+		}
+	}
 	// Multi-container isolation subtest: an identical unauthorized sibling
 	// container that is granted nothing (ai-conformance#75 parity).
 	if len(gpuPod.Spec.Containers) != 2 {
@@ -651,8 +673,8 @@ func TestCheckSecureAcceleratorAccess_DRAPathUnchanged(t *testing.T) {
 		DynamicClient: newDRAFakeDynamicClient(
 			testDeviceClass(draDriverGPU),
 			testResourceSlice("s1", draDriverGPU, "node1", 1, 1,
-				map[string]interface{}{"nodeName": "node1"},
-				[]interface{}{plainDevice("gpu-0")}),
+				map[string]any{"nodeName": "node1"},
+				[]any{plainDevice("gpu-0")}),
 		),
 	}
 
@@ -721,13 +743,13 @@ func TestCheckSecureAcceleratorAccess_DRAPathBetaVersions(t *testing.T) {
 
 			device := plainDevice("gpu-0")
 			if tt.version == versionV1beta1 {
-				device = basicWrappedDevice("gpu-0", map[string]interface{}{})
+				device = basicWrappedDevice("gpu-0", map[string]any{})
 			}
 			dynClient := newDRAFakeDynamicClientAt(tt.version,
 				testDeviceClassAt(apiVersion, draDriverGPU),
 				testResourceSliceAt(apiVersion, "s1", draDriverGPU, "node1", 1, 1,
-					map[string]interface{}{"nodeName": "node1"},
-					[]interface{}{device}),
+					map[string]any{"nodeName": "node1"},
+					[]any{device}),
 			)
 			var createdClaim *unstructured.Unstructured
 			dynClient.PrependReactor("create", "resourceclaims",
@@ -764,12 +786,12 @@ func TestCheckSecureAcceleratorAccess_DRAPathBetaVersions(t *testing.T) {
 			if err != nil || !found || len(requests) != 1 {
 				t.Fatalf("claim requests = %v (found=%t err=%v), want exactly one request", requests, found, err)
 			}
-			request, ok := requests[0].(map[string]interface{})
+			request, ok := requests[0].(map[string]any)
 			if !ok {
 				t.Fatalf("claim request has unexpected type %T", requests[0])
 			}
 			if tt.wantExactly {
-				exactly, ok := request["exactly"].(map[string]interface{})
+				exactly, ok := request["exactly"].(map[string]any)
 				if !ok {
 					t.Fatalf("claim request = %v, want the `exactly` wrapper at %s", request, tt.version)
 				}
@@ -1105,8 +1127,8 @@ func TestCheckSecureAcceleratorAccess_AmbiguousPodCreateCleansUp(t *testing.T) {
 		dynClient := newDRAFakeDynamicClient(
 			testDeviceClass(draDriverGPU),
 			testResourceSlice("s1", draDriverGPU, "node1", 1, 1,
-				map[string]interface{}{"nodeName": "node1"},
-				[]interface{}{plainDevice("gpu-0")}),
+				map[string]any{"nodeName": "node1"},
+				[]any{plainDevice("gpu-0")}),
 		)
 		cascadeNamespaceDelete(t, clientset, dynClient)
 		ctx := &validators.Context{
@@ -1693,14 +1715,14 @@ func TestBuildResourceClaim(t *testing.T) {
 			if nestedErr != nil || !found || len(requests) != 1 {
 				t.Fatalf("requests = %v (found=%t err=%v), want exactly one", requests, found, nestedErr)
 			}
-			request, ok := requests[0].(map[string]interface{})
+			request, ok := requests[0].(map[string]any)
 			if !ok {
 				t.Fatalf("request has unexpected type %T", requests[0])
 			}
 			if request[keyName] != gpuClaimName {
 				t.Errorf("request name = %v, want %q", request[keyName], gpuClaimName)
 			}
-			exactly, hasExactly := request["exactly"].(map[string]interface{})
+			exactly, hasExactly := request["exactly"].(map[string]any)
 			if hasExactly != tt.wantExactly {
 				t.Fatalf("request `exactly` wrapper present = %t, want %t (request: %v)", hasExactly, tt.wantExactly, request)
 			}
@@ -2056,5 +2078,87 @@ func TestWaitForTerminalPod_ForbiddenWatchFailsFast(t *testing.T) {
 	}
 	if stderrors.Is(err, errors.New(errors.ErrCodeTimeout, "")) {
 		t.Errorf("error = %v — a permanent watch failure must not be classified as timeout", err)
+	}
+}
+
+// prologueBashTimeout bounds the bash subprocess each prologue-behavior
+// subtest spawns — the script is two exports plus a printf, so anything
+// near this bound means a wedged shell, not a slow test.
+const prologueBashTimeout = 10 * time.Second
+
+// TestGrantProbePrologueBehavior executes the SHIPPED probe prologue (the
+// PATH / LD_LIBRARY_PATH exports of gpuExclusiveGrantProbeScript, extracted
+// verbatim) under bash and pins the ${VAR:+${VAR}:} guard semantics the text
+// assertions elsewhere only name: appending must never leave an empty entry
+// (an empty PATH/ld.so entry means the current working directory) and must
+// always end with the nvidia path so nvidia-smi resolves under GKE's managed
+// device plugin.
+func TestGrantProbePrologueBehavior(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath(bashShell); err != nil {
+		t.Skip("bash not available; skipping behavioral prologue test")
+	}
+
+	// Extract the prologue — everything before the first nvidia-smi
+	// statement — from the shipped script so the behavior under test is the
+	// deployed one, not a copy.
+	prologue, _, found := strings.Cut(gpuExclusiveGrantProbeScript, `uuids=`)
+	if !found || !strings.Contains(prologue, "LD_LIBRARY_PATH") {
+		t.Fatalf("cannot extract export prologue from shipped script: %q", gpuExclusiveGrantProbeScript)
+	}
+
+	tests := []struct {
+		name     string
+		preamble string
+		wantPath string
+		wantLD   string
+	}{
+		{
+			name:     "unset variables",
+			preamble: `unset PATH LD_LIBRARY_PATH; `,
+			wantPath: "/usr/local/nvidia/bin",
+			wantLD:   "/usr/local/nvidia/lib64",
+		},
+		{
+			name:     "empty variables",
+			preamble: `PATH=""; LD_LIBRARY_PATH=""; `,
+			wantPath: "/usr/local/nvidia/bin",
+			wantLD:   "/usr/local/nvidia/lib64",
+		},
+		{
+			name:     "pre-populated variables",
+			preamble: `PATH="/usr/bin"; LD_LIBRARY_PATH="/usr/lib"; `,
+			wantPath: "/usr/bin:/usr/local/nvidia/bin",
+			wantLD:   "/usr/lib:/usr/local/nvidia/lib64",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, cancel := context.WithTimeout(t.Context(), prologueBashTimeout)
+			defer cancel()
+			script := tt.preamble + prologue + `printf '%s\n%s\n' "$PATH" "$LD_LIBRARY_PATH"`
+			out, err := exec.CommandContext(ctx, bashShell, "-c", script).Output()
+			if err != nil {
+				t.Fatalf("bash -c prologue error = %v", err)
+			}
+			lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("prologue output = %q, want PATH and LD_LIBRARY_PATH lines", out)
+			}
+			for _, check := range []struct{ name, got, want string }{
+				{"PATH", lines[0], tt.wantPath},
+				{"LD_LIBRARY_PATH", lines[1], tt.wantLD},
+			} {
+				if check.got != check.want {
+					t.Errorf("%s = %q, want %q", check.name, check.got, check.want)
+				}
+				for entry := range strings.SplitSeq(check.got, ":") {
+					if entry == "" {
+						t.Errorf("%s = %q contains an empty entry (implicit CWD)", check.name, check.got)
+					}
+				}
+			}
+		})
 	}
 }

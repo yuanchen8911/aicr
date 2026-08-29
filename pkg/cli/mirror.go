@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/urfave/cli/v3"
@@ -134,12 +135,7 @@ func mirrorListFlags() []cli.Flag {
 
 // flagMatchesName returns true if a CLI flag has the given name among its names.
 func flagMatchesName(f cli.Flag, name string) bool {
-	for _, n := range f.Names() {
-		if n == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(f.Names(), name)
 }
 
 //nolint:gocyclo // linear option resolution
@@ -165,7 +161,7 @@ func runMirrorListCmd(ctx context.Context, cmd *cli.Command) (err error) {
 	// Build ONE per-command Client bound to the resolved data source. Both
 	// recipe-resolution paths (--recipe load and criteria resolve) run through
 	// it, replacing the old process-global data provider.
-	client, err := recipeClientFromCmd(cmd, cfg)
+	client, err := recipeClientFromCmd(ctx, cmd, cfg)
 	if err != nil {
 		return err
 	}
@@ -237,7 +233,7 @@ func runMirrorListCmd(ctx context.Context, cmd *cli.Command) (err error) {
 func resolveRecipeForMirror(ctx context.Context, cmd *cli.Command, cfg *appcfg.AICRConfig, client *aicr.Client) (*recipe.RecipeResult, error) {
 	recipePath := cmd.String("recipe")
 	if recipePath != "" {
-		if cmd.IsSet(flagProfile) || cfg.Recipe().ProfileSelection() != "" {
+		if cmd.IsSet(flagProfile) || aicr.WrapConfig(cfg).RecipeProfile() != "" {
 			return nil, errors.New(errors.ErrCodeInvalidRequest,
 				"--profile/spec.recipe.profile selects during criteria resolution and cannot be combined with --recipe")
 		}
@@ -285,10 +281,5 @@ func resolveOutputWriter(cmd *cli.Command) (io.Writer, func() error, error) {
 
 // isValidMirrorFormat checks if the given format is in the supported list.
 func isValidMirrorFormat(f mirror.Format) bool {
-	for _, valid := range mirror.SupportedFormats() {
-		if string(f) == valid {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(mirror.SupportedFormats(), string(f))
 }

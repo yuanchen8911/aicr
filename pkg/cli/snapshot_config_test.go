@@ -26,6 +26,8 @@ import (
 	"github.com/urfave/cli/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/NVIDIA/aicr/pkg/serializer"
 )
 
 // === Regression: --config wiring on snapshot command ===
@@ -442,7 +444,7 @@ spec:
 
 // TestSnapshotCmd_InvalidConfig_LegacyAPIVersion confirms a legacy
 // aicr.nvidia.com apiVersion is rejected fail-closed at config-load time.
-// After the aicr.run hard-break migration, only aicr.run/v1alpha2 is valid.
+// The old aicr.nvidia.com domain remains outside the ADR-022 read window.
 func TestSnapshotCmd_InvalidConfig_LegacyAPIVersion(t *testing.T) {
 	tmp := t.TempDir()
 	cfgPath := filepath.Join(tmp, "config.yaml")
@@ -528,9 +530,10 @@ spec:
 // === toAgentConfig conversion sanity check ===
 
 // TestSnapshotCmdOptions_ToAgentConfig pins the field-by-field
-// translation from snapshotCmdOptions to snapshotter.AgentConfig.
+// translation from snapshotCmdOptions to the facade aicr.AgentConfig.
 // Regression guard: silent drops would manifest as default empty values
-// reaching the deployer.
+// reaching the deployer. The facade→snapshotter half of the projection is
+// pinned separately by TestAgentConfigMirrorsInternal in pkg/client/v1.
 func TestSnapshotCmdOptions_ToAgentConfig(t *testing.T) {
 	opts := &snapshotCmdOptions{
 		kubeconfig:         "/kube/config",
@@ -549,6 +552,9 @@ func TestSnapshotCmdOptions_ToAgentConfig(t *testing.T) {
 		runtimeClass:       "nvidia",
 		os:                 "ubuntu",
 		maxNodesPerEntry:   5,
+		clusterConfigPath:  "/l8k/cluster-config.yaml",
+		aksGPUPoolsPath:    "/aks/pools.json",
+		discoverNetwork:    true,
 		requests:           corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
 		limits:             corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
 		tmplOpts: &snapshotTemplateOptions{
@@ -581,6 +587,9 @@ func TestSnapshotCmdOptions_ToAgentConfig(t *testing.T) {
 		{"Output", ac.Output, "snapshot.yaml"},
 		{"TemplatePath", ac.TemplatePath, "tpl.tmpl"},
 		{"NodeSelector[k]", ac.NodeSelector["k"], "v"},
+		{"ClusterConfigPath", ac.ClusterConfigPath, "/l8k/cluster-config.yaml"},
+		{"AKSGPUPoolsPath", ac.AKSGPUPoolsPath, "/aks/pools.json"},
+		{"DiscoverNetwork", ac.DiscoverNetwork, true},
 	}
 	for _, w := range wants {
 		if !reflect.DeepEqual(w.got, w.want) {
@@ -595,6 +604,90 @@ func TestSnapshotCmdOptions_ToAgentConfig(t *testing.T) {
 	}
 	if ac.Limits.Memory().String() != "2Gi" {
 		t.Errorf("Limits Memory = %v, want 2Gi", ac.Limits.Memory())
+	}
+}
+
+// TestSnapshotCmdOptions_ToSnapshotDelivery is the CLI-side regression guard
+// for issue #2398: `aicr snapshot --format json` wrote the agent's YAML
+// because the resolved format never reached the delivery descriptor. The agent
+// Job always stages YAML, so a format dropped in this projection is a format
+// silently ignored.
+func TestSnapshotCmdOptions_ToSnapshotDelivery(t *testing.T) {
+	for _, format := range []serializer.Format{
+		serializer.FormatYAML, serializer.FormatJSON, serializer.FormatTable,
+	} {
+		opts := &snapshotCmdOptions{
+			kubeconfig: "/kube/config",
+			tmplOpts: &snapshotTemplateOptions{
+				outputPath:   "snapshot.out",
+				templatePath: "tpl.tmpl",
+				format:       format,
+			},
+		}
+		got := opts.toSnapshotDelivery()
+		wants := []struct {
+			name string
+			got  any
+			want any
+		}{
+			{"Output", got.Output, "snapshot.out"},
+			{"TemplatePath", got.TemplatePath, "tpl.tmpl"},
+			{"Kubeconfig", got.Kubeconfig, "/kube/config"},
+			{"Format", got.Format, format},
+		}
+		for _, w := range wants {
+			if !reflect.DeepEqual(w.got, w.want) {
+				t.Errorf("format %q: %s = %v, want %v", format, w.name, w.got, w.want)
+			}
+		}
+	}
+}
+
+// TestSnapshotCmd_FormatFlagResolves covers both flag spellings the issue
+// reported as ignored, plus the config-file source, since all three feed the
+// same resolved format.
+func TestSnapshotCmd_FormatFlagResolves(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want serializer.Format
+	}{
+		{"default is yaml", []string{"-o", "-"}, serializer.FormatYAML},
+		{"long flag", []string{"-o", "-", "--format", "json"}, serializer.FormatJSON},
+		{"short alias", []string{"-o", "-", "-t", "json"}, serializer.FormatJSON},
+		{"table", []string{"-o", "-", "--format", "table"}, serializer.FormatTable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := captureSnapshotOpts(t, tt.args)
+			if opts.tmplOpts.format != tt.want {
+				t.Errorf("format = %q, want %q", opts.tmplOpts.format, tt.want)
+			}
+			if got := opts.toSnapshotDelivery().Format; got != tt.want {
+				t.Errorf("delivery format = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSnapshotCmd_ConfigFormatResolves pins the config-file source of the
+// same field: spec.snapshot.output.format must reach delivery too.
+func TestSnapshotCmd_ConfigFormatResolves(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.yaml")
+	cfg := `kind: AICRConfig
+apiVersion: aicr.run/v1alpha2
+spec:
+  snapshot:
+    output:
+      path: snapshot.json
+      format: json
+`
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	opts := captureSnapshotOpts(t, []string{"--config", cfgPath})
+	if got := opts.toSnapshotDelivery().Format; got != serializer.FormatJSON {
+		t.Errorf("delivery format = %q, want json", got)
 	}
 }
 

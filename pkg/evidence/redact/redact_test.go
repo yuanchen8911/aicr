@@ -16,6 +16,7 @@ package redact_test
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/NVIDIA/aicr/pkg/evidence/redact"
@@ -420,6 +421,15 @@ func TestCTRFAllowlistsExtra(t *testing.T) {
 			want: map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
 		},
 		{
+			// The RDMA fabric gate (#1952) reuses these same count keys to
+			// disclose a cordoned RDMA node narrowing its cohort (validated < total).
+			// No new key or skipReason is minted, so the allowlist is unchanged and
+			// the coverage survives redaction into the signed bundle verbatim.
+			name: "rdma cordoned-narrowed coverage survives",
+			in:   map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
+			want: map[string]string{"nodesValidated": "1", "nodesTotal": "2"},
+		},
+		{
 			name: "valid skip reason enum survives",
 			in:   map[string]string{"skipReason": "no-gpu-nodes"},
 			want: map[string]string{"skipReason": "no-gpu-nodes"},
@@ -505,13 +515,7 @@ func reportWithExtra(extra map[string]string) *ctrf.Report {
 
 func TestCTRFAppliedRulesIncludeExtraAllowlist(t *testing.T) {
 	_, rules := redact.CTRF(sampleReport())
-	found := false
-	for _, r := range rules {
-		if r == "ctrf.tests.extra.allowlist" {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(rules, "ctrf.tests.extra.allowlist")
 	if !found {
 		t.Errorf("applied rules must include ctrf.tests.extra.allowlist, got %v", rules)
 	}
@@ -556,4 +560,61 @@ func sortedUnique(s []string) bool {
 		}
 	}
 	return true
+}
+
+// TestSnapshotDropsItemsFromAllowlistedSubtype pins the second redaction layer.
+//
+// The allowlist drops label/taint by name, so Items on those never reach
+// copySubtype. This covers the other case: an *allowlisted* subtype that
+// carries Items. copySubtype rebuilds the subtype from the allowlisted Data
+// keys alone and never assigns Items, so node names or other identifiers
+// attached as items cannot cross the publication boundary.
+//
+// Without this, a future "carry Items through" change would be a one-line
+// fail-open with a fully green suite.
+func TestSnapshotDropsItemsFromAllowlistedSubtype(t *testing.T) {
+	snap := &snapshotter.Snapshot{
+		Measurements: []*measurement.Measurement{
+			measurement.NewMeasurement(measurement.TypeNodeTopology).
+				WithSubtype(measurement.Subtype{
+					Name: "summary",
+					Data: map[string]measurement.Reading{
+						"node-count":  measurement.Int(3),
+						"label-count": measurement.Int(9),
+					},
+					// Identifiers deliberately attached to an allowlisted subtype.
+					Items: []measurement.ItemEntry{{
+						Context: map[string]string{"key": "kubernetes.io/hostname", "value": "gpu-node-01"},
+						Data: map[string]measurement.Reading{
+							"node-count": measurement.Int(2),
+							"node-list":  measurement.Str("gpu-node-01,gpu-node-02"),
+							"truncated":  measurement.Bool(false),
+						},
+					}},
+				}).
+				Build(),
+		},
+	}
+
+	got, _ := redact.Snapshot(snap)
+
+	for _, m := range got.Measurements {
+		for i := range m.Subtypes {
+			st := &m.Subtypes[i]
+			if len(st.Items) != 0 {
+				t.Errorf("subtype %q retained %d items after redaction; Items must never cross "+
+					"the publication boundary", st.Name, len(st.Items))
+			}
+		}
+	}
+
+	// The allowlisted Data keys must still survive — this is a drop of Items,
+	// not of the subtype.
+	st := got.Measurements[0].GetSubtype("summary")
+	if st == nil {
+		t.Fatal("allowlisted summary subtype was dropped entirely")
+	}
+	if _, err := st.GetInt64("node-count"); err != nil {
+		t.Errorf("allowlisted key node-count did not survive redaction: %v", err)
+	}
 }

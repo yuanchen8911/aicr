@@ -127,28 +127,30 @@ Generate an optimized configuration recipe based on environment parameters.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `service` | string | any | K8s service: `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm`, `any` |
-| `accelerator` | string | any | GPU type: `h100`, `h200`, `gb200`, `b200`, `a100`, `l40`, `l40s`, `rtx-pro-6000`, `any` |
+| `service` | string | any | K8s service: `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm`, `metal3`, `any` |
+| `accelerator` | string | any | GPU type: `h100`, `h200`, `gb200`, `gb300`, `b200`, `a100`, `l40`, `l40s`, `rtx-pro-6000`, `any` |
 | `gpu` | string | any | Alias for `accelerator` |
 | `intent` | string | any | Workload: `training`, `inference`, `any` |
 | `os` | string | any | Node OS: `ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`, `any` |
 | `platform` | string | any | Platform/framework: `dynamo`, `kubeflow`, `nim`, `runai`, `slurm`, `any` |
-| `nodes` | integer | 0 | GPU node count (0 = any) |
+| `nodes` | integer | 0 | GPU node count hint (0 = unspecified). Advisory metadata — does not select or filter overlays. |
 
 **Examples:**
 
 ```shell
-# Minimal request
-curl "http://localhost:8080/v1/recipe"
-
-# Specify accelerator
+# Minimal request — at least one criteria dimension is required
 curl "http://localhost:8080/v1/recipe?accelerator=h100"
+
+# Specify accelerator with service
+curl "http://localhost:8080/v1/recipe?service=eks&accelerator=h100"
 
 # Full specification
 curl "http://localhost:8080/v1/recipe?service=eks&accelerator=h100&intent=training&os=ubuntu&nodes=8"
 
-# Using gpu alias (os is required here: gb200 on gke has no OS-agnostic recipe)
-curl "http://localhost:8080/v1/recipe?gpu=gb200&service=gke&os=cos"
+# Using gpu alias. Note: the profiled families (service=aks, service=gke)
+# are rejected on /v1 — use /v2/recipe for those (see the AKS/GKE
+# cut-over note below).
+curl "http://localhost:8080/v1/recipe?gpu=gb200&service=eks&os=ubuntu"
 
 # Pretty print with jq
 curl -s "http://localhost:8080/v1/recipe?accelerator=h100" | jq '.'
@@ -224,8 +226,9 @@ curl -s -X POST "http://localhost:8080/v1/recipe" \
 ```
 
 **Error Responses:**
+- `400 Bad Request` - No criteria provided: at least one of `service`, `accelerator`, `intent`, `os`, `platform`, or `nodes` must be non-zero. An empty request returns `"no criteria provided: specify at least one of service, accelerator, intent, os, platform, nodes"`. This guard applies to `GET /v1/recipe`, `POST /v1/recipe`, `GET /v1/query`, and `POST /v1/query`.
 - `400 Bad Request` - Invalid criteria format, missing required fields, or invalid enum values
-- `400 Bad Request` - A stated criteria dimension is not honored by any applicable recipe overlay (uncovered dimension). This applies to both `GET /v1/recipe` and `POST /v1/recipe`: every dimension you state (`service`, `accelerator`, `intent`, `os`, `platform`) must be matched by at least one applied overlay, or the request fails instead of silently returning a recipe that ignores it. `nodes` is exempt — it is advisory and never required to be covered. The response's `details.uncovered` array names the offending dimension(s), the requested value, and any `validCompletions` (additional criteria that would make the request coverable). Snapshot-driven resolution (CLI `--snapshot` / Go SDK) may additionally attach `excludedOverlays` and `constraintWarnings` to the error; the HTTP API resolves from criteria only and never emits those two fields.
+- `400 Bad Request` - A stated criteria dimension is not honored by any applicable recipe overlay (uncovered dimension). This applies to `GET /v1/recipe`, `POST /v1/recipe`, `GET /v1/query`, and `POST /v1/query`: every dimension you state (`service`, `accelerator`, `intent`, `os`, `platform`) must be matched by at least one applied overlay, or the request fails instead of silently returning a recipe that ignores it. `nodes` is exempt — it is advisory and never required to be covered. The response's `details.uncovered` array names the offending dimension(s), the requested value, and any `validCompletions` (additional criteria that would make the request coverable). Snapshot-driven resolution (CLI `--snapshot` / Go SDK) may additionally attach `excludedOverlays` and `constraintWarnings` to the error; the HTTP API resolves from criteria only and never emits those two fields.
 - `405 Method Not Allowed` - Only GET and POST are supported
 
 **Uncovered-Dimension Error Example:**
@@ -346,7 +349,9 @@ All GET /v1/recipe parameters are supported, plus:
 
 **Error Responses:**
 
-`GET /v1/query` and `POST /v1/query` resolve a recipe through the same engine as `/v1/recipe`, so a stated criteria dimension not honored by any applicable overlay fails the same way: `400 Bad Request` with the `details.uncovered` array described in the [POST /v1/recipe error responses](#post-v1recipe) above.
+- `400 Bad Request` - No criteria provided: at least one criteria dimension (`service`, `accelerator`, `intent`, `os`, `platform`, or `nodes`) must be non-zero. Returns `"no criteria provided: specify at least one of service, accelerator, intent, os, platform, nodes"`. See the [POST /v1/recipe error responses](#post-v1recipe) entry for full details.
+- `400 Bad Request` - Omitting `selector` returns `INVALID_REQUEST`. An explicitly empty `selector=` remains valid and returns the entire hydrated recipe.
+- `400 Bad Request` - A stated criteria dimension not honored by any applicable overlay (uncovered dimension) — same `details.uncovered` shape as described in the [POST /v1/recipe error responses](#post-v1recipe) above.
 
 **Examples:**
 
@@ -394,24 +399,30 @@ curl -X POST "http://localhost:8080/v1/query" \
 
 The response format matches `GET /v1/query`: scalar values are returned as plain JSON values; maps and lists are returned as JSON objects/arrays.
 
+**Error Responses:**
+
+Same as `GET /v1/query` — see the [GET /v1/query error responses](#get-v1query) section above. The no-criteria and uncovered-dimension 400 cases apply. Note: unlike `GET /v1/query`, omitting `selector` from the POST body returns the entire hydrated recipe rather than a 400 (use `/v2/query` if you need the selector to be required).
+
 ---
 
 ### Configured v2 endpoints
 
 `v2` in the route and `apiVersion` in a recipe document are independent
 version axes. The route segment versions the transient HTTP contract;
-`aicr.run/v1alpha2` and `aicr.run/v1alpha3` identify persisted recipe schemas.
-Therefore, `/v2/recipe` can return either artifact version and `/v2/bundle`
-accepts both, plus versionless legacy artifacts. Selecting a profile or resolving
-a Slurm accounting mode—not the route number—determines whether the artifact
-uses `v1alpha3`.
+`aicr.run/v1alpha2` and `aicr.run/v1alpha3` are the recipe schemas emitted by
+this reader-first release. `/v2/bundle` also accepts their ADR-022 targets:
+`aicr.run/v1` for a default recipe and `aicr.run/v1beta2` for a
+profile/configuration recipe, plus versionless legacy artifacts. Selecting a
+profile or resolving a Slurm accounting mode—not the route number—determines
+which schema track applies.
 
 `/v2/recipe`, `/v2/query`, and `/v2/bundle` expose the configured HTTP contract
-for profiles and Slurm accounting. The AKS family is the first embedded profile
-adopter (`gpuStack`), so
-**`/v1` workflows with `service=aks` now reject and must move to `/v2`**
-(see the AKS cut-over note below); `/v1` remains unchanged for families
-without a profile.
+for profiles and Slurm accounting. The AKS and GKE families are the embedded
+profile adopters (`gpuStack`), so **`/v1/recipe` and `/v1/query` requests with
+`service=aks` or `service=gke` now reject and must move to `/v2`**;
+`/v1/bundle` rejects only profile-bearing recipe bodies, so legacy unprofiled
+AKS/GKE recipes still bundle there (see the cut-over note below). `/v1`
+remains unchanged for families without a profile.
 
 **GET `/v2/recipe`.** Accepts the `/v1/recipe` criteria parameters plus
 optional `profile=name=value` and `slurmAccountingMode`. Profile omission
@@ -466,19 +477,23 @@ selector: metadata.selectedProfile
 **POST `/v2/bundle`.** Uses the same query parameters and ZIP response as
 `POST /v1/bundle`. It carries no profile-selection field because its body is
 an already-selected `RecipeResult`. It accepts legacy
-`aicr.run/v1alpha2` recipes, including older artifacts that omit
-`apiVersion`, and strictly decodes profiled or accounting-configured
-`aicr.run/v1alpha3` recipes. The
+`aicr.run/v1alpha2` and `aicr.run/v1` default recipes, including older
+artifacts that omit `apiVersion`, and strictly decodes profiled or
+accounting-configured `aicr.run/v1alpha3` and `aicr.run/v1beta2` recipes. The
 request requires `Content-Type: application/json` or `Content-Type:
 application/x-yaml`; missing, aliased, or unsupported media types are
 rejected.
 
 ```shell
-# The AKS family is the first embedded adopter (gpuStack profile).
-curl -s \
-  "http://localhost:8080/v2/recipe?service=aks&accelerator=h100&os=ubuntu&intent=training&profile=gpuStack=operator-managed" |
-  curl -X POST "http://localhost:8080/v2/bundle" \
-    -H "Content-Type: application/json" -d @- -o bundles.zip
+# The AKS and GKE families are the embedded adopters (gpuStack profiles).
+# -f stops on an HTTP error so a 4xx/5xx recipe body is never staged and
+# an error response is never written to bundles.zip. POSIX sh suffices:
+# the commands are sequential (no pipeline), so pipefail is not needed.
+set -eu
+curl -fsS -o recipe.json \
+  "http://localhost:8080/v2/recipe?service=aks&accelerator=h100&os=ubuntu&intent=training&profile=gpuStack=operator-managed"
+curl -fsS -X POST "http://localhost:8080/v2/bundle" \
+  -H "Content-Type: application/json" -d @recipe.json -o bundles.zip
 ```
 
 Profile-bearing responses record `metadata.selectedProfile`; accounting-aware
@@ -490,17 +505,37 @@ output.
 
 The `/v1` routes remain the legacy contract. Explicit profile and
 `slurmAccountingMode` input is rejected; Slurm recipes remain implicitly
-disabled and use the `aicr.run/v1alpha2` response shape. `/v1/recipe` and
-`/v1/query` reject a composition after it adopts a profile even when the request
-omits selection, and `/v1/bundle` rejects a profile-bearing body. Migrate a
-converted workflow to v2 as one cut-over.
+disabled and use the default-track response shape. That track is
+`aicr.run/v1alpha2` today, and the schema also admits its ADR-022 target
+`aicr.run/v1` so a client generated from this spec tolerates the value a
+release before AICR emits it. `/v1` never carries a profile-track version.
+`/v1/recipe` and `/v1/query` reject a composition after it adopts a
+profile even when the request omits selection, and `/v1/bundle` rejects a
+profile-bearing body. Migrate a converted workflow to v2 as one cut-over.
 
-**AKS cut-over:** the AKS family is the first embedded adopter, so
-`/v1/recipe` and `/v1/query` requests with `service=aks` now reject —
-move AKS clients to `GET /v2/recipe` / `GET /v2/query` (identical query
-parameters, plus optional `profile=gpuStack=azure-managed|operator-managed`), and
-POST AKS `aicr.run/v1alpha3` recipes to `/v2/bundle`. Other families are
+**AKS/GKE cut-over:** the AKS and GKE families are the embedded adopters, so
+`/v1/recipe` and `/v1/query` requests with `service=aks` or `service=gke` now
+reject. Move GET clients to `GET /v2/recipe` / `GET /v2/query` (identical
+query parameters, plus optional `profile=gpuStack=azure-managed` or
+`profile=gpuStack=operator-managed` on AKS, and `profile=gpuStack=gke-default`
+or `profile=gpuStack=bundle-installer` on GKE); move POST
+clients to `POST /v2/recipe` / `POST /v2/query`, converting the body to the
+strict envelope described above (a plain `criteria` object with an explicit
+`Content-Type`, not the v1 `RecipeCriteria` resource). Then POST the
+resulting `aicr.run/v1alpha3` recipes to `/v2/bundle`. Other families are
 unaffected on `/v1` until they adopt a profile.
+
+```shell
+# GKE migration: /v2/recipe (omit profile= for the gke-default default,
+# or select gpuStack=bundle-installer explicitly), then POST to /v2/bundle.
+# -f stops on an HTTP error so a 4xx/5xx recipe body is never staged and
+# an error response is never written to bundles.zip.
+set -euo pipefail
+curl -fsS -o recipe.json \
+  "http://localhost:8080/v2/recipe?service=gke&accelerator=h100&os=cos&intent=training&profile=gpuStack=bundle-installer"
+curl -fsS -X POST "http://localhost:8080/v2/bundle" \
+  -H "Content-Type: application/json" -d @recipe.json -o bundles.zip
+```
 
 ---
 
@@ -513,14 +548,15 @@ Generate deployment bundles from a recipe.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `bundlers` | string | (all) | Comma-delimited list of recipe component names to bundle (e.g. `gpu-operator,network-operator`). Whitespace around names is trimmed. Components not listed are skipped as if disabled (their dependency edges are treated as satisfied externally). A name the recipe does not declare, or one that is disabled (by the recipe or a `set` `enabled=false` override), is rejected with HTTP 400. |
-| `set` | string[] | | Value overrides (format: `bundler:path.to.field=value`). Repeat for multiple. The reserved prefix `deployer:` carries Argo CD Application options for `deployer=argocd` and `deployer=argocd-helm` (`namePrefix`, `destinationServer`, `project`, `cascadeDelete`), e.g. `set=deployer:namePrefix=tenant-a-`. Unknown `deployer:` keys — or the prefix with any other deployer — are rejected with HTTP 400. See the CLI reference's [Argo CD Deployer Options](cli-reference.md#argo-cd-deployer-options) for full semantics. |
-| `dynamic` | string[] | | Declare value paths as install-time parameters (format: `component:path.to.field`). Repeat for multiple. Supported with `deployer=helm`, `deployer=argocd-helm`, `deployer=flux`, and `deployer=helmfile`. |
+| `set` | string[] | | Value overrides (format: `bundler:path.to.field=value`). Repeat for multiple. The reserved prefix `deployer:` carries Argo CD Application options for `deployer=argocd` and `deployer=argocd-helm` (`namePrefix`, `destinationServer`, `project`, `cascadeDelete`), e.g. `set=deployer:namePrefix=tenant-a-`. Unknown `deployer:` keys — or the prefix with any other deployer — are rejected with HTTP 400. An override whose component is absent from the generated bundle is rejected with HTTP 400 (`INVALID_REQUEST`, "cannot take effect") rather than silently discarded; the scalar `enabled=false` spelling is exempt on a declared component. See [Overrides that cannot take effect are rejected](bundling.md#overrides-that-cannot-take-effect-are-rejected) and the CLI reference's [Argo CD Deployer Options](cli-reference.md#argo-cd-deployer-options) for full semantics. |
+| `dynamic` | string[] | | Declare value paths as install-time parameters (format: `component:path.to.field`). Repeat for multiple. Supported with `deployer=helm`, `deployer=argocd-helm`, `deployer=flux`, and `deployer=helmfile`. A declaration whose component is absent from the generated bundle is rejected with HTTP 400 (`INVALID_REQUEST`, "cannot take effect"); no path is exempt. Certain gate- or contract-owned paths on **present** components are also rejected — driver-ownership paths, GPU allocation-policy keys, the DRA eviction paths `kubeletPlugin.nodeSelector` and `driver.manager.env` when both contract components are enabled, and, where the corresponding NVSentinel gate applies on the recipe's platform and configuration, the NVSentinel remedy/consumer/runtime-class paths; see [NVSentinel on provider-installed-driver platforms](component-catalog.md#nvsentinel-on-provider-installed-driver-platforms). See [Overrides that cannot take effect are rejected](bundling.md#overrides-that-cannot-take-effect-are-rejected). |
 | `system-node-selector` | string[] | | Node selectors for system components (format: `key=value`). Repeat for multiple. |
 | `system-node-toleration` | string[] | | Tolerations for system components (format: `key=value:effect`). Repeat for multiple. |
 | `accelerated-node-selector` | string[] | | Node selectors for GPU nodes (format: `key=value`). Repeat for multiple. |
 | `accelerated-node-toleration` | string[] | | Tolerations for GPU nodes (format: `key=value:effect`). Repeat for multiple. |
+| `dra-eviction-node-label` | string | `nvidia.com/dra-kubelet-plugin=true` | Single node label coordinating DRA kubelet-plugin eviction with GPU Operator driver upgrades (format: `key=value`). Applied only when both components are enabled. Nodes used for DRA GPU allocation must carry the same label. |
 | `nodes` | int | 0 | Estimated number of GPU nodes (0 = unset). Written to Helm value paths declared in the registry under `nodeScheduling.nodeCountPaths`. |
-| `vendor-charts` | bool | false | Pull upstream Helm chart bytes into the bundle at bundle time so the artifact is fully self-contained and air-gap deployable. Each vendored chart is recorded in `provenance.yaml` with name, version, source URL, and SHA256. Trades the upstream CVE-yank fail-loud signal for offline deployability — see the CLI reference's "Vendoring Charts for Air-Gap" section for the full tradeoff. Requires the `helm` binary on the API server's `$PATH` and registry credentials configured for any private upstream repos (`HELM_REPOSITORY_USERNAME`/`HELM_REPOSITORY_PASSWORD` for HTTP(S); docker config for OCI). If prerequisites are missing the request fails with a structured error code (`SERVICE_UNAVAILABLE` / HTTP 503 for missing helm, `UNAUTHORIZED` / HTTP 401 for credentials). |
+| `vendor-charts` | bool | false | Pull upstream Helm chart bytes into the bundle at bundle time so the artifact is fully self-contained and air-gap deployable. Each vendored chart is recorded in `provenance.yaml` with name, version, source URL, and SHA256. Trades the upstream CVE-yank fail-loud signal for offline deployability — see the CLI reference's "Vendoring Charts for Air-Gap" section for the full tradeoff. Requires the `helm` binary on the API server's `$PATH`. **The server-side vendor path is opt-in and off by default** — the operator must set `AICR_ALLOW_VENDOR_CHARTS=true`, otherwise `vendor-charts=true` returns `400 vendor-charts is not enabled on this server`. Even when enabled, repository hosts that resolve to loopback, link-local, private, or cloud-metadata IPs are rejected with `400 INVALID_REQUEST`, and vendored artifacts are capped at 64 MiB. **Private HTTP(S) repository credentials:** the aicrd pre-check sends `HELM_REPOSITORY_USERNAME`/`HELM_REPOSITORY_PASSWORD` (as HTTP Basic auth) ONLY when `AICR_HELM_REPOSITORY_HOST` is set to that repository's exact host, the request scheme is `https`, and the request host matches (case-insensitive). All three conditions must hold — an operator setting only the username/password env vars will get no credentials attached, preventing a caller-supplied `Repository` URL from harvesting the operator's helm credentials. (Note: the upstream `helm pull --repo` subprocess does not itself read these env vars — private HTTP repos require a prior `helm repo add --username --password` in the aicrd image or an SDK-based puller.) OCI credentials flow through the standard docker config (`~/.docker/config.json` or `$DOCKER_CONFIG`), exactly like `helm pull oci://...`. If prerequisites are missing the request fails with a structured error code (`SERVICE_UNAVAILABLE` / HTTP 503 for missing helm). The index pre-check surfaces upstream HTTP status by class: `404` → `NOT_FOUND` / HTTP 404, `401`/`403` → `UNAUTHORIZED` / HTTP 401, `408`/`429` → `SERVICE_UNAVAILABLE` / HTTP 503 (retryable), other `4xx` → `INVALID_REQUEST` / HTTP 400, `5xx` → `SERVICE_UNAVAILABLE` / HTTP 503. |
 | `serial` | bool | false | Sequence components strictly one at a time in deployment order, disabling the parallel rollout of independent components. Affects `deployer=argocd`, `argocd-helm`, `flux`, and `helmfile` (`helm` is already serial): argocd falls back to a linear sync-wave per folder, flux chains each `HelmRelease` `dependsOn` to the previous component, and helmfile chains every release via `needs:` into one linear apply order. An escape hatch for reproducing the pre-parallelism ordering or bisecting a rollout. |
 | `deployer` | string | helm | Deployment method: `helm`, `argocd`, `argocd-helm`, `flux`, or `helmfile` |
 | `repo` | string | | Git repository URL for GitOps deployments (used with `deployer=argocd` and `deployer=flux`; ignored by `deployer=argocd-helm`) |
@@ -530,8 +566,9 @@ Generate deployment bundles from a recipe.
 **Request Body:**
 
 The request body is the recipe (`RecipeResult`) directly. No wrapper object is
-needed. Current artifacts carry `apiVersion: aicr.run/v1alpha2` or
-`aicr.run/v1alpha3` and `kind: RecipeResult`. The v1alpha3 form identifies
+needed. This release emits `apiVersion: aicr.run/v1alpha2` or
+`aicr.run/v1alpha3` and `kind: RecipeResult`; its bundle readers additionally
+accept `aicr.run/v1` and `aicr.run/v1beta2`, respectively. The profile track identifies
 recipes carrying `metadata.selectedProfile`, typed
 `configuration.slurm.accounting`, or both; profile-bearing artifacts must use
 `/v2/bundle`. New clients should preserve the version emitted by recipe
@@ -543,34 +580,40 @@ For backward compatibility, the endpoint also accepts:
   strings after a decode/remarshal round trip.
 - The `kind: Recipe` value this contract published through v0.18.0.
 
-The handler does not validate `kind`, so all three shapes reach the bundler
-identically. `apiVersion` is the exception, validated as described next.
+All three shapes reach the bundler identically: the endpoint normalizes `kind`
+on ingest, stamping `kind: RecipeResult` when the request carries an absent,
+empty, or legacy `Recipe` kind. The generated bundle's `recipe.yaml`
+therefore always carries the canonical `kind` and reloads through
+`aicr bundle -r`, `aicr validate -r`, and the tooling that reads a bundle's
+`recipe.yaml` (TestGrid publication, evidence synthesis). Only `kind` is
+rewritten — a request that omits `apiVersion` still produces an artifact with
+an empty `apiVersion`, which every reader accepts as the legacy shape.
 
-`apiVersion` has no equivalent legacy window on purpose. An artifact
-group/version bump is a hard break with no transition period, so a recipe
-stamped with a prior group/version should be regenerated rather than sent.
+Any other `kind` is rejected with a 400, so the endpoint never emits an artifact
+it would refuse to read back. This matches the `/v2/bundle` decode path, and the
+CLI file loader for the same values — `aicr bundle -r` accepts a
+`RecipeMetadata` file as an *overlay* to hydrate, but as a hydrated
+`RecipeResult` artifact it too accepts only `RecipeResult` or an absent kind.
+`apiVersion` is validated separately, as described next.
 
-This one is enforced. The shared artifact gate rejects any `apiVersion` outside
-`aicr.run/v1alpha2` and `aicr.run/v1alpha3` with a 400, on this endpoint as well
-as on the CLI file-load path, so a prior group/version fails rather than being
-silently accepted. An absent or empty `apiVersion` is still admitted as the
-legacy shape.
-
-**Round-trip caveat for `kind: Recipe`.** The header is copied into the
-generated bundle's `recipe.yaml` rather than normalized. The CLI file loader
-tolerates an absent or empty `kind` but rejects `Recipe`, so a bundle generated
-from a `kind: Recipe` body cannot be fed back through `aicr bundle -r` or
-`aicr validate -r`. Send `kind: RecipeResult` if you need the emitted artifact
-to remain reloadable.
-
-The same limit reaches the tooling that reads a bundle's `recipe.yaml`, so
-TestGrid publication and evidence synthesis also reject such a bundle. Only
-bundles generated from a `kind: Recipe` HTTP body are affected; the CLI always
-writes `RecipeResult`.
+The shared artifact gate rejects any `apiVersion` outside
+`aicr.run/v1alpha2`, `aicr.run/v1`, `aicr.run/v1alpha3`, and
+`aicr.run/v1beta2` with a 400, on this endpoint as well as on the CLI file-load
+path. An absent or empty `apiVersion` is still admitted as the legacy shape on
+`RecipeResult` inputs through v0.22, and v0.23 stops admitting it along with the
+alpha values. The tolerance is scoped to `RecipeResult`, which predates the
+field: a `RecipeMetadata` overlay is a catalog document however it arrives, so
+`aicr bundle -r` and `aicr validate -r` reject a headerless one exactly as a
+`--data` catalog scan does. The reader and emitter clocks are separate: v0.21
+and v0.22 both read the alpha values, the target values, and the empty header,
+while generated recipes keep their alpha headers until v0.22 switches the
+emitters. See
+[Catalog and binary compatibility](../integrator/data-extension.md#catalog-and-binary-compatibility)
+for the release-by-release table.
 
 #### Components
 
-These are the recipe **components** in [`recipes/registry.yaml`](https://github.com/NVIDIA/aicr/blob/main/recipes/registry.yaml) — the names the `bundlers` query parameter accepts (a request may only name components the recipe declares). The registry is the authoritative source — see the [component catalog](component-catalog.md) for the full, current list with detailed descriptions. The table below is illustrative of commonly used components:
+These are the recipe **components** in [`recipes/registry.yaml`](https://github.com/NVIDIA/aicr/blob/main/recipes/registry.yaml) — the names the `bundlers` query parameter accepts (a request may only name components the recipe declares). The registry is the authoritative source — see the [component catalog](component-catalog.md) for detailed descriptions, pinned versions, and per-component caveats.
 
 | Component | Description |
 |-----------|-------------|
@@ -579,19 +622,25 @@ These are the recipe **components** in [`recipes/registry.yaml`](https://github.
 | `aws-ebs-csi-driver` | Amazon EBS CSI driver (EKS) |
 | `aws-efa` | AWS Elastic Fabric Adapter device plugin (EKS) |
 | `cert-manager` | TLS certificate management |
+| `cert-manager-ocp` | cert-manager variant for OpenShift (OCP) |
+| `cert-manager-ocp-olm` | cert-manager for OpenShift via Operator Lifecycle Manager (OLM) |
 | `dynamo-platform` | NVIDIA Dynamo inference serving platform |
 | `gatekeeper` | OPA Gatekeeper policy controller |
-| `gke-nccl-tcpxo` | NCCL TCPxO network plugin for optimized collective communication (GKE) |
+| `gke-nccl-tcpxo` | NCCL TCPXO network plugin for optimized collective communication (GKE) |
 | `gpu-operator` | NVIDIA GPU Operator — driver and runtime lifecycle |
 | `gpu-operator-ocp` | GPU Operator variant for OpenShift (OCP) |
 | `gpu-operator-ocp-olm` | GPU Operator for OpenShift via Operator Lifecycle Manager (OLM) |
 | `grove` | Dynamo pod lifecycle management |
+| `k8s-aibom` | Optional runtime AI workload inventory — namespace-scoped CycloneDX ML-BOM resources |
 | `k8s-ephemeral-storage-metrics` | Ephemeral storage usage metrics |
 | `k8s-nim-operator` | NVIDIA NIM Operator for inference microservice deployments |
+| `k8s-nim-operator-ocp` | NIM Operator variant for OpenShift (OCP) |
 | `kai-scheduler` | DRA-aware gang scheduler with topology-aware placement |
 | `kube-prometheus-stack` | Prometheus, Grafana, Alertmanager monitoring stack |
 | `kubeflow-trainer` | Kubeflow Training Operator for distributed training |
 | `kueue` | Kubernetes-native job queuing for batch and AI workloads |
+| `mariadb-operator` | Official MariaDB Operator; installed only for AICR-provided Slurm accounting |
+| `mariadb-operator-crds` | Official MariaDB Operator CRDs; installed only for AICR-provided Slurm accounting |
 | `network-operator` | NVIDIA Network Operator — RDMA, SR-IOV, host networking |
 | `network-operator-ocp` | Network Operator variant for OpenShift (OCP) |
 | `network-operator-ocp-olm` | Network Operator for OpenShift via Operator Lifecycle Manager (OLM) |
@@ -601,14 +650,15 @@ These are the recipe **components** in [`recipes/registry.yaml`](https://github.
 | `nodewright-customizations` | Environment-specific node tuning profiles |
 | `nodewright-operator` | OS-level node tuning and kernel configuration |
 | `nvidia-dra-driver-gpu` | Dynamic Resource Allocation driver for GPUs |
+| `nvidia-dra-driver-gpu-ocp` | DRA GPU driver variant for OpenShift (OCP) |
 | `nvsentinel` | GPU health monitoring and automated remediation |
 | `prometheus-adapter` | Custom metrics for HPA scaling |
+| `prometheus-adapter-ocp` | Prometheus Adapter variant for OpenShift (OCP) |
 | `prometheus-operator-crds` | CRDs for the prometheus-operator (`Alertmanager`, `Prometheus`, `ServiceMonitor`, etc.) |
 | `slinky-slurm` | Slinky-managed Slurm cluster instance (Controller, LoginSet, NodeSet, RestApi); reconciled by `slinky-slurm-operator` |
 | `slinky-slurm-operator` | SchedMD Slinky Slurm operator and admission webhook |
 | `slinky-slurm-operator-crds` | CRDs for the SchedMD Slinky Slurm operator (`slinky.slurm.net`) |
-| `mariadb-operator-crds` | Official MariaDB Operator CRDs; installed only for AICR-provided Slurm accounting |
-| `mariadb-operator` | Official MariaDB Operator; installed only for AICR-provided Slurm accounting |
+| `slinky-topograph` | Generates Slurm `topology.conf` from cloud topology APIs for topology-aware Slinky placement |
 | `slurm-accounting-mariadb` | Installation-managed MariaDB instance and Secret generation contract for Slurm accounting; installed only for AICR-provided Slurm accounting |
 
 **Examples:**
@@ -664,6 +714,12 @@ curl -s "http://localhost:8080/v1/recipe?accelerator=h100&service=eks" | \
 # With node scheduling for system and GPU nodes
 # (recipe.json must be a fully-hydrated RecipeResult, e.g. from GET /v1/recipe)
 curl -X POST "http://localhost:8080/v1/bundle?system-node-selector=nodeGroup=system&system-node-toleration=dedicated=system:NoSchedule&accelerated-node-selector=nvidia.com/gpu.present=true&accelerated-node-toleration=nvidia.com/gpu=present:NoSchedule" \
+  -H "Content-Type: application/json" \
+  -d @recipe.json \
+  -o bundles.zip
+
+# Override the shared DRA eviction label when bundling DRA with GPU Operator
+curl -X POST "http://localhost:8080/v1/bundle?dra-eviction-node-label=example.com%2Fdra-ready%3Denabled" \
   -H "Content-Type: application/json" \
   -d @recipe.json \
   -o bundles.zip
@@ -778,7 +834,7 @@ certificate from Fulcio using its own OIDC identity. Operator setup for Mode B:
 | `AICR_SIGNING_CONFIG_PATH` | A, B | Sigstore SigningConfig JSON for Rekor v2 targeting. |
 | `AICR_TLOG_UPLOAD` | A | Set `false` to skip the Rekor upload for air-gapped KMS signing. KMS-only; keyless always uploads. |
 | `AICR_BINARY_ATTESTATION_FILE` | A, B | Absolute path to the aicrd binary attestation. Unset defaults to the conventional `<executable>-attestation.sigstore.json` next to the running binary. Set it when the attestation ships elsewhere in the image, e.g. a ko build stages assets under `KO_DATA_PATH` (`/var/run/ko/aicrd-attestation.sigstore.json`) rather than next to the binary. |
-| `AICR_BINARY_ATTESTATION_IDENTITY_REGEXP` | A, B | Certificate-identity pattern the server pins its own binary attestation to. Unset uses the release-workflow default (`on-tag.yaml`). A custom value MUST still contain `NVIDIA/aicr` so it stays pinned to the NVIDIA org; it retargets which NVIDIA workflow attested the binary (e.g. an e2e workflow), not the org, and a value that is not so pinned fails startup. Mirrors the CLI's `--certificate-identity-regexp`. |
+| `AICR_BINARY_ATTESTATION_IDENTITY_REGEXP` | A, B | Certificate-identity pattern the server pins its own binary attestation to. Unset uses the release-workflow default (`on-tag.yaml`). A custom value MUST begin with `https://github.com/NVIDIA/aicr/` (leading `^` allowed) and must not use top-level alternation, so it stays confined to the NVIDIA repository; it retargets which NVIDIA workflow attested the binary (e.g. an e2e workflow), not the org, and a value that is not so pinned fails startup. Mirrors the CLI's `--certificate-identity-regexp`. |
 
 Setting both `AICR_SIGNING_KEY` and the keyless variables is ambiguous and the
 server refuses to start.
@@ -837,9 +893,10 @@ curl "http://localhost:8080/ready"
 
 ---
 
-### GET /metrics
+### GET and HEAD /metrics
 
-Prometheus metrics endpoint.
+Prometheus metrics endpoint. `HEAD` returns the same headers with no body;
+every other method is rejected with `405` and an `Allow: GET, HEAD` header.
 
 ```shell
 curl "http://localhost:8080/metrics"
@@ -921,6 +978,7 @@ ls -la
 | `NOT_FOUND` | 404 | Selector path not found in the resolved configuration | No |
 | `METHOD_NOT_ALLOWED` | 405 | Wrong HTTP method | No |
 | `CONFLICT` | 409 | Resource state conflict (e.g., already exists or version mismatch) | No |
+| `CANCELED` | 408 | The operation was aborted before completion (CLI-originated; not expected from the HTTP API) | No |
 | `RATE_LIMIT_EXCEEDED` | 429 | Too many requests | Yes |
 | `INTERNAL` | 500 | Server error | Yes |
 | `SERVICE_UNAVAILABLE` | 503 | Server temporarily unavailable | Yes |
@@ -1135,16 +1193,19 @@ main();
 #!/bin/bash
 # Generate recipes for multiple environments
 
+# /v2/recipe accepts every family (profiled and unprofiled); the aks and
+# gke entries below would be rejected on /v1 because those families carry
+# the gpuStack profile (see the AKS/GKE cut-over note).
 environments=(
   "os=ubuntu&accelerator=h100&service=eks"
-  "os=ubuntu&accelerator=gb200&service=gke"
-  "os=rhel&accelerator=a100&service=aks"
+  "os=cos&accelerator=h100&service=gke"
+  "os=ubuntu&accelerator=h100&service=aks"
 )
 
 for env in "${environments[@]}"; do
   echo "Fetching recipe for: $env"
 
-  curl -s "http://localhost:8080/v1/recipe?${env}" \
+  curl -s "http://localhost:8080/v2/recipe?${env}" \
     | jq -r '.componentRefs[] | "\(.name): \(.version)"'
 
   echo ""
@@ -1179,7 +1240,7 @@ openapi-generator-cli generate -i openapi.yaml -g typescript-fetch -o ./ts-clien
 
 **"Invalid accelerator type" error:**
 ```shell
-# Use valid values: h100, h200, gb200, b200, a100, l40, l40s, rtx-pro-6000, any
+# Use valid values: h100, h200, gb200, gb300, b200, a100, l40, l40s, rtx-pro-6000, any
 curl "http://localhost:8080/v1/recipe?accelerator=h100"
 ```
 

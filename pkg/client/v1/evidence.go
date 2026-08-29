@@ -25,7 +25,7 @@ import (
 )
 
 // OIDCResolveOptions configures keyless-signing OIDC token resolution for a
-// pushed evidence bundle. Transparent alias of
+// pushed evidence bundle. Deliberate transparent alias of
 // pkg/bundler/attestation.ResolveOptions, mirroring how BundleOptions exposes
 // BundleAttester: the caller (CLI/server) builds the resolution inputs and the
 // facade threads them through to attestation.Emit, which resolves the token
@@ -37,7 +37,7 @@ type OIDCResolveOptions = bundleattest.ResolveOptions
 // mirror of the inputs the CLI used to assemble inline, minus the interactive
 // signing-disclosure prompt, which is a UI concern the caller owns.
 type EvidenceOptions struct {
-	// OutDir is the directory to write the recipe-evidence v1 bundle to
+	// OutDir is the directory to write the recipe-evidence bundle to
 	// (summary-bundle/, optionally logs-bundle/, and pointer.yaml). Required.
 	OutDir string
 
@@ -95,8 +95,10 @@ func (c *Client) MergeReports(results []*PhaseResult) *ctrf.Report {
 	return ctrf.MergeReports("aicr", version, reports)
 }
 
-// EmitRecipeEvidence builds (and optionally pushes) a recipe-evidence v1
-// attestation bundle from a completed validation run. It is the facade
+// EmitRecipeEvidence builds (and optionally pushes) a recipe-evidence
+// attestation bundle from a completed validation run — predicateType v1 for
+// unprofiled recipes, v2 when the recipe carries a configuration profile
+// (metadata.selectedProfile). It is the facade
 // counterpart to the logic the CLI previously assembled inline: it converts
 // the facade PhaseResults back to the internal shape, loads the validator
 // catalog against THIS Client's data source and version, and delegates to the

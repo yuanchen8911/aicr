@@ -41,6 +41,14 @@ on:
         description: 'nightly (provision→CUJ→teardown) | daytime-up (provision+deploy+HOLD) | daytime-down (tear down the held daytime cluster).'
         type: string
         default: nightly
+      slug:
+        description: 'Daytime cluster-name discovery slug (ADR-017; from the reservation row) — the <slug> in aicr-uat-day-<slug>-<slot>-<run_id>.'
+        type: string
+        default: ''
+      slot:
+        description: 'Daytime cluster slot (ADR-017) — the <slot> in aicr-uat-day-<slug>-<slot>-<run_id>. Only slot 0 is provisioned today.'
+        type: string
+        default: '0'
       cluster_config_path:
         description: 'Cluster-config the AKS actuator provisions from (from infra/uat/reservations.yaml).'
         type: string
@@ -68,19 +76,27 @@ permissions:
 
 jobs:
   uat-azure:
-    if: github.repository == 'nvidia/aicr'
+    # always() so a cancelled run still reaches the step-level always()-run
+    # Destroy Cluster teardown. Without it GitHub applies an implicit success()
+    # to the job-level if:, force-killing the job ~5m after cancellation — before
+    # the ~26m-per-attempt teardown can release the AKS cluster, leaking it and
+    # its resource group. The repository guard is preserved as the second
+    # conjunct so forks still skip the job.
+    if: always() && github.repository == 'nvidia/aicr'
     runs-on: ubuntu-latest
     # Budget = uncapped non-UAT steps (build, validator image push, AKS
     # provisioning, evidence upload ~30m) + UAT phase steps (prep 15 + install 90
     # + validate 40 + the intent-selected CUJ (train 25 OR serve 40) + verify 5
-    # = up to 190) + the always()-run Destroy Cluster teardown (3 retries, ~10m
-    # each = up to ~40m). Only one of train/serve runs per intent, so the budget
-    # counts the larger (serve). The teardown MUST fit in this budget: a job-level
-    # timeout cancels pending always() steps, so an undersized cap would skip
-    # teardown and leak the GPU node. 190 UAT + ~30 setup + ~8 failure-path debug
-    # collection (Collect cluster debug bundle) + ~40 teardown = ~268, so 280
-    # leaves the teardown headroom even on a worst-case phase run.
-    timeout-minutes: 280
+    # = up to 190) + ~8 failure-path debug collection (Collect cluster debug
+    # bundle) + the always()-run Destroy Cluster teardown. Only one of
+    # train/serve runs per intent, so the budget counts the larger (serve).
+    # Teardown = up to 3 retries × ~26m real destroy = up to ~78m. The teardown
+    # MUST fit in this budget: a job-level timeout cancels pending always()
+    # steps, so an undersized cap would skip teardown and leak the GPU node /
+    # resource group even after a LATE failure. ~30 setup + 190 UAT + ~8 debug =
+    # 228, + ~78 teardown = 306, so 330 leaves the teardown clear headroom on a
+    # worst-case run.
+    timeout-minutes: 330
     permissions:
       contents: read
       actions: read
@@ -104,17 +120,27 @@ jobs:
       # AZURE_PRINCIPAL_ID). Inlined because the federated az session may
       # lack the Graph access needed to resolve the client id to a principal.
       AZURE_PRINCIPAL_ID: "3c061691-eded-40cb-869e-d5fdb2944a62"
-      # Cluster name (AKS actuator derives both the cluster name and its
-      # resource group `<id>-rg` from .deployment.id). The nightly
-      # per-run lifecycle uses a run-scoped name for per-run isolation; the
-      # daytime lifecycles use a STABLE, reservation-tagged name so the evening
-      # teardown (daytime-down) and the nightly pre-batch guard can find the
-      # held cluster. Reservation names are lowercase alnum+hyphen, so the
-      # derived name is a valid AKS cluster name.
+      # Cluster name (AKS actuator derives both the cluster name and its resource
+      # group `<id>-rg` from .deployment.id). The `aicr-uat-` prefix is shared across
+      # AWS/GCP/Azure (and matches the committed cluster-config `id: aicr-uat`), so
+      # UAT cluster names are consistent per platform. The nightly per-run lifecycle
+      # uses a run-scoped name (aicr-uat-<run_id>) for per-run isolation. daytime-up
+      # uses an EPHEMERAL, (slug, slot)-scoped name (ADR-017) — the stable prefix
+      # aicr-uat-day-<slug>-<slot>- with the up-run's id appended — so a re-provision
+      # never reuses a name the previous teardown just deleted (which collides with
+      # cloud deletion tombstones and, on Azure especially, stale terraform-state
+      # blob-lease locks). Discovery is name-free: the pre-batch guard and
+      # daytime-down both scan the stable prefix (the actuator derives the cluster
+      # name, its <name>-rg resource group, AND its TF-state key from .deployment.id).
+      # daytime-down has no static name here — it resolves the concrete cluster at
+      # runtime (see "Resolve daytime cluster to tear down") and overrides
+      # DEPLOYMENT_ID. The slug is a short lowercase-alnum registry key and slot a
+      # small integer, so the derived name (and its <name>-rg group) is a valid AKS
+      # cluster name well within the 63-char cap.
       DEPLOYMENT_ID: >-
-        ${{ (inputs.lifecycle == 'daytime-up' || inputs.lifecycle == 'daytime-down')
-        && format('aicr-day-{0}', inputs.reservation)
-        || format('aicr-{0}', github.run_id) }}
+        ${{ inputs.lifecycle == 'daytime-up'
+        && format('aicr-uat-day-{0}-{1}-{2}', inputs.slug, inputs.slot, github.run_id)
+        || format('aicr-uat-{0}', github.run_id) }}
       CLUSTER_CONFIG: ${{ inputs.cluster_config_path }}
       # DC2 selects the AICRConfig by intent; both intents drive the same
       # cluster-config (GPU pool from the reservation, system/CPU pools dynamic).
@@ -153,6 +179,8 @@ jobs:
           INTENT: ${{ inputs.intent }}
           LIFECYCLE: ${{ inputs.lifecycle }}
           SKIP_TESTS: ${{ inputs.skip_tests }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
         run: |
           set -euo pipefail
           case "${INTENT}" in
@@ -163,6 +191,21 @@ jobs:
             nightly|daytime-up|daytime-down) ;;
             *) echo "::error::unknown lifecycle '${LIFECYCLE}' (want nightly|daytime-up|daytime-down)"; exit 1 ;;
           esac
+          # Fail closed on a malformed slug/slot (ADR-017): both become cluster-name
+          # components AND grep -E prefixes in the guard/teardown scans, so a blank
+          # slug misses the held cluster and a slot carrying ERE metacharacters makes
+          # the pattern invalid (grep ... || true then reads it as "no match" — the
+          # guard would provision anyway, or daytime-down skip teardown). slug matches
+          # the registry charset; slot is numeric and length-bounded (the ADR models
+          # 1-2 digit slots; uat-run additionally pins today's policy to slot 0).
+          SLUG_RE='^[a-z][a-z0-9]{1,3}$'
+          SLOT_RE='^[0-9]{1,2}$'
+          if [[ ! "${SLUG}" =~ $SLUG_RE ]]; then
+            echo "::error::invalid slug '${SLUG}' (want ${SLUG_RE})"; exit 1
+          fi
+          if [[ ! "${SLOT}" =~ $SLOT_RE ]]; then
+            echo "::error::invalid slot '${SLOT}' (want 1-2 digits)"; exit 1
+          fi
           # The per-intent config is only consumed by the UAT phase steps, so
           # only require it when tests will actually run: skip_tests burn-in
           # runs and daytime-down (teardown-only) must not fail on a missing
@@ -188,7 +231,6 @@ jobs:
           cache: true
           cache-dependency-path: |
             go.sum
-            vendor/modules.txt
 
       # Main cell (aicr_version empty): build the aicr binary from the
       # checked-out source (tip). Release cells install the released binary
@@ -197,7 +239,6 @@ jobs:
       - name: Build aicr binary
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         env:
-          GOFLAGS: -mod=vendor
           # github.sha via env (never inline ${{ }} in a shell run — expression
           # injection). It is a 40-hex commit, so no real risk, but env is the
           # repo norm and keeps zizmor/CodeRabbit quiet.
@@ -247,18 +288,20 @@ jobs:
       - name: Build and push validator images
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         run: |
-          GO_VERSION="$(cat .go-version)"
+          set -euo pipefail
+          VALIDATOR_ARCH="$(go env GOARCH)"
+          VALIDATOR_ARCHES="${VALIDATOR_ARCH}" ./tools/build-validator-binaries
           # CHAINSAW_* args dropped in #1236 — the deployment validator
           # no longer ships /usr/local/bin/chainsaw; it executes Chainsaw
-          # Test format in-process via validators/chainsaw/inprocess.go.
+          # Test format in-process via pkg/chainsaw/inprocess.go.
           #
           # aiperf-bench is an ancillary (non-Go) validator image the
           # performance phase's inference-perf check pulls at runtime, resolved
           # through the same AICR_VALIDATOR_IMAGE_TAG=uat-<run_id> override as
           # the Go validators. It MUST be built+pushed here too, or the AIPerf
           # pod ImagePullBackOffs on a nonexistent uat-<run_id> tag and hangs
-          # until the job timeout (#1636). It uses a different Dockerfile path
-          # and takes no GO_VERSION build-arg. Keep the phase set in sync with
+          # until the job timeout (#1636). It uses a different Dockerfile and
+          # does not consume a prebuilt Go binary. Keep the phase set in sync with
           # VALIDATOR_PHASES in on-push.yaml / on-tag.yaml.
           for phase in deployment performance conformance aiperf-bench; do
             IMAGE="${VALIDATOR_IMAGE_PREFIX}/${phase}:${VALIDATOR_TAG}"
@@ -269,7 +312,7 @@ jobs:
                 ;;
               *)
                 docker build -f "validators/${phase}/Dockerfile" \
-                  --build-arg "GO_VERSION=${GO_VERSION}" \
+                  --build-arg "TARGETARCH=${VALIDATOR_ARCH}" \
                   -t "${IMAGE}" .
                 ;;
             esac
@@ -284,7 +327,7 @@ jobs:
       # phases below each re-run azure/login — mirroring the AWS pipeline's
       # per-stage STS refreshes.
       - name: Authenticate to Azure
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -298,41 +341,131 @@ jobs:
       # failure means genuinely exhausted quota, not a race. Recorded in
       # docs/contributor/uat.md; intentionally no capacity step below.
 
-      # Pre-batch guard (#1275, DC2). The nightly lifecycle refuses to provision
-      # into a reservation that still holds an un-torn-down daytime cluster: a
-      # missed evening teardown must surface as a BLOCKED batch, not as silent
-      # contention. Detect by the stable daytime cluster name
-      # (aicr-day-<reservation>); we already hold the reservation lease
-      # (uat-run.yaml) and are authenticated, so this runs before Bringup and
-      # fails fast rather than racing. Only the nightly lifecycle guards —
-      # daytime-up creates that cluster, daytime-down removes it.
+      # Pre-batch guard (#1275, DC2). A provisioning run refuses to provision into
+      # a reservation that still holds an un-torn-down daytime cluster: a missed
+      # evening teardown must surface as a BLOCKED run, not as silent contention
+      # (or a second, stacked daytime cluster).
+      #
+      # daytime clusters are EPHEMERALLY named (aicr-uat-day-<slug>-<slot>-<id>,
+      # ADR-017), so this detects them by the stable, (slug, slot)-scoped PREFIX
+      # rather than a reconstructed exact name — a prefix scan is the only
+      # name-free way to find a held cluster this run cannot name. DUAL-PREFIX
+      # MIGRATION SHIM: it also matches the LEGACY reservation-name prefix
+      # (aicr-uat-day-<reservation>-) so an old-named daytime cluster still blocks
+      # the batch; drop the legacy leg once no old-named clusters remain. Both the
+      # nightly batch AND daytime-up guard: daytime-up must refuse if a prior day's
+      # cluster leaked (the reservation cannot host two, and unique names would
+      # otherwise let them stack). daytime-up's OWN cluster does not exist yet, so
+      # only a leaked prior cluster matches. We already hold the reservation lease
+      # (uat-run.yaml) and are authenticated, so this runs before Bringup and fails
+      # fast.
       - name: Pre-batch guard — refuse if a daytime cluster still holds the reservation
         id: guard
-        if: inputs.lifecycle == 'nightly'
+        if: inputs.lifecycle == 'nightly' || inputs.lifecycle == 'daytime-up'
         env:
           RESERVATION: ${{ inputs.reservation }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
+          LIFECYCLE: ${{ inputs.lifecycle }}
         run: |
           set -euo pipefail
-          DAYTIME_NAME="aicr-day-${RESERVATION}"
+          # New (slug, slot)-scoped prefix (ADR-017) plus the LEGACY reservation
+          # prefix — a transitional shim so an old-named daytime cluster still
+          # blocks the batch; drop the legacy leg once none remain.
+          PREFIX="aicr-uat-day-${SLUG}-${SLOT}-"
+          LEGACY_PREFIX="aicr-uat-day-${RESERVATION}-"
           set +e
-          OUT=$(az aks show --name "${DAYTIME_NAME}" \
-            --resource-group "${DAYTIME_NAME}-rg" 2>&1)
+          OUT=$(az aks list --query "[].name" -o tsv --only-show-errors 2>&1)
           RC=$?
           set -e
-          if [[ ${RC} -eq 0 ]]; then
-            echo "::error::daytime cluster ${DAYTIME_NAME} still holds reservation ${RESERVATION}; refusing to start the nightly batch. Tear it down first (uat-run lifecycle=daytime-down)."
+          # Fail closed on a list error: a throttle/auth failure must not be read
+          # as "no daytime cluster, clear to proceed".
+          if [[ ${RC} -ne 0 ]]; then
+            echo "::error::could not list clusters to determine daytime-cluster state for reservation ${RESERVATION}: ${OUT}"
             exit 1
           fi
-          # Fail closed on anything that is NOT a definitive "does not exist":
-          # a throttle/auth error must not be read as "clear to proceed". The
-          # actuator derives the RG as <cluster>-rg, so either the cluster or
-          # its whole RG being absent is a definitive negative.
-          if grep -qE 'ResourceNotFound|ResourceGroupNotFound|could not be found' <<<"${OUT}"; then
-            echo "no daytime cluster on reservation ${RESERVATION}; proceeding"
-          else
-            echo "::error::could not determine daytime-cluster state for ${DAYTIME_NAME}: ${OUT}"
+          # Broad matcher (anything prefix-ish blocks a batch), both prefixes.
+          HELD=$(printf '%s\n' "${OUT}" | grep -E "^(${PREFIX}|${LEGACY_PREFIX})[0-9]" || true)
+          if [[ -n "${HELD}" ]]; then
+            echo "::error::a daytime cluster still holds reservation ${RESERVATION}; refusing (lifecycle=${LIFECYCLE})."
+            echo "::error::tear it down first: gh workflow run uat-run.yaml -f reservation=${RESERVATION} -f lifecycle=daytime-down"
+            while IFS= read -r c; do
+              [[ -z "${c}" ]] && continue
+              echo "::error::  held: ${c}"
+            done <<<"${HELD}"
             exit 1
           fi
+          echo "no daytime cluster on reservation ${RESERVATION}; proceeding"
+
+      # Resolve the ephemeral daytime cluster this daytime-down run must tear down.
+      # daytime-up names it aicr-uat-day-<slug>-<slot>-<up-run-id> (ADR-017), so this
+      # evening run (a different run id) cannot reconstruct the name — it discovers
+      # it by the stable, (slug, slot)-scoped prefix (name-free, like the guard),
+      # plus the LEGACY reservation-name prefix as a transitional shim so an
+      # old-named held cluster is still torn down (drop the legacy leg once none
+      # remain). The resolved name is exported to DEPLOYMENT_ID so the always()-run Destroy step (which
+      # writes .deployment.id itself) and the teardown creds refresh target it — the
+      # actuator derives the cluster name, its <name>-rg resource group, and its
+      # TF-state key from .deployment.id.
+      #   0 matches → benign no-op (already gone / never provisioned); teardown skips.
+      #   1 match   → the normal case; export it.
+      #   >1        → a broken invariant (the guard refuses a second daytime-up while
+      #               one is held); fail loud rather than silently tear down one.
+      - name: Resolve daytime cluster to tear down
+        if: inputs.lifecycle == 'daytime-down'
+        env:
+          RESERVATION: ${{ inputs.reservation }}
+          SLUG: ${{ inputs.slug }}
+          SLOT: ${{ inputs.slot }}
+        run: |
+          set -euo pipefail
+          # New (slug, slot)-scoped prefix (ADR-017) plus the LEGACY reservation
+          # prefix (transitional shim; drop once no old-named clusters remain).
+          PREFIX="aicr-uat-day-${SLUG}-${SLOT}-"
+          LEGACY_PREFIX="aicr-uat-day-${RESERVATION}-"
+          # Bounded retry. Every teardown gate below keys off DAYTIME_FOUND, so a
+          # single throttled/transient list call ending this step early would skip
+          # teardown entirely and leak the cluster (and the reservation) until a
+          # human re-dispatches daytime-down. Retry, then fail LOUDLY saying so.
+          RC=1
+          OUT=
+          for attempt in 1 2 3; do
+            set +e
+            OUT=$(az aks list --query "[].name" -o tsv --only-show-errors 2>&1)
+            RC=$?
+            set -e
+            if [[ ${RC} -eq 0 ]]; then
+              break
+            fi
+            echo "cluster listing attempt ${attempt} failed (rc=${RC}): ${OUT}"
+            if [[ ${attempt} -lt 3 ]]; then
+              sleep 15
+            fi
+          done
+          if [[ ${RC} -ne 0 ]]; then
+            echo "::error::could not list clusters for reservation ${RESERVATION} after 3 attempts: ${OUT}"
+            echo "::error::TEARDOWN SKIPPED — any daytime cluster is still up and the reservation may still be held."
+            echo "::error::re-dispatch: gh workflow run uat-run.yaml -f reservation=${RESERVATION} -f lifecycle=daytime-down"
+            exit 1
+          fi
+          # End-anchored: only an exact <prefix><run-id> name is a teardown
+          # target. The guard's matcher is deliberately broader — anything
+          # prefix-ish should BLOCK a batch, but must not be destroyed here.
+          # Matches the new (slug, slot) prefix OR the legacy reservation prefix.
+          mapfile -t held < <(printf '%s\n' "${OUT}" | grep -E "^(${PREFIX}|${LEGACY_PREFIX})[0-9]+$" || true)
+          if [[ "${#held[@]}" -eq 0 ]]; then
+            echo "no ${PREFIX}* or legacy ${LEGACY_PREFIX}* cluster found; nothing to tear down (already gone or never provisioned)."
+            echo "DAYTIME_FOUND=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [[ "${#held[@]}" -gt 1 ]]; then
+            echo "::error::expected at most one daytime cluster for ${RESERVATION} but found ${#held[@]}: ${held[*]}"
+            echo "::error::the pre-batch guard should prevent this; tear each down manually and investigate the leak."
+            exit 1
+          fi
+          echo "daytime cluster to tear down: ${held[0]}"
+          echo "DEPLOYMENT_ID=${held[0]}" >> "$GITHUB_ENV"
+          echo "DAYTIME_FOUND=true" >> "$GITHUB_ENV"
 
       # Deps
       - name: Install tools
@@ -367,7 +500,6 @@ jobs:
       - name: Build and push snapshot-agent image
         if: inputs.aicr_version == '' && inputs.skip_tests != true && inputs.lifecycle != 'daytime-down'
         env:
-          GOFLAGS: -mod=vendor
           KO_DOCKER_REPO: ghcr.io/nvidia/aicr-validators/agent
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -433,7 +565,7 @@ jobs:
       # re-logins keep the chain alive.
       - name: Refresh Azure credentials before cluster connect
         if: steps.infra.outcome == 'success'
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -580,7 +712,7 @@ jobs:
       # the same condition as the step each precedes.
       - name: Refresh Azure credentials before install
         if: steps.prep.outcome == 'success'
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -621,7 +753,7 @@ jobs:
       # daytime-up stops after install and leaves the cluster up for handoff.
       - name: Refresh Azure credentials before validate
         if: steps.install.outcome == 'success' && inputs.lifecycle != 'daytime-up'
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -648,7 +780,7 @@ jobs:
       # below), so verify/evidence cover the deployed stack either way.
       - name: Refresh Azure credentials before CUJ
         if: steps.conformance.outcome == 'success'
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -729,7 +861,7 @@ jobs:
         if: always() && steps.conformance.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: uat-azure-evidence-pointer-${{ github.run_id }}
+          name: uat-azure-evidence-pointer-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/pointer.yaml
           # Org policy caps at 90d; anything higher is silently clamped.
           retention-days: 90
@@ -757,7 +889,7 @@ jobs:
         if: failure() && (steps.prep.outcome != 'skipped' || steps.client.outcome == 'success')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: uat-azure-debug-${{ github.run_id }}
+          name: uat-azure-debug-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             snapshot.yaml
             recipe.yaml
@@ -849,16 +981,25 @@ jobs:
       # Teardown gating (#1275, DC2): tear down for the nightly lifecycle
       # (unless skip_delete) and for daytime-down (the explicit evening
       # teardown of the held cluster — daytime-down provisions nothing, so it
-      # does not gate on steps.infra). NEVER for daytime-up, which holds the
-      # cluster for handoff. skip_delete is a nightly-only debugging escape
-      # and is ignored for daytime-down.
+      # does not gate on steps.infra). skip_delete is a nightly-only debugging
+      # escape and is ignored for daytime-down.
+      #
+      # daytime-up (provision + deploy + HOLD) holds the cluster for handoff ONLY
+      # on a clean run: if any stage failed or the run was cancelled
+      # (failure() || cancelled()), there is no usable cluster to hand off, so we
+      # tear it down rather than leak its GPU node + resource group. Gated on
+      # steps.infra.outcome != 'skipped' so a cancel before Bringup — which
+      # provisioned nothing — still no-ops. The Destroy step targets this run's
+      # own DEPLOYMENT_ID (aicr-uat-day-<reservation>-<run_id>), which it sets
+      # itself, so it tears down exactly the cluster this up-run created.
       - name: Re-authenticate to Azure for teardown
         if: >-
           always() && (
-            inputs.lifecycle == 'daytime-down' ||
-            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped')
+            (inputs.lifecycle == 'daytime-down' && env.DAYTIME_FOUND == 'true') ||
+            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped') ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()) && steps.infra.outcome != 'skipped')
           )
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ env.AZURE_CLIENT_ID }}
           tenant-id: ${{ env.AZURE_TENANT_ID }}
@@ -877,20 +1018,91 @@ jobs:
       - name: Destroy Cluster
         if: >-
           always() && (
-            inputs.lifecycle == 'daytime-down' ||
-            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped')
+            (inputs.lifecycle == 'daytime-down' && env.DAYTIME_FOUND == 'true') ||
+            (inputs.lifecycle == 'nightly' && inputs.skip_delete != true && steps.infra.outcome != 'skipped') ||
+            (inputs.lifecycle == 'daytime-up' && (failure() || cancelled()) && steps.infra.outcome != 'skipped')
           )
         shell: bash
         run: |
           set -euxo pipefail
           yq -i '.deployment.id = strenv(DEPLOYMENT_ID) | .deployment.destroy = true' "$CLUSTER_CONFIG"
           cat "$CLUSTER_CONFIG"
+          # Break any orphaned Terraform state-blob lease before each destroy
+          # attempt. The azurerm backend holds an INFINITE lease on the state
+          # blob for the duration of the Bringup apply; a run cancelled
+          # mid-bringup SIGKILLs that apply before Terraform can release it,
+          # leaving the lease held. Every destroy attempt then fails to acquire
+          # the state lock and the retry loop cannot recover — the GPU node
+          # leaks. This always()-gated step runs only after the Bringup
+          # container has exited, so the lease has no live holder and is safe to
+          # break. State layout (infra/uat-azure-account): RG cluster-state-rg,
+          # account clst<sub-hex> (discovered — the setup tool derives the hex),
+          # container tfstate, blob deployments/<location>/<id>/terraform.tfstate.
+          #
+          # Auth is the account key, handed to `az` through AZURE_STORAGE_KEY
+          # rather than --account-key so it never appears in argv (which is
+          # world-readable via /proc/<pid>/cmdline), with xtrace off across the
+          # whole helper so it cannot reach the build log either. `--auth-mode
+          # login` is not an option: the pipeline identity holds subscription
+          # Contributor, which grants listKeys but no data-plane blob role, and
+          # the ABAC condition on its RBAC Administrator grant permits exactly
+          # three role definitions — none of them a Storage Blob Data role — so
+          # it cannot self-assign one (infra/uat-azure-account/README.md). Key
+          # auth is also how the actuator's own azurerm backend reaches this
+          # same blob.
+          #
+          # Only "no lease held" (and a state blob that was never written) is
+          # the happy path. Account lookup, key retrieval, and lease-break
+          # failures are reported as warnings instead of being swallowed by
+          # `|| true`, and are retried by virtue of running inside the destroy
+          # loop. Deliberately not fatal: aborting here would skip the destroy
+          # entirely and guarantee the leak this step exists to prevent, so the
+          # loop's terminal `exit 1` stays the gate on a real teardown failure.
+          STATE_RG="cluster-state-rg"
+          STATE_LOCATION="$(yq -r '.deployment.location' "$CLUSTER_CONFIG")"
+          STATE_BLOB="deployments/${STATE_LOCATION}/${DEPLOYMENT_ID}/terraform.tfstate"
+          break_stale_state_lease() {
+            local errf sa key rc
+            errf="$(mktemp)"
+            sa="$(az storage account list -g "$STATE_RG" --subscription "$AZURE_SUBSCRIPTION_ID" --query "[?starts_with(name, 'clst')].name | [0]" -o tsv 2>"$errf")" && rc=0 || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning::state storage account lookup failed (rc=${rc}); cannot clear a stale state-blob lease: $(cat "$errf")"
+              rm -f "$errf"
+              return 0
+            fi
+            if [ -z "$sa" ]; then
+              echo "::warning::no clst* state storage account under ${STATE_RG}; cannot clear a stale state-blob lease"
+              rm -f "$errf"
+              return 0
+            fi
+            key="$(az storage account keys list -g "$STATE_RG" -n "$sa" --subscription "$AZURE_SUBSCRIPTION_ID" --query '[0].value' -o tsv 2>"$errf")" && rc=0 || rc=$?
+            if [ "$rc" -ne 0 ] || [ -z "$key" ]; then
+              echo "::warning::state storage account key retrieval failed (rc=${rc}); cannot clear a stale state-blob lease: $(cat "$errf")"
+              rm -f "$errf"
+              return 0
+            fi
+            echo "Clearing any stale Terraform state-blob lease: ${sa}/tfstate/${STATE_BLOB}"
+            AZURE_STORAGE_ACCOUNT="$sa" AZURE_STORAGE_KEY="$key" \
+              az storage blob lease break --account-name "$sa" \
+                --container-name tfstate --blob-name "$STATE_BLOB" >/dev/null 2>"$errf" && rc=0 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "broke stale state-blob lease"
+            elif grep -qiE 'LeaseNotPresent|there is currently no lease|BlobNotFound|does not exist' "$errf"; then
+              echo "no stale state-blob lease to break (expected on the happy path)"
+            else
+              echo "::warning::state-blob lease break failed (rc=${rc}); a held lease will block this destroy: $(cat "$errf")"
+            fi
+            rm -f "$errf"
+          }
           # Same writable-copy mount as Bringup Infra (container uid cannot
           # write a directly-mounted ~/.azure). Fresh copy per attempt so a
           # partially-mutated context cannot poison the retries.
           destroyed=false
           for attempt in 1 2 3; do
             echo "Destroy attempt ${attempt}..."
+            set +x  # keep the storage account key out of the xtrace log
+            break_stale_state_lease
+            set -x
             AZ_MOUNT=$(mktemp -d)
             cp -a "$HOME/.azure/." "$AZ_MOUNT/"
             chmod -R a+rwX "$AZ_MOUNT"

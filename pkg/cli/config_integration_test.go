@@ -202,8 +202,10 @@ spec:
         role: system
       acceleratedNodeTolerations:
         - "nvidia.com/gpu=present:NoSchedule"
+      draEvictionNodeLabel: example.com/dra-ready=enabled
       nodes: 4
       storageClass: gp3
+      sharedStorageClass: efs-sc
     attestation:
       enabled: false
     registry:
@@ -211,9 +213,9 @@ spec:
       plainHTTP: false
 `
 
-// runBundleParse executes the bundle command's flag parser via a minimal
-// shim Action, returning the captured *bundleCmdOptions for assertion.
-func runBundleParse(t *testing.T, args []string) *bundleCmdOptions {
+// tryRunBundleParse executes the bundle command's flag parser via a minimal
+// shim Action, returning the captured options and any parse error.
+func tryRunBundleParse(t *testing.T, args []string) (*bundleCmdOptions, error) {
 	t.Helper()
 	var captured *bundleCmdOptions
 	cmd := bundleCmd()
@@ -229,10 +231,19 @@ func runBundleParse(t *testing.T, args []string) *bundleCmdOptions {
 		captured = opts
 		return nil
 	}
-	if err := cmd.Run(context.Background(), append([]string{"bundle"}, args...)); err != nil {
+	err := cmd.Run(context.Background(), append([]string{"bundle"}, args...))
+	return captured, err
+}
+
+// runBundleParse executes the bundle command's flag parser via a minimal
+// shim Action, returning the captured *bundleCmdOptions for assertion.
+func runBundleParse(t *testing.T, args []string) *bundleCmdOptions {
+	t.Helper()
+	opts, err := tryRunBundleParse(t, args)
+	if err != nil {
 		t.Fatalf("bundle.Run: %v", err)
 	}
-	return captured
+	return opts
 }
 
 func TestBundleCmd_ConfigFlag_PopulatesAllSections(t *testing.T) {
@@ -261,11 +272,17 @@ func TestBundleCmd_ConfigFlag_PopulatesAllSections(t *testing.T) {
 	if len(opts.acceleratedNodeTolerations) == 0 {
 		t.Errorf("expected acceleratedNodeTolerations to be populated")
 	}
+	if got := opts.draEvictionNodeLabel.String(); got != "example.com/dra-ready=enabled" {
+		t.Errorf("draEvictionNodeLabel = %q, want example.com/dra-ready=enabled", got)
+	}
 	if opts.estimatedNodeCount != 4 {
 		t.Errorf("estimatedNodeCount = %d, want 4", opts.estimatedNodeCount)
 	}
 	if opts.storageClass != "gp3" {
 		t.Errorf("storageClass = %q, want gp3", opts.storageClass)
+	}
+	if opts.sharedStorageClass != "efs-sc" {
+		t.Errorf("sharedStorageClass = %q, want efs-sc", opts.sharedStorageClass)
 	}
 	if opts.attest {
 		t.Errorf("attest = true, want false")
@@ -281,6 +298,8 @@ func TestBundleCmd_ConfigFlag_FlagOverridesScalar(t *testing.T) {
 		"--config", cfgPath,
 		"--deployer", "helm",
 		"--storage-class", "premium",
+		"--shared-storage-class", "custom-rwx",
+		"--dra-eviction-node-label", "example.com/cli-dra=true",
 		"-o", t.TempDir(),
 	})
 	if got := opts.deployer.String(); got != "helm" {
@@ -288,6 +307,102 @@ func TestBundleCmd_ConfigFlag_FlagOverridesScalar(t *testing.T) {
 	}
 	if opts.storageClass != "premium" {
 		t.Errorf("storageClass = %q, want premium (CLI override)", opts.storageClass)
+	}
+	if opts.sharedStorageClass != "custom-rwx" {
+		t.Errorf("sharedStorageClass = %q, want custom-rwx (CLI override)", opts.sharedStorageClass)
+	}
+	if got := opts.draEvictionNodeLabel.String(); got != "example.com/cli-dra=true" {
+		t.Errorf("draEvictionNodeLabel = %q, want example.com/cli-dra=true (CLI override)", got)
+	}
+}
+
+func TestBundleCmd_ConfigFlag_NormalizesSharedStorageClass(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		want       string
+		wantErrSub string
+	}{
+		{
+			name:  "trims surrounding whitespace",
+			value: "  efs-sc  ",
+			want:  "efs-sc",
+		},
+		{
+			name:       "rejects blank value",
+			value:      "   ",
+			wantErrSub: "spec.bundle.scheduling.sharedStorageClass cannot be blank",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recipePath := writeYAML(t, "recipe.yaml", "kind: Recipe\n")
+			cfg := strings.ReplaceAll(testBundleConfig, "%q", recipePath)
+			cfg = strings.Replace(cfg,
+				"sharedStorageClass: efs-sc",
+				"sharedStorageClass: \""+tt.value+"\"",
+				1,
+			)
+			cfgPath := writeYAML(t, "config.yaml", cfg)
+
+			opts, err := tryRunBundleParse(t, []string{"--config", cfgPath, "-o", t.TempDir()})
+			if tt.wantErrSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("bundle.Run error = %v, want containing %q", err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("bundle.Run: %v", err)
+			}
+			if opts.sharedStorageClass != tt.want {
+				t.Errorf("sharedStorageClass = %q, want %q", opts.sharedStorageClass, tt.want)
+			}
+		})
+	}
+}
+
+func TestBundleCmd_Flag_NormalizesSharedStorageClass(t *testing.T) {
+	tests := []struct {
+		name       string
+		value      string
+		want       string
+		wantErrSub string
+	}{
+		{
+			name:  "trims surrounding whitespace",
+			value: "  efs-sc  ",
+			want:  "efs-sc",
+		},
+		{
+			name:       "rejects blank value",
+			value:      "   ",
+			wantErrSub: "--shared-storage-class cannot be blank when specified",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recipePath := writeYAML(t, "recipe.yaml", "kind: Recipe\n")
+			opts, err := tryRunBundleParse(t, []string{
+				"--recipe", recipePath,
+				"--shared-storage-class", tt.value,
+				"-o", t.TempDir(),
+			})
+			if tt.wantErrSub != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("bundle.Run error = %v, want containing %q", err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("bundle.Run: %v", err)
+			}
+			if opts.sharedStorageClass != tt.want {
+				t.Errorf("sharedStorageClass = %q, want %q", opts.sharedStorageClass, tt.want)
+			}
+		})
 	}
 }
 

@@ -64,6 +64,10 @@ spec:
       target: ./bundle
     deployment:
       deployer: helmfile
+      # No NVSentinel overrides: the azure-managed gpuStack profile
+      # assigns labeler.assumeDriverInstalled and
+      # metadata-collector.runtimeClassName itself (#2181), so this lane
+      # exercises the recipes supplying both remedies unaided.
     scheduling:
       acceleratedNodeSelector:
         nodeGroup: gpu-worker

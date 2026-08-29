@@ -145,8 +145,7 @@ func (h *recipeHandler) handleRecipes(w http.ResponseWriter, r *http.Request, v2
 		}()
 		bodyData, readErr := io.ReadAll(bounded)
 		if readErr != nil {
-			var maxBytesErr *http.MaxBytesError
-			if stderrors.As(readErr, &maxBytesErr) {
+			if maxBytesErr, ok := stderrors.AsType[*http.MaxBytesError](readErr); ok {
 				logger.Warn("recipe POST body exceeded size limit",
 					"limit", defaults.MaxRecipePOSTBytes,
 					"received", maxBytesErr.Limit,
@@ -210,9 +209,7 @@ func (h *recipeHandler) handleRecipes(w http.ResponseWriter, r *http.Request, v2
 		return
 	}
 
-	if criteria == nil {
-		WriteError(w, r, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest,
-			"Recipe criteria cannot be empty", false, nil)
+	if !criteriaValid(w, r, criteria) {
 		return
 	}
 	resolveOpts, err := recipeResolveOptions(r, profile, v2)
@@ -295,8 +292,7 @@ func (h *recipeHandler) parseQueryPOSTBody(
 
 	bodyData, err := io.ReadAll(bounded)
 	if err != nil {
-		var maxBytesErr *http.MaxBytesError
-		if stderrors.As(err, &maxBytesErr) {
+		if maxBytesErr, ok := stderrors.AsType[*http.MaxBytesError](err); ok {
 			logger.Warn("query POST body exceeded size limit",
 				"limit", defaults.MaxRecipePOSTBytes,
 				"received", maxBytesErr.Limit,
@@ -406,10 +402,17 @@ func (h *recipeHandler) handleQuery(w http.ResponseWriter, r *http.Request, v2 b
 			if err != nil {
 				break
 			}
-		} else if _, supplied := r.URL.Query()[keyProfile]; supplied {
-			err = aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-				"profile selection is available only on /v2/query")
-			break
+		} else {
+			if _, supplied := r.URL.Query()[keyProfile]; supplied {
+				err = aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+					"profile selection is available only on /v2/query")
+				break
+			}
+			if !r.URL.Query().Has("selector") {
+				err = aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+					"selector is required on /v1/query")
+				break
+			}
 		}
 		criteria, err = recipe.ParseCriteriaFromRequest(r, h.client.CriteriaRegistry())
 		if !v2 {
@@ -441,9 +444,7 @@ func (h *recipeHandler) handleQuery(w http.ResponseWriter, r *http.Request, v2 b
 		return
 	}
 
-	if criteria == nil {
-		WriteError(w, r, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest,
-			"Query criteria cannot be empty", false, nil)
+	if !criteriaValid(w, r, criteria) {
 		return
 	}
 	resolveOpts, err := recipeResolveOptions(r, profile, v2)
@@ -484,24 +485,29 @@ func (h *recipeHandler) handleQuery(w http.ResponseWriter, r *http.Request, v2 b
 	}
 	resolved := normalizeLegacyRecipeResult(rec.Resolved(), v2)
 
-	// Hydrate and select as two steps (rather than the combined
-	// aicr.SelectFromRecipe) to preserve the legacy handler's distinct error
-	// mapping: a hydrate failure surfaces via its own error code (5xx), while a
-	// missing selector path is a 404. The legacy projection preserves the
-	// resolved result's bound DataProvider so hydration uses the same source.
-	hydrated, err := recipe.HydrateResultWithContext(ctx, resolved)
+	// Hydrate + select through the facade, then shape the response here.
+	// The legacy projection keeps the resolved result's bound DataProvider,
+	// so WrapResolved hydrates against the same source. The handler's
+	// distinct error mapping — a missing selector path is 404, a hydrate
+	// failure is its own (5xx) code — is a handler-level mapping over the
+	// facade's documented outermost-code contract, not a second
+	// hydrate+select implementation.
+	selected, err := aicr.SelectFromRecipeWithContext(ctx, aicr.WrapResolved(resolved), selector)
 	if err != nil {
+		// Match on the OUTERMOST structured code: stderrors.Is walks the
+		// wrap chain and would misread a hydration failure whose cause
+		// happens to carry ErrCodeNotFound (e.g. a missing values file) as
+		// a missing selector path.
+		var se *aicrerrors.StructuredError
+		if stderrors.As(err, &se) && se.Code == aicrerrors.ErrCodeNotFound {
+			WriteError(w, r, http.StatusNotFound, aicrerrors.ErrCodeNotFound,
+				"Selector path not found", false, map[string]any{
+					"selector": selector,
+					keyError:   err.Error(),
+				})
+			return
+		}
 		WriteErrorFromErr(w, r, err, "Failed to hydrate recipe", nil)
-		return
-	}
-
-	selected, err := recipe.Select(hydrated, selector)
-	if err != nil {
-		WriteError(w, r, http.StatusNotFound, aicrerrors.ErrCodeNotFound,
-			"Selector path not found", false, map[string]any{
-				"selector": selector,
-				keyError:   err.Error(),
-			})
 		return
 	}
 
@@ -688,6 +694,24 @@ func bodyHasTopLevelProfile(data []byte, format serializer.Format) (bool, error)
 	}
 }
 
+// criteriaValid rejects nil criteria or requests with no effective criteria,
+// matching the CLI guard in pkg/cli/query.go. Applied to both /recipe and
+// /query so that empty-criteria resolution is consistently rejected. Returns
+// true when the request may proceed.
+func criteriaValid(w http.ResponseWriter, r *http.Request, criteria *recipe.Criteria) bool {
+	if criteria == nil {
+		WriteError(w, r, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest,
+			"Recipe criteria cannot be empty", false, nil)
+		return false
+	}
+	if criteria.Specificity() == 0 {
+		WriteError(w, r, http.StatusBadRequest, aicrerrors.ErrCodeInvalidRequest,
+			"no criteria provided: specify at least one of service, accelerator, intent, os, platform, nodes", false, nil)
+		return false
+	}
+	return true
+}
+
 func recipeResolveOptions(r *http.Request, profile string, v2 bool) ([]aicr.RecipeResolveOption, error) {
 	var opts []aicr.RecipeResolveOption
 	if profile != "" {
@@ -721,6 +745,6 @@ func normalizeLegacyRecipeResult(result *recipe.RecipeResult, v2 bool) *recipe.R
 	projected := result.DeepCopy()
 	projected.BindDataProvider(result.DataProvider())
 	projected.Configuration = nil
-	projected.APIVersion = recipe.RecipeAPIVersion
+	projected.APIVersion = recipe.RecipeResultAPIVersion
 	return projected
 }

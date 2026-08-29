@@ -46,6 +46,13 @@ const (
 	// version mismatch). Distinct from ErrCodeInvalidRequest because the request
 	// itself is well-formed; the conflict is with current resource state.
 	ErrCodeConflict ErrorCode = "CONFLICT"
+	// ErrCodeCanceled indicates the operator deliberately aborted the operation
+	// (SIGINT/SIGTERM propagated through the command context). Distinct from
+	// ErrCodeTimeout because a timeout is an environmental fault worth retrying
+	// and a cancellation is an instruction to stop: IsTransient reports false
+	// for this code, so a Ctrl-C never re-enters a retry loop or gets reported
+	// as a transient infrastructure failure.
+	ErrCodeCanceled ErrorCode = "CANCELED"
 )
 
 // StructuredError provides structured error information for better observability.
@@ -136,6 +143,12 @@ func IsTransient(err error) bool {
 	if err == nil {
 		return false
 	}
+	// An explicit operator abort outranks anything else in the chain: a
+	// canceled command must never re-enter a retry loop, even when the
+	// underlying context.Canceled is still visible below it.
+	if stderrors.Is(err, New(ErrCodeCanceled, "")) {
+		return false
+	}
 	return stderrors.Is(err, context.DeadlineExceeded) ||
 		stderrors.Is(err, context.Canceled) ||
 		stderrors.Is(err, New(ErrCodeTimeout, ""))
@@ -150,8 +163,7 @@ func PropagateOrWrap(err error, fallbackCode ErrorCode, message string) error {
 	if err == nil {
 		return nil
 	}
-	var se *StructuredError
-	if stderrors.As(err, &se) {
+	if _, ok := stderrors.AsType[*StructuredError](err); ok {
 		return err
 	}
 	return Wrap(fallbackCode, message, err)

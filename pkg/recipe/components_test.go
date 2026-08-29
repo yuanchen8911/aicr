@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	stderrors "errors"
+	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -62,7 +63,7 @@ func TestComponentRegistry_Validate(t *testing.T) {
 // every component in recipes/registry.yaml MUST declare
 // healthCheck.assertFile, and that path MUST resolve through the data
 // provider to a readable file. Together with
-// TestValidateTestReadOnly_RegistryContent in validators/chainsaw —
+// TestValidateTestReadOnly_RegistryContent in pkg/chainsaw —
 // which separately validates that every file the registry points at
 // passes the read-only allowlist — this closes the registry-side half
 // of the contract that #1220 introduced at runtime: deployment-phase
@@ -88,7 +89,7 @@ func TestComponentRegistry_RequiresHealthCheck(t *testing.T) {
 			if comp.HealthCheck.AssertFile == "" {
 				t.Errorf("component %q must declare healthCheck.assertFile in recipes/registry.yaml "+
 					"and ship the corresponding recipes/checks/%s/health-check.yaml — see #1223 "+
-					"and validators/chainsaw/allowlist.go for the read-only allowlist contract",
+					"and pkg/chainsaw/allowlist.go for the read-only allowlist contract",
 					comp.Name, comp.Name)
 				return
 			}
@@ -266,6 +267,91 @@ func TestComponentRegistry_NodeSchedulingPaths(t *testing.T) {
 	}
 }
 
+// TestComponentRegistry_K8sAIBOMContract pins the k8s-aibom registry
+// properties that encode *intent* — the ones a rename, a reshuffle, or a
+// well-meaning cleanup would silently break without any other test noticing.
+//
+// It deliberately does NOT restate the chart repository, chart name, version,
+// or namespace. Those are verbatim copies of recipes/registry.yaml with no
+// independent source of truth, so asserting them detects nothing and turns
+// every routine chart bump into a two-file edit. Version drift specifically is
+// already gated by TestCommittedBOMVersionsMatchRegistry, which compares the
+// registry pin against the committed BOM.
+func TestComponentRegistry_K8sAIBOMContract(t *testing.T) {
+	registry, err := GetComponentRegistry()
+	if err != nil {
+		t.Fatalf("failed to load component registry: %v", err)
+	}
+
+	component := registry.Get("k8s-aibom")
+	if component == nil {
+		t.Fatal("k8s-aibom not found in registry")
+	}
+
+	// The chart ships its CRDs under crds/ AND renders AIBOMControllerConfig
+	// from templates/, so helm-diff cannot resolve that CR on a fresh cluster.
+	// Losing this flag produces a Helmfile release without
+	// disableValidation: true, which fails only at deploy time on a clean
+	// cluster — far from the change that caused it.
+	if !component.HasSelfRefCRDs {
+		t.Error("hasSelfRefCRDs must be enabled: the chart renders a CR whose CRD it also ships")
+	}
+	// Renaming or dropping the check file turns the component's deployment
+	// gate into a no-op; the generic RequiresHealthCheck test proves *a* file
+	// resolves, this proves it is still the k8s-aibom one.
+	if component.HealthCheck.AssertFile != "checks/k8s-aibom/health-check.yaml" {
+		t.Errorf("health check = %q", component.HealthCheck.AssertFile)
+	}
+
+	tests := []struct {
+		name string
+		got  []string
+		want []string
+	}{
+		{name: "override keys", got: component.ValueOverrideKeys, want: []string{"k8saibom", "aibom"}},
+		{name: "system node selectors", got: component.GetSystemNodeSelectorPaths(), want: []string{"nodeSelector"}},
+		{name: "system tolerations", got: component.GetSystemTolerationPaths(), want: []string{"tolerations"}},
+		{name: "accelerated node selectors", got: component.GetAcceleratedNodeSelectorPaths(), want: nil},
+		{name: "accelerated tolerations", got: component.GetAcceleratedTolerationPaths(), want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !slices.Equal(tt.got, tt.want) {
+				t.Errorf("got %v, want %v", tt.got, tt.want)
+			}
+		})
+	}
+}
+
+// TestKubeflowTrainerValues_UseJobSetInstallCondition pins AICR's values key to
+// the dependency condition exposed by the upstream Kubeflow Trainer chart.
+// Chart v2.2.0 gates its JobSet subchart on jobset.install; jobset.enabled is
+// ignored by Helm and would make the documented opt-out ineffective.
+func TestKubeflowTrainerValues_UseJobSetInstallCondition(t *testing.T) {
+	const valuesPath = "components/kubeflow-trainer/values.yaml"
+	content, err := GetEmbeddedFS().ReadFile(valuesPath)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", valuesPath, err)
+	}
+
+	var values map[string]any
+	if err := yaml.Unmarshal(content, &values); err != nil {
+		t.Fatalf("failed to parse %s: %v", valuesPath, err)
+	}
+	jobSet, ok := values["jobset"].(map[string]any)
+	if !ok {
+		t.Fatalf("%s jobset = %T, want map[string]any", valuesPath, values["jobset"])
+	}
+	install, ok := jobSet["install"].(bool)
+	if !ok || !install {
+		t.Errorf("%s jobset.install = %v, want true", valuesPath, jobSet["install"])
+	}
+	if _, exists := jobSet["enabled"]; exists {
+		t.Errorf("%s must not set ignored key jobset.enabled", valuesPath)
+	}
+}
+
 func TestComponentRegistry_SlinkySlurmOperator_NodeSchedulingPaths(t *testing.T) {
 	registry, err := GetComponentRegistry()
 	if err != nil {
@@ -324,6 +410,29 @@ func TestComponentRegistry_SlinkySlurmChartVersions(t *testing.T) {
 				t.Errorf("%s chart version = %q, want %q", name, component.Helm.DefaultVersion, wantVersion)
 			}
 		})
+	}
+}
+
+func TestComponentRegistry_SlinkySlurmSharedStorageClassPaths(t *testing.T) {
+	registry, err := GetComponentRegistry()
+	if err != nil {
+		t.Fatalf("failed to load component registry: %v", err)
+	}
+	slurm := registry.Get("slinky-slurm")
+	if slurm == nil {
+		t.Fatal("slinky-slurm not found in registry")
+	}
+	want := []string{
+		"storage.home.storageClassName",
+		"storage.data.storageClassName",
+	}
+	if got := slurm.GetSharedStorageClassPaths(); !slices.Equal(got, want) {
+		t.Errorf("shared storage class paths = %v, want %v", got, want)
+	}
+	if overlap := slices.ContainsFunc(slurm.GetStorageClassPaths(), func(path string) bool {
+		return slices.Contains(want, path)
+	}); overlap {
+		t.Errorf("shared storage paths must not overlap generic storageClassPaths: %v", slurm.GetStorageClassPaths())
 	}
 }
 
@@ -1106,6 +1215,43 @@ func TestGetComponentRegistry_PerProviderIsolation(t *testing.T) {
 	}
 	if rB.Get("alpha-only") != nil {
 		t.Errorf("registry B leaked alpha-only component")
+	}
+}
+
+func TestLoadComponentRegistry_ReleaseNHeaders(t *testing.T) {
+	tests := []struct {
+		name       string
+		apiVersion string
+		kind       string
+		wantErr    bool
+	}{
+		{name: "current alpha", apiVersion: ComponentRegistryAPIVersion, kind: ComponentRegistryKind},
+		{name: "target beta", apiVersion: "aicr.run/v1beta1", kind: ComponentRegistryKind},
+		{name: "empty version", apiVersion: "", kind: ComponentRegistryKind, wantErr: true},
+		{name: "unknown version", apiVersion: "aicr.run/v9", kind: ComponentRegistryKind, wantErr: true},
+		{name: "wrong kind", apiVersion: ComponentRegistryAPIVersion, kind: "RecipeMetadata", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dp := newInMemoryProvider("registry-header-"+tt.name, map[string][]byte{
+				"registry.yaml": fmt.Appendf(nil, "apiVersion: %s\nkind: %s\ncomponents: []\n", tt.apiVersion, tt.kind),
+			})
+			t.Cleanup(func() { EvictCachedRegistry(dp) })
+
+			_, err := GetComponentRegistryFor(dp)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("GetComponentRegistryFor() error = nil, want header rejection")
+				}
+				if !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+					t.Fatalf("error = %v, want ErrCodeInvalidRequest", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetComponentRegistryFor() error = %v", err)
+			}
+		})
 	}
 }
 

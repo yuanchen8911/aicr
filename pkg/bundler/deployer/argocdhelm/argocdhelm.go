@@ -472,8 +472,13 @@ func (g *Generator) writeProfileLockTemplate(templatesDir string) (string, int64
 		return "", 0, nil
 	}
 
-	components := make([]string, 0, len(g.RecipeResult.Metadata.SelectedProfile.OwnedPaths))
-	for component := range g.RecipeResult.Metadata.SelectedProfile.OwnedPaths {
+	// The guard is derived from the EFFECTIVE lock set — declared
+	// ownedPaths plus the recomputed #1327 closure — so an
+	// advertisement-owning profile also guards the closure's
+	// allocation-policy selector paths at install time (ADR-015).
+	lockSet := g.RecipeResult.EffectiveLockSet()
+	components := make([]string, 0, len(lockSet))
+	for component := range lockSet {
 		components = append(components, component)
 	}
 	sort.Strings(components)
@@ -485,7 +490,7 @@ func (g *Generator) writeProfileLockTemplate(templatesDir string) (string, int64
 		if err != nil {
 			return "", 0, err
 		}
-		for pathIndex, lockedPath := range g.RecipeResult.Metadata.SelectedProfile.OwnedPaths[componentName] {
+		for pathIndex, lockedPath := range lockSet[componentName] {
 			segments := strings.Split(lockedPath, ".")
 			writeProfilePathGuard(
 				&buf,
@@ -737,9 +742,20 @@ func (g *Generator) writeStaticValuesAndBuildStubs(outputDir string) ([]string, 
 	}
 
 	for _, ref := range g.RecipeResult.ComponentRefs {
-		// Skip non-Helm components (Kustomize, manifest-only)
-		isHelmChart := ref.Type != recipe.ComponentTypeKustomize && ref.Source != ""
+		// Skip non-Helm components (Kustomize, manifest-only) and local
+		// charts (Helm with empty Source — values are baked at bundle time).
+		// --dynamic for those components used to be silently dropped (#1949):
+		// the request looked successful but the root values.yaml carried no
+		// stub, so install-time overrides had nowhere to land.
+		// HasExternalChart is the canonical classifier (Helm, case-insensitive,
+		// with a non-empty Source); a bare Type!=Kustomize check would treat
+		// an uncanonicalized "kustomize" ref as a chart and keep the silent drop.
+		isHelmChart := ref.HasExternalChart()
 		if !isHelmChart {
+			if paths, ok := g.DynamicValues[ref.Name]; ok && len(paths) > 0 {
+				return nil, 0, nil, errors.New(errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("--dynamic is not supported for component %q under --deployer argocd-helm: it resolves to a local chart or non-Helm source with no install-time values surface", ref.Name))
+			}
 			continue
 		}
 

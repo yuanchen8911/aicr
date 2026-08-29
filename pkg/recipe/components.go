@@ -22,8 +22,18 @@ import (
 
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
 	"gopkg.in/yaml.v3"
 )
+
+// ComponentRegistryKind is the wire kind for component registry documents.
+const ComponentRegistryKind = "ComponentRegistry"
+
+// ComponentRegistryAPIVersion is the apiVersion expected on a registry.yaml.
+// ComponentRegistry is on the ADR-022 authoring track, so this aliases
+// header.AuthoringGroupVersion; the track's target is
+// header.GroupVersionV1Beta1.
+const ComponentRegistryAPIVersion = header.AuthoringGroupVersion
 
 // ComponentRegistry holds the declarative configuration for all components.
 // This is loaded from embedded recipe data (recipes/registry.yaml) at startup.
@@ -63,6 +73,11 @@ type ComponentConfig struct {
 	// StorageClassPaths are Helm value paths where the storage class name is injected.
 	// When --storage-class is provided at bundle time, the value is written to each path.
 	StorageClassPaths []string `yaml:"storageClassPaths,omitempty"`
+
+	// SharedStorageClassPaths are Helm value paths for shared filesystem PVCs.
+	// When --shared-storage-class is provided at bundle time, the value is
+	// written to each path without affecting the generic storageClassPaths.
+	SharedStorageClassPaths []string `yaml:"sharedStorageClassPaths,omitempty"`
 
 	// Validations defines component-specific validation checks.
 	Validations []ComponentValidationConfig `yaml:"validations,omitempty"`
@@ -121,6 +136,33 @@ type ComponentConfig struct {
 	// ships in `crds/`. See https://github.com/NVIDIA/aicr/issues/914.
 	HasSelfRefCRDs bool `yaml:"hasSelfRefCRDs,omitempty"`
 
+	// OwnsCRDs signals that this component is the ONLY chart in the
+	// registry that ships its CRDs, so a deployer may replace those CRDs
+	// on upgrade instead of leaving them at the schema installed on day
+	// one. Helm installs a chart's `crds/` directory on first install and
+	// never touches it again, and Flux's helm-controller inherits that via
+	// its `spec.upgrade.crds: Skip` default, so a chart bump whose CRDs
+	// changed otherwise runs a new controller against the previous schema.
+	//
+	// This is opt-in, and deliberately so. An audit of every Helm
+	// component in the registry found 15 ship CRDs under `crds/`, and 11
+	// of those share at least one CRD with another component: nfd,
+	// gpu-operator, and network-operator all ship the NodeFeature CRDs,
+	// and nfd plus gpu-operator plus kai-scheduler all appear together in
+	// `base.yaml`. Replacing unconditionally would have two or three
+	// HelmReleases rewrite the same CRD on every reconcile, each with the
+	// schema its own chart pins. The `Skip` default is what keeps that
+	// from happening today.
+	//
+	// Set this only for a component that both (a) solely owns every CRD it
+	// ships — including against charts that ship CRDs through `templates/`
+	// rather than `crds/`, which `helm show crds` does not report — and
+	// (b) ships no CRD using `spec.conversion.strategy: Webhook`, because
+	// replace discards a `caBundle` injected at runtime.
+	//
+	// See https://github.com/NVIDIA/aicr/issues/2264.
+	OwnsCRDs bool `yaml:"ownsCRDs,omitempty"`
+
 	// ManifestsUseChartCRDs signals that the component's attached
 	// manifestFiles (wrapped by the bundler into an injected -post
 	// local-helm release) instantiate CRs whose CRDs this component's
@@ -132,12 +174,12 @@ type ComponentConfig struct {
 	// helm-diff REST-mapper check can therefore never pass. This flag
 	// instructs the helmfile deployer to emit `disableValidation: true`
 	// on the release whose folder carries the post-phase manifests —
-	// the injected -post wrapper, or the collapsed single folder under
-	// --vendor-charts (mixed components do not split there). Releases
-	// without post manifests and -pre wrappers keep the mapper check;
-	// see issue #929. Canonical examples: network-operator (the AKS
-	// overlay attaches a NicClusterPolicy CR whose CRD the chart
-	// installs) and kubeflow-trainer (platform-kubeflow attaches a
+	// the injected -post wrapper under both vendored and non-vendored
+	// layouts (#1835). Releases without post manifests and -pre
+	// wrappers keep the mapper check; see issue #929. Canonical
+	// examples: network-operator (the AKS overlay attaches a
+	// NicClusterPolicy CR whose CRD the chart installs) and
+	// kubeflow-trainer (platform-kubeflow attaches a
 	// ClusterTrainingRuntime CR of the CRD shipped in the chart's
 	// crds/).
 	ManifestsUseChartCRDs bool `yaml:"manifestsUseChartCRDs,omitempty"`
@@ -383,12 +425,15 @@ func loadComponentRegistryFor(provider DataProvider) (*ComponentRegistry, error)
 	defer cancel()
 	data, err := provider.ReadFile(ctx, "registry.yaml")
 	if err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to read registry.yaml", err)
+		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal, "failed to read registry.yaml")
 	}
 
 	var registry ComponentRegistry
 	if err := yaml.Unmarshal(data, &registry); err != nil {
 		return nil, errors.Wrap(errors.ErrCodeInternal, "failed to parse registry.yaml", err)
+	}
+	if err := validateComponentRegistryHeader(&registry, "registry.yaml"); err != nil {
+		return nil, err
 	}
 
 	// Fail closed on the reserved deployer key for EVERY loaded registry
@@ -425,6 +470,23 @@ func loadComponentRegistryFor(provider DataProvider) (*ComponentRegistry, error)
 	}
 
 	return &registry, nil
+}
+
+func validateComponentRegistryHeader(registry *ComponentRegistry, source string) error {
+	if registry == nil {
+		return errors.New(errors.ErrCodeInvalidRequest, source+" is empty")
+	}
+	if registry.Kind != ComponentRegistryKind {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("%s has kind %q, expected %q; use a ComponentRegistry document compatible with this aicr release",
+				source, registry.Kind, ComponentRegistryKind))
+	}
+	if !header.IsSupportedAuthoringAPIVersion(registry.APIVersion) {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("%s has apiVersion %q, expected %q or %q for %s; update the registry header for this aicr release",
+				source, registry.APIVersion, ComponentRegistryAPIVersion, header.GroupVersionV1Beta1, ComponentRegistryKind))
+	}
+	return nil
 }
 
 // Get returns the component configuration by name.
@@ -593,6 +655,15 @@ func (c *ComponentConfig) GetStorageClassPaths() []string {
 		return nil
 	}
 	return c.StorageClassPaths
+}
+
+// GetSharedStorageClassPaths returns Helm value paths where the shared
+// filesystem storage class name is injected.
+func (c *ComponentConfig) GetSharedStorageClassPaths() []string {
+	if c == nil {
+		return nil
+	}
+	return c.SharedStorageClassPaths
 }
 
 // GetValidations returns all validation configurations for a component.

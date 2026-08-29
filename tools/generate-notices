@@ -3,7 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Generate a third-party notices file aggregating the licenses of every
-# Go dependency that ships in the released aicr/aicrd/validator binaries.
+# third-party dependency AICR redistributes:
+#   - Go modules statically linked into the released aicr/aicrd/validator
+#     binaries (collected from the verified Go module cache).
+#   - Python packages installed into the released aiperf-bench image
+#     (collected by tools/generate-aiperf-licenses into a committed tree; read
+#     back here offline — see the "Python packages" section below).
 #
 # Output: THIRD_PARTY_NOTICES.md (single self-contained file with an
 # index of every dependency and the verbatim text of each license).
@@ -42,6 +47,16 @@ OUTPUT="${OUTPUT:-THIRD_PARTY_NOTICES.md}"
 LICENSES_DIR="${LICENSES_DIR:-.licenses-cache}"
 PACKAGES=("./...")
 
+# Python packages: the aiperf-bench image ships an installed venv, not a
+# vendored source tree, so its license data cannot be derived from anything in
+# this repo. It is collected out-of-band by tools/generate-python-licenses
+# (which needs docker + network), rendered to Markdown there, and COMMITTED.
+# This script appends that fragment verbatim, keeping generation hermetic and
+# byte-deterministic: 'make notices-check' regenerates and git-diffs in the
+# merge gate, where neither docker nor PyPI is available.
+PYTHON_NOTICES="${PYTHON_NOTICES:-validators/performance/licenses/python-notices.md}"
+PYTHON_REQUIREMENTS="${PYTHON_REQUIREMENTS:-validators/performance/requirements.txt}"
+
 if ! command -v go-licenses >/dev/null 2>&1; then
     echo "ERROR: go-licenses is not installed." >&2
     echo "Install it with 'make tools-setup' or 'go install github.com/google/go-licenses/v2@\$(yq -r .linting.go_licenses .settings.yaml)'." >&2
@@ -58,6 +73,69 @@ if ! command -v yq >/dev/null 2>&1; then
     echo "Install it with 'make tools-setup'." >&2
     exit 1
 fi
+
+# Fail closed on a missing/empty Python fragment rather than silently emitting
+# a Go-only notices file: quietly dropping the attributions for everything
+# redistributed inside the aiperf-bench image is the failure mode this gate
+# exists to prevent.
+if [[ ! -s "${PYTHON_NOTICES}" ]]; then
+    echo "ERROR: ${PYTHON_NOTICES} is missing or empty." >&2
+    echo "The aiperf-bench image redistributes third-party Python packages whose" >&2
+    echo "licenses must appear in ${OUTPUT}. Regenerate the committed fragment" >&2
+    echo "with 'make python-licenses' (requires docker + network) and commit it." >&2
+    exit 1
+fi
+
+# Staleness gate for the Python fragment. 'make notices-check' can only prove
+# the notices file matches its committed inputs; it cannot tell whether those
+# inputs still describe the image, because regenerating them needs docker and
+# PyPI (unavailable in the merge gate). Editing requirements.txt without
+# re-running 'make python-licenses' would otherwise ship an image whose
+# attributions silently describe the PREVIOUS dependency set.
+#
+# The fragment records the sha256 of the requirements file it was generated
+# from; comparing hashes catches every kind of edit (version bump, added or
+# removed package), unlike matching a single version string. Pure file
+# comparison, no network, so the existing gate enforces it for free.
+if [[ ! -f "${PYTHON_REQUIREMENTS}" ]]; then
+    echo "ERROR: ${PYTHON_REQUIREMENTS} not found — run 'make notices' from the repo root." >&2
+    exit 1
+fi
+# sha256sum is coreutils (Linux/CI); shasum is the perl one macOS ships. Accept
+# either so the gate and a developer laptop compute the same digest.
+if command -v sha256sum >/dev/null 2>&1; then
+    req_sha=$(sha256sum "${PYTHON_REQUIREMENTS}" | cut -d' ' -f1)
+elif command -v shasum >/dev/null 2>&1; then
+    req_sha=$(shasum -a 256 "${PYTHON_REQUIREMENTS}" | cut -d' ' -f1)
+else
+    echo "ERROR: neither sha256sum nor shasum is available to verify" >&2
+    echo "${PYTHON_NOTICES} against ${PYTHON_REQUIREMENTS}." >&2
+    exit 1
+fi
+if ! grep -qF "${req_sha}" "${PYTHON_NOTICES}"; then
+    echo "ERROR: ${PYTHON_NOTICES} is stale." >&2
+    echo "It was generated from a different ${PYTHON_REQUIREMENTS} than the one" >&2
+    echo "committed now (expected sha256 ${req_sha}). Re-run 'make python-licenses'" >&2
+    echo "(requires docker + network) and commit the result alongside the change." >&2
+    exit 1
+fi
+
+# Emit a code fence long enough to contain a license file verbatim.
+#
+# Some licenses are Markdown and contain fenced blocks of their own —
+# hashicorp/errwrap's LICENSE-adjacent README ships ```go samples. A fixed
+# ``` fence is closed early by that content, so the remainder of the license
+# renders as Markdown and every following block is inverted for the rest of
+# the document. CommonMark allows a longer opening fence, so use one backtick
+# more than the longest run present in the file.
+fence_for() {
+    local file="$1" longest
+    longest=$(grep -oE '`+' "${file}" 2>/dev/null \
+        | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')
+    local width=$(( longest + 1 ))
+    (( width < 3 )) && width=3
+    printf '%*s' "${width}" '' | tr ' ' '`'
+}
 
 mkdir -p "$(dirname "${OUTPUT}")"
 
@@ -80,10 +158,51 @@ if [[ -z "${LOCAL_MODULE}" ]]; then
     exit 1
 fi
 
-export GOFLAGS="-mod=vendor"
+# Explicit, and load-bearing. `readonly` resolves from the module cache and
+# refuses to rewrite go.mod, so this script can never quietly change the manifest
+# it is reporting on. Stated rather than left to default so the mode is a decision
+# and not a side effect of the tree layout — which is exactly how it behaved
+# before #2374, when a committed vendor/ made Go pick -mod=vendor on its own.
+export GOFLAGS="-mod=readonly"
+
 # CGO is disabled for every released binary (see .goreleaser.yaml). Disabling it
 # here lets go-licenses cross-list each target platform without a C toolchain.
 export CGO_ENABLED=0
+
+# Modules whose license go-licenses cannot classify, mapped to a committed copy
+# of the license text. Each entry is "<module path>|<repo-relative file>|<SPDX id>".
+#
+# The copies are committed rather than read from the module cache so generation
+# stays hermetic, does not depend on how dependencies are materialised, and so
+# the exact bytes being disclosed are reviewable in-tree.
+#
+# All three are Apache-2.0, verified by reading the files.
+#
+# This list is not an escape hatch. The completeness check after collection
+# fails on any linked package missing from the index whether or not it is listed
+# here, so the only way to satisfy that check is to disclose a license — naming
+# the file and the SPDX id.
+LICENSE_OVERRIDES_DIR="${LICENSE_OVERRIDES_DIR:-licenses/overrides}"
+LICENSE_OVERRIDES=(
+    "github.com/in-toto/attestation|github.com/in-toto/attestation/LICENSE|Apache-2.0"
+    "github.com/in-toto/in-toto-golang|github.com/in-toto/in-toto-golang/LICENSE|Apache-2.0"
+    "github.com/cyberphone/json-canonicalization|github.com/cyberphone/json-canonicalization/LICENSE|Apache-2.0"
+)
+
+# go-licenses decides whether a package is standard library by testing its
+# source path against go/build's GOROOT, and a Go binary only carries a baked-in
+# GOROOT when it was linked WITHOUT -trimpath. An exported GOFLAGS=-trimpath (a
+# common local default) therefore yields a go-licenses whose GOROOT is empty, so
+# the stdlib prefix collapses to "/" and EVERY absolute source path matches: the
+# tool classifies the whole dependency graph as stdlib, writes nothing, and
+# exits 0. Pass the active GOROOT explicitly so the output never depends on how
+# the binary happened to be built.
+GOROOT="$(go env GOROOT)"
+if [[ -z "${GOROOT}" || ! -d "${GOROOT}" ]]; then
+    echo "ERROR: could not resolve a usable GOROOT via 'go env GOROOT' (got '${GOROOT}')." >&2
+    exit 1
+fi
+export GOROOT
 
 # The released binaries ship for multiple OS/arch targets (see .goreleaser.yaml:
 # aicr → darwin+linux × amd64+arm64, aicrd → linux × amd64+arm64). go-licenses
@@ -129,10 +248,22 @@ fi
 
 # Per-platform license trees are saved under a scratch root and merged into
 # ${LICENSES_DIR}; the combined CSV accumulates every platform's entries.
-SAVE_ROOT="$(mktemp -d)"
-COMBINED_CSV="$(mktemp)"
-INDEX_FILE="$(mktemp)"
-trap 'rm -rf "${SAVE_ROOT}"; rm -f "${COMBINED_CSV}" "${INDEX_FILE}"' EXIT
+# Explicit templates: macOS 'mktemp' with no template ignores TMPDIR and
+# allocates under confstr(_CS_DARWIN_USER_TEMP_DIR), which makes the scratch
+# location unoverridable in sandboxed or otherwise restricted environments.
+SAVE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/aicr-notices.XXXXXX")"
+COMBINED_CSV="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-csv.XXXXXX")"
+INDEX_FILE="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-idx.XXXXXX")"
+LINKED_RAW="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-linked.XXXXXX")"
+INDEX_KEYS="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-keys.XXXXXX")"
+LINKED_LIST="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-pkgs.XXXXXX")"
+MISSING_LIST="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-missing.XXXXXX")"
+LIST_ERR="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-listerr.XXXXXX")"
+MODMAP_RAW="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-modmap.XXXXXX")"
+MODMAP="$(mktemp "${TMPDIR:-/tmp}/aicr-notices-modmap-u.XXXXXX")"
+trap 'rm -rf "${SAVE_ROOT}"; rm -f "${COMBINED_CSV}" "${INDEX_FILE}" \
+    "${LINKED_RAW}" "${INDEX_KEYS}" "${LINKED_LIST}" "${MISSING_LIST}" \
+    "${LIST_ERR}" "${MODMAP_RAW}" "${MODMAP}"' EXIT
 
 mkdir -p "${LICENSES_DIR}"
 
@@ -144,10 +275,23 @@ for platform in "${PLATFORMS[@]}"; do
     # 'go list std' is GOOS-dependent (e.g. syscall/js exists only for wasm),
     # so recompute the stdlib ignore set per target platform. Standard-library
     # packages are excluded from the notices file (covered by Go's own license).
+    # Full package paths, NOT first path segments. `--ignore` matches by
+    # prefix, and `go list std | cut -d/ -f1` yields the bare segment `go`
+    # (from go/ast, go/build, ...), which then also matches every third-party
+    # module under go.opentelemetry.io, go.uber.org, and go.yaml.in — silently
+    # dropping them from the notices file with no error. Full paths cannot
+    # collide that way.
     stdlib_ignore=$(GOOS="${goos}" GOARCH="${goarch}" go list std 2>/dev/null \
-        | cut -d'/' -f1 | LC_ALL=C sort -u | paste -sd ',' -)
+        | LC_ALL=C sort -u | paste -sd ',' -)
     # go-licenses --ignore takes a comma-separated list of package paths.
+    # The override modules are ignored here because `go-licenses save` exits
+    # non-zero on a license it cannot classify; their licenses are injected
+    # verbatim after the loop and their index rows appended, so they still
+    # appear in the notices file.
     ignore="${stdlib_ignore},${LOCAL_MODULE}"
+    for entry in "${LICENSE_OVERRIDES[@]}"; do
+        ignore="${ignore},${entry%%|*}"
+    done
 
     # 'go-licenses save' writes each dependency's license file to
     # <save_path>/<import-path>/<original-filename>. We do NOT pass a
@@ -161,6 +305,36 @@ for platform in "${PLATFORMS[@]}"; do
         --force \
         --ignore="${ignore}"
 
+    # Fail closed on an empty save. 'go-licenses save' exits 0 when it finds no
+    # third-party packages at all (see the GOROOT note above), leaving save_path
+    # missing entirely — which surfaced only as a bare ENOENT from the 'cp'
+    # below. Report the actual cause, and never let a silently-empty collection
+    # reach the notices file.
+    if [[ ! -d "${platform_save}" ]] || [[ -z "$(ls -A "${platform_save}" 2>/dev/null)" ]]; then
+        echo "ERROR: 'go-licenses save' collected no licenses for ${goos}/${goarch}." >&2
+        echo "The tool exits 0 in this state, so this is almost always go-licenses" >&2
+        echo "failing to locate GOROOT and treating every package as standard library." >&2
+        echo "Reinstall it without -trimpath:" >&2
+        echo "  GOFLAGS= go install github.com/google/go-licenses/v2@\$(yq -r .linting.go_licenses .settings.yaml)" >&2
+        exit 1
+    fi
+
+    # Restore write permission before merging. 'go-licenses save' copies license
+    # files straight out of the module cache, which Go deliberately makes
+    # read-only (files 0444, directories 0555), and cp preserves those modes. The
+    # first platform therefore lands a read-only tree, and every later platform's
+    # merge fails with a wall of "cp: ...: Permission denied".
+    #
+    # This did not happen before #2374 because the source was vendor/ — an
+    # ordinary writable working-tree directory. Removing vendor/ is what moved
+    # the source to the module cache and exposed it.
+    #
+    # u+w only, and only on the scratch trees this script owns. The module cache
+    # itself is never touched; making it writable would defeat the protection Go
+    # applies to keep verified module content immutable.
+    chmod -R u+w "${platform_save}"
+    [[ -d "${LICENSES_DIR}" ]] && chmod -R u+w "${LICENSES_DIR}"
+
     # Merge into the shared tree. A module's license text is identical across
     # platforms, so overwriting is a no-op; modules present on only one platform
     # are preserved (union). 'cp -R src/.' copies directory contents in place.
@@ -169,16 +343,187 @@ for platform in "${PLATFORMS[@]}"; do
     GOOS="${goos}" GOARCH="${goarch}" go-licenses csv "${PACKAGES[@]}" \
         --ignore="${ignore}" \
         >> "${COMBINED_CSV}"
+
+    # Union the linked-module set per platform, for the same reason the
+    # collection loops at all: build-tagged sources import different transitive
+    # dependencies per GOOS/GOARCH, so a single-platform list would let a
+    # linux-only dependency pass unnoticed on a macOS run — the same silent
+    # omission this gate exists to catch.
+    #
+    # Resolve each package to its OWNING MODULE rather than listing package
+    # paths. A license is a property of the module, and nested submodules are
+    # independent modules that may carry a different license than their parent
+    # — this dependency graph already contains several (oauth2adapt under
+    # cloud.google.com/go/auth, ~20 aws-sdk-go-v2/* under aws-sdk-go-v2).
+    # Comparing package paths let a parent's index entry vouch for a submodule
+    # whose license was never seen, which is the exact failure this gate exists
+    # to catch. Stdlib packages have no .Module and emit nothing.
+    #
+    # stderr is surfaced rather than discarded: on a partial failure `go list`
+    # still prints what it could resolve and exits non-zero, so `set -e` aborts
+    # here — but with the error hidden that abort carries no explanation.
+    if ! GOOS="${goos}" GOARCH="${goarch}" \
+        go list -deps -f '{{if .Module}}{{.Module.Path}}{{end}}' ./cmd/... \
+        >> "${LINKED_RAW}" 2>"${LIST_ERR}"; then
+        echo "ERROR: 'go list -deps ./cmd/...' failed for ${goos}/${goarch}:" >&2
+        sed 's/^/  /' "${LIST_ERR}" >&2
+        exit 1
+    fi
+
+    # Package -> owning module, used to resolve index keys back to a module.
+    # Built from './...' rather than './cmd/...' because go-licenses is run over
+    # './...' and can therefore key a row on a package this binary's dependency
+    # graph does not itself contain; an unresolvable key would then look like a
+    # missing license. Superset in, exact resolution out.
+    if ! GOOS="${goos}" GOARCH="${goarch}" \
+        go list -deps -f '{{.ImportPath}} {{if .Module}}{{.Module.Path}}{{end}}' ./... \
+        >> "${MODMAP_RAW}" 2>"${LIST_ERR}"; then
+        echo "ERROR: 'go list -deps ./...' failed for ${goos}/${goarch}:" >&2
+        sed 's/^/  /' "${LIST_ERR}" >&2
+        exit 1
+    fi
+done
+
+# Modules linked into the released commands, unioned across every target
+# platform by the loop above. Both the override staleness check and the
+# completeness gate below use it.
+LINKED_MODULES=$(LC_ALL=C sort -u "${LINKED_RAW}" | grep -v '^$' || true)
+if [[ -z "${LINKED_MODULES}" ]]; then
+    echo "ERROR: 'go list -deps ./cmd/...' resolved no dependency modules; cannot verify license coverage." >&2
+    exit 1
+fi
+
+LC_ALL=C sort -u "${MODMAP_RAW}" > "${MODMAP}"
+if [[ ! -s "${MODMAP}" ]]; then
+    echo "ERROR: 'go list -deps ./...' produced no package-to-module map; cannot verify license coverage." >&2
+    exit 1
+fi
+
+# Inject the override modules go-licenses could not classify. Their license
+# files come from the committed copies under LICENSE_OVERRIDES_DIR; the index
+# rows are appended so they appear alongside every other dependency.
+for entry in "${LICENSE_OVERRIDES[@]}"; do
+    ov_module="${entry%%|*}"
+    ov_rest="${entry#*|}"
+    ov_file="${ov_rest%%|*}"
+    ov_spdx="${ov_rest##*|}"
+
+    ov_src="${LICENSE_OVERRIDES_DIR}/${ov_file}"
+    if [[ ! -s "${ov_src}" ]]; then
+        echo "ERROR: license override for ${ov_module} names ${ov_src}, which is missing or empty." >&2
+        echo "Restore the committed license copy rather than deleting the override:" >&2
+        echo "removing it drops a real dependency's license from ${OUTPUT}." >&2
+        exit 1
+    fi
+
+    # A stale override is worse than none: it would keep asserting a license for
+    # a module the build no longer uses. Check against the linked module list
+    # rather than `go list -m`, which cannot resolve dependency modules while a
+    # vendor directory is present. Both sides are module paths, so this is an
+    # exact match — an override must name a module, not a package within one.
+    if ! grep -qxF -- "${ov_module}" <<<"${LINKED_MODULES}"; then
+        echo "ERROR: license override lists ${ov_module}, which is no longer linked into any released binary." >&2
+        echo "Remove its entry from LICENSE_OVERRIDES and delete ${ov_src}." >&2
+        exit 1
+    fi
+
+    mkdir -p "${LICENSES_DIR}/${ov_module}"
+    cp "${ov_src}" "${LICENSES_DIR}/${ov_module}/$(basename "${ov_file}")"
+    printf '%s,%s,%s\n' \
+        "${ov_module}" \
+        "https://github.com/NVIDIA/aicr/blob/HEAD/${LICENSE_OVERRIDES_DIR}/${ov_file}" \
+        "${ov_spdx}" >> "${COMBINED_CSV}"
 done
 
 echo "Generating dependency index..." >&2
+# go-licenses can repeat a nested module's directory after its subdirectory
+# tag. Keep a reachable emitted URL; otherwise use the reachable tag-root URL.
+tools/normalize-go-license-urls "${COMBINED_CSV}" > "${COMBINED_CSV}.normalized"
+
 # Deduplicate by package (first CSV field) and sort deterministically. LC_ALL=C
 # pins byte-ordering so macOS (BSD sort) and Linux (GNU sort) agree — locale
 # collation is the classic source of cross-platform diff noise.
-LC_ALL=C sort -t, -k1,1 -u "${COMBINED_CSV}" > "${INDEX_FILE}"
+LC_ALL=C sort -t, -k1,1 -u "${COMBINED_CSV}.normalized" > "${INDEX_FILE}"
 
 if [[ ! -s "${INDEX_FILE}" ]]; then
     echo "ERROR: go-licenses produced no entries — refusing to write empty notices file." >&2
+    exit 1
+fi
+
+# Completeness gate. Everything above trusts go-licenses to report each package
+# it was asked about; nothing checked that it did. It does not always: in vendor
+# mode it silently omitted seven packages that are linked into the released
+# binaries, so their licenses were missing from this file with no error anywhere.
+#
+# Assert directly instead. Every third-party module linked into the released
+# commands must appear in the index under its own path.
+echo "Verifying every linked dependency is covered..." >&2
+# Coverage is compared on module identity, never on path prefixes. go-licenses
+# keys a row on whatever package it resolved a license for, which is usually a
+# package *inside* the module, so each key is mapped back to its owning module
+# before comparison.
+#
+# Prefix matching was the earlier approach and is wrong: it let an ancestor
+# entry vouch for a nested submodule, and a nested submodule is a separate
+# module whose license may differ from — or be missing in — its parent's. This
+# graph already contains such submodules (oauth2adapt under
+# cloud.google.com/go/auth, ~20 aws-sdk-go-v2/*), so an undisclosed one would
+# have passed unreported. Resolving to modules also disposes of the degenerate
+# bare-host key ("github.com") go-licenses emits when it cannot resolve a
+# package at all: it maps to no module, so it vouches for nothing.
+LC_ALL=C cut -d, -f1 "${INDEX_FILE}" > "${INDEX_KEYS}"
+printf '%s\n' "${LINKED_MODULES}" > "${LINKED_LIST}"
+# Explicit status check: an awk failure must not read as "everything covered".
+# Files are distinguished by FILENAME rather than an input counter, which would
+# desynchronise if any input were empty.
+if ! awk -v local="${LOCAL_MODULE}" \
+        -v mapf="${MODMAP}" -v keysf="${INDEX_KEYS}" '
+        FILENAME == mapf {
+            if ($2 != "") { pkgmod[$1] = $2; ismod[$2] = 1 }
+            next
+        }
+        # Resolve an index key to the module that owns it. go-licenses keys a
+        # row on the directory a license covers, which is often a roll-up
+        # prefix ("k8s.io/apimachinery/pkg") rather than a real import path, so
+        # an exact package lookup is not enough. Walking up finds the LONGEST
+        # known module that contains the key, which is the definition of its
+        # owning module: a key inside a nested submodule resolves to that
+        # submodule and never to its parent. A key under no known module (the
+        # degenerate bare host) resolves to nothing and vouches for nothing.
+        FILENAME == keysf {
+            key = $0
+            if (key in pkgmod) { covered[pkgmod[key]] = 1; next }
+            p = key
+            while (p != "") {
+                if (p in ismod) { covered[p] = 1; next }
+                i = length(p)
+                while (i > 0 && substr(p, i, 1) != "/") i--
+                if (i == 0) break
+                p = substr(p, 1, i - 1)
+            }
+            next
+        }
+        {
+            mod = $0
+            if (mod == "" || mod == local) next
+            if (index(mod, local "/") == 1) next   # nested local submodule
+            if (mod in covered) next
+            print mod
+        }
+    ' "${MODMAP}" "${INDEX_KEYS}" "${LINKED_LIST}" > "${MISSING_LIST}"; then
+    echo "ERROR: the license completeness check failed to run." >&2
+    exit 1
+fi
+missing_mods=$(cat "${MISSING_LIST}")
+
+if [[ -n "${missing_mods}" ]]; then
+    echo "ERROR: module(s) linked into the released binaries have no license entry:" >&2
+    printf '%s\n' "${missing_mods}" | sed 's/^/  /' >&2
+    echo "" >&2
+    echo "These are redistributed, so their licenses must appear in ${OUTPUT}." >&2
+    echo "If go-licenses cannot classify one, add it to LICENSE_OVERRIDES near the" >&2
+    echo "top of this script with its license file and SPDX id. Do not silence this" >&2
+    echo "by adding the package to --ignore: that is what hid them previously." >&2
     exit 1
 fi
 
@@ -189,12 +534,18 @@ echo "Composing ${OUTPUT}..." >&2
 
 NVIDIA AI Cluster Runtime (AICR)
 
-This file lists every third-party Go module that is statically linked into
-the released \`aicr\`, \`aicrd\`, and validator binaries, along with the
-verbatim text of each module's license. Standard library packages are
-excluded (their license is covered by the Go distribution).
+This file lists every third-party dependency that AICR redistributes, along
+with the verbatim text of each dependency's license. Two distribution
+surfaces are covered:
 
-## Index
+* **Go modules** statically linked into the released \`aicr\`, \`aicrd\`, and
+  validator binaries. Standard library packages are excluded (their license
+  is covered by the Go distribution).
+* **Python packages** installed into the released \`aicr-validators/aiperf-bench\`
+  container image, which ships the AIPerf benchmark runner and its full
+  transitive dependency closure.
+
+## Go Module Index
 
 | Package | License | Source |
 |---------|---------|--------|
@@ -208,7 +559,7 @@ EOF
 
     cat <<'EOF'
 
-## License Texts
+## Go Module License Texts
 
 EOF
 
@@ -220,9 +571,23 @@ EOF
         # LICENSE-MIT + LICENSE-APACHE for dual-licensed modules). Emit
         # every file in deterministic (sorted) order so attribution is
         # not silently lost. Use NUL-delimited reads to tolerate spaces.
+        # Keep only license-bearing files. 'go-licenses save' copies the whole
+        # module source for restricted licenses (MPL-2.0 and friends) to help
+        # satisfy their source-availability clauses, so the hashicorp/* trees
+        # arrive with README.md, Makefile, .travis.yml, .gitignore and .go
+        # sources alongside LICENSE. Emitting those verbatim put 143 non-license
+        # files into this document, which is not what a notices file is for and
+        # is not how source availability is actually discharged (we redistribute
+        # these modules unmodified; the upstream repository is the source).
+        # The glob still admits NOTICE and the dual-license variants
+        # (LICENSE-MIT / LICENSE-APACHE) that the emit loop exists to catch.
         license_files=()
         if [[ -d "${LICENSES_DIR}/${pkg}" ]]; then
             while IFS= read -r -d '' f; do
+                if ! printf '%s' "$(basename "${f}")" \
+                    | grep -qiE '^(licen[cs]e|notice|copying|copyright|authors|patents)([-._].*)?$'; then
+                    continue
+                fi
                 license_files+=("${f}")
             done < <(find "${LICENSES_DIR}/${pkg}" -maxdepth 1 -type f -print0 2>/dev/null \
                 | LC_ALL=C sort -z)
@@ -234,11 +599,12 @@ EOF
 
         if (( ${#license_files[@]} > 0 )); then
             for lf in "${license_files[@]}"; do
+                fence="$(fence_for "${lf}")"
                 printf '#### %s\n\n' "$(basename "${lf}")"
-                echo '```text'
+                printf '%stext\n' "${fence}"
                 cat "${lf}"
                 echo
-                echo '```'
+                printf '%s\n' "${fence}"
                 echo
             done
         else
@@ -246,7 +612,20 @@ EOF
         fi
         echo
     done < "${INDEX_FILE}"
+
+    # Python packages redistributed inside the aiperf-bench image. Appended
+    # verbatim from the committed fragment (see PYTHON_NOTICES above) so this
+    # stays offline and byte-deterministic. Rendering lives in
+    # tools/generate-python-licenses because only that step can reach the
+    # installed venv; keeping it there means the committed bytes are exactly
+    # what lands here, which is what makes the fragment reviewable on its own.
+    echo
+    cat "${PYTHON_NOTICES}"
 } > "${OUTPUT}"
 
-ENTRIES=$(wc -l < "${INDEX_FILE}" | tr -d ' ')
-echo "Wrote ${OUTPUT} (${ENTRIES} dependencies)" >&2
+GO_ENTRIES=$(wc -l < "${INDEX_FILE}" | tr -d ' ')
+# Count the index table rows, not '### ' headings: license texts are embedded
+# verbatim and some contain Markdown headings of their own, which inflated the
+# count (Shakespeare/Getty/tiktoken data notices in this closure).
+PY_ENTRIES=$(grep -c '^| `' "${PYTHON_NOTICES}" || true)
+echo "Wrote ${OUTPUT} (${GO_ENTRIES} Go modules, ${PY_ENTRIES} Python packages)" >&2

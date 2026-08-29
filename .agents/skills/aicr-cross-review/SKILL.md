@@ -16,7 +16,7 @@ user-invocable: true
 # automatic path that removing the explicit nested call did not.
 disallowed-tools: Skill
 argument-hint: "<PR-number-or-URL>"
-version: 0.3.19
+version: 0.3.22
 ---
 
 # AICR Cross-Review: Multi-Agent PR Review with Consensus
@@ -98,6 +98,85 @@ ones under review. Ask for a trusted checkout. This catches the accidental case 
    session's active review. (Each worktree adds sandbox deny-list paths; at ~70 the
    profile exceeded the OS spawn-arg limit and every sandboxed Bash call failed with
    `E2BIG`. Recovery needs a fresh session.)
+3. Reap dead runs' pinned inputs. A session killed between Batch B and Phase 5 leaks
+   its two `refs/cr/*` and its temp diff file permanently — nothing else reclaims
+   them, and they accumulate in the same slow way the worktrees above do.
+
+   ```bash
+   RUNS="$(git -C "<repo-path>" rev-parse --path-format=absolute --git-common-dir)/cr-runs"
+   find "$RUNS" -maxdepth 1 -type f -mmin +1440 -delete 2>/dev/null || true
+   git -C "<repo-path>" for-each-ref --format='%(refname)' 'refs/cr/pr*' 'refs/cr/base*' |
+   while read -r REF; do
+     KEY=${REF#refs/cr/}                                  # want <n>-<SID>
+     case "$KEY" in pr*) KEY=${KEY#pr};; base*) KEY=${KEY#base};; esac
+     case "$KEY" in *-*) ;; *) continue;; esac             # must have both components
+     case "${KEY%-*}" in ''|*[!0-9]*) continue;; esac      # <n> is a PR number
+     case "${KEY##*-}" in ??????) ;; *) continue;; esac    # <SID> is mktemp's six chars
+     [ -e "$RUNS/$KEY" ] || git -C "<repo-path>" update-ref -d "$REF"
+   done
+   find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'cross-review-pr*.??????' -mmin +1440 -delete 2>/dev/null || true
+   ```
+
+   Liveness comes from the per-run marker Batch B drops in `cr-runs/`, not from the
+   ref and not from the diff file. Both alternatives are broken:
+
+   - **Not the ref.** `git gc` packs `refs/cr/*` into `packed-refs`, after which the
+     per-ref file under `.git/refs/cr/` no longer exists and an mtime gate silently
+     stops reaping — and `git fetch`, which Batch B runs, triggers `gc --auto`. The
+     two substitutes fail too: `refs/cr/*` has no reflog (`core.logAllRefUpdates`
+     covers only `refs/heads`, `refs/remotes`, `refs/notes`, and `HEAD`), and
+     `%(creatordate)` is the *commit's* date, so a ref created a minute ago on
+     yesterday's `main` reports "21 hours ago".
+   - **Not the diff file.** `TMPDIR` is not stable across sessions, or even within
+     one: under Claude Code's sandbox it is `/tmp/claude-<uid>`, and with the sandbox
+     bypassed it is the shell default (`/var/folders/…/T/` on macOS). A reaper that
+     tested for the diff file would miss a live session's file whenever the two
+     disagree and delete that session's pinned refs — the one thing this skill must
+     never do.
+
+   `cr-runs/` sits next to the refs it guards, under the **common** git dir, so every
+   worktree of a clone shares one view, exactly as `refs/cr/*` are shared. Git ignores
+   unknown entries there, so nothing packs or prunes it and the marker keeps a real
+   creation timestamp. The last `find` is only a temp-file janitor: it reclaims diff
+   files in whatever `TMPDIR` this session sees, and reclaiming none is harmless.
+
+   **The three `case` guards are the safety boundary, and all three are load-bearing.**
+   A candidate must have both components, a numeric `<n>`, and a six-character `<SID>`
+   before it can be deleted. Prefix-stripping alone is not enough: `refs/cr/pr*` also
+   matches `refs/cr/private-ABC123`, which strips to `ivate-ABC123` and would pass a
+   suffix-only check. Hand-made bookmarks (`refs/cr/2183-r5`, `refs/cr/2187-test`) are
+   deliberate, often pin active work, and must survive — the only names that now
+   collide are a literal `pr<digits>-<six characters>` or `base<digits>-<six
+   characters>`, since the loop accepts both prefixes, so do not use either shape
+   for one. `find … -delete` rather than `rm` for the same reason as everywhere else in
+   this skill: managed permission policies gate `rm:*` behind a prompt. The janitor
+   is `-type f` so a directory that happens to match the diff-file pattern is never
+   removed.
+
+   **The marker key is `<n>-<SID>`, never `<SID>` alone.** `mktemp` guarantees the
+   full filename it returns is unique; it does not reserve the suffix. Two concurrent
+   reviews of *different* PRs pass different templates, so both can be handed the same
+   six characters — their refs stay distinct, but a `<SID>`-keyed marker would be one
+   shared file, and whichever run finished first would delete the other's protection.
+   Reviews of the *same* PR are safe whenever they share a `TMPDIR`, since `mktemp`
+   guarantees distinct names within one directory. It guarantees nothing across
+   directories, so same-PR runs under different `TMPDIR` roots can still collide —
+   but on `$SID` itself, which makes `PRREF` and `BASEREF` collide first. That is a
+   property of how Batch B derives `$SID`, not of this reaper, and is left to a
+   follow-up.
+
+   **The gate is 24 hours, and it must stay far above any real run.** Nothing enforces
+   an end-to-end limit on a review: Codex gets a five-wait, ~45-minute budget in the
+   Review phase and again in Cross-review, with Verify on top. A gate near the
+   expected duration would let a later Phase 1 reap a *live* run's marker, then its
+   refs, and the temp-file janitor would take its `DIFFPATH` with them — the run would
+   destroy itself. The gate measures **age since Batch B stamped the marker, not
+   inactivity** — the marker is written once and never refreshed — so a run still
+   alive a day later is outside every documented budget and is treated as dead. The
+   temp-file janitor is gated independently, on each diff file's own mtime, so
+   refreshing the marker would not cover `DIFFPATH` either way. Since this reaper
+   exists for leaks that accumulate over days, waiting a day to collect one costs
+   nothing. Do not tune it down toward the expected runtime.
 
 **Batch B — after A** (needs `HEAD_SHA` and `baseRefName`). `gh pr diff` takes no
 SHA argument, so pin the diff with `git fetch`. Refs and the diff file are
@@ -110,6 +189,13 @@ BASE="<baseRefName>"                    # from step 1 — never hardcode "main"
 DIFFPATH=$(mktemp "${TMPDIR:-/tmp}/cross-review-pr<n>.XXXXXX")   # must end in X on macOS
 SID=${DIFFPATH##*.}                     # reuse mktemp's unique suffix to scope the refs
 PRREF="refs/cr/pr<n>-$SID"; BASEREF="refs/cr/base<n>-$SID"
+# Liveness marker for Batch A step 3's reaper, written BEFORE the refs exist so no
+# concurrent reaper can ever see a ref without its marker. Keyed by <n>-$SID — mktemp
+# guarantees the full filename is unique, not the suffix, so a $SID-only key would
+# collide with a concurrent review of a DIFFERENT PR. Under the common git dir, so
+# every worktree of this clone shares one view.
+RUNS="$(git -C "<repo-path>" rev-parse --path-format=absolute --git-common-dir)/cr-runs"
+RUNMARK="$RUNS/<n>-$SID"; mkdir -p "$RUNS"; : > "$RUNMARK"
 # Fetch from the canonical repo by URL, not from `origin`: in GitHub's standard fork
 # layout `origin` is the contributor's fork, and refs/pull/* exist only on the canonical
 # repository.
@@ -119,12 +205,13 @@ git -C "<repo-path>" fetch "https://github.com/NVIDIA/aicr.git" \
 # otherwise abort before the names are ever printed, leaving them unreclaimable.
 if [ "$(git -C "<repo-path>" rev-parse "$PRREF")" != "<HEAD_SHA>" ]; then
   git -C "<repo-path>" update-ref -d "$PRREF"; git -C "<repo-path>" update-ref -d "$BASEREF"
-  rm -f "$DIFFPATH"; echo "HEAD moved since setup — restart the review"; exit 1
+  find "$DIFFPATH" "$RUNMARK" -maxdepth 0 -delete
+  echo "HEAD moved since setup — restart the review"; exit 1
 fi
 # Echo the names FIRST: under `set -e` an empty or failing diff aborts, and any
 # echo below it would never run — leaking the refs and the temp file with a random
 # suffix nobody recorded, which Phase 5 then cannot clean up.
-echo "DIFFPATH=$DIFFPATH"; echo "PRREF=$PRREF"; echo "BASEREF=$BASEREF"
+echo "DIFFPATH=$DIFFPATH"; echo "PRREF=$PRREF"; echo "BASEREF=$BASEREF"; echo "RUNMARK=$RUNMARK"
 git -C "<repo-path>" diff "$BASEREF...$PRREF" > "$DIFFPATH"
 test -s "$DIFFPATH"                     # a real PR diff is never empty
 # repoNotes source, pinned to the BASE ref — a fork PR must not be able to rewrite
@@ -136,7 +223,7 @@ git -C "<repo-path>" show "$BASEREF":.claude/CLAUDE.md 2>/dev/null || echo "(no 
 echo "BASE_SHA=$(git -C "<repo-path>" rev-parse "$BASEREF")"
 ```
 
-Capture `DIFFPATH`, `BASE_SHA`, `PRREF`, `BASEREF` — shell variables do not persist
+Capture `DIFFPATH`, `BASE_SHA`, `PRREF`, `BASEREF`, `RUNMARK` — shell variables do not persist
 between Bash calls and Phase 5 needs the ref names.
 
 Then build `repoNotes` for the Claude reviewer only (never fed to Codex — lean-context
@@ -170,6 +257,15 @@ done
 Read only the paths reported `TRUSTED`. `AGENTS.local.md` is normally a symlink to
 `CLAUDE.local.md`, so it is skipped and the overlay is read through the real file —
 no content is lost.
+
+**Verify the workflow script version before Phase 2.** The script about to be passed as
+`scriptPath` must contain the sentinel identifier `codexResumeJobId`:
+`grep -c codexResumeJobId "<skill-dir>/scripts/workflow.mjs"` — expect a non-zero count.
+If it is absent, STOP: the file is a stale or reverted copy, and running it silently
+restores the old semantics (observed live: a concurrent session's git operation reverted
+uncommitted skill files in a shared checkout, and a full review round ran the old script
+unnoticed). The sentinel detects staleness relative to this revision only — if that
+identifier is ever renamed, update this check in the same change.
 
 ## Phase 1.5: Classify and extract the change list
 
@@ -217,11 +313,14 @@ the consensus mechanics):
 
 - **Review** — Claude Code (reviews the pinned diff directly; it deliberately does
   *not* delegate to the `code-review` command, whose step 8 instructs its agent to
-  `gh pr comment` the result back to the PR), Codex (background dispatch, a 9-min
-  bounded wait plus one continuation wait when the job is still running — about 18 min
+  `gh pr comment` the result back to the PR), Codex (two chained agents: a dispatch
+  agent starts the remote background job and hands back its id, which the workflow
+  immediately writes to the progress log — `Codex job <id> dispatched — review running
+  remotely` — then a wait agent runs a 9-min
+  bounded wait plus up to four continuation waits when the job is still running — about 45 min
   for a live job), CodeRabbit (CLI against a detached worktree at `HEAD_SHA`, explicit
   600000 ms timeout — the Bash tool caps any single call at 10 minutes, which is why
-  Codex exceeds it by waiting twice rather than waiting longer), and integration
+  Codex exceeds it by waiting across several calls rather than waiting longer), and integration
   analysis (bounded to `changeList`). Every lane is a
   `general-purpose` agent. All
   parallel, schema-validated, and none may execute the reviewed commit's code.
@@ -288,23 +387,26 @@ the consensus mechanics):
 
   One deliberate exception, at the level of a **finding** rather than a lane. An
   integration finding claims a specific consumer breaks, so one lacking
-  `consumerPath`/`consumerLine` cannot be verified and never enters consensus — but it is
-  dropped on its own, with a `log()` naming what went, rather than failing the run. The
-  earlier all-or-nothing rule was disproportionate: on a real run the lane returned
-  several findings, one of them a genuine evidenced defect, plus a stale-comment finding
-  that legitimately has no consumer, and the review reported `incomplete` with all four
-  lanes `ok` and no report produced. The run still stops when **every** integration
-  finding is unusable, which is the case that motivated the check — silently dropping the
+  `consumerPath`/`consumerLine` cannot be verified *as an integration claim* — but if it
+  still locates a defect (its own path/line) with evidence, it is a perfectly reviewable
+  ordinary finding. It is therefore **demoted** — consumer fields stripped, flagged in the
+  candidate list, excluded from the integration severity escalation — rather than dropped,
+  with a `log()` naming what was demoted. Dropping was tried twice and cost a whole run
+  each time: first when the lane returned several findings and one legitimately
+  consumer-less observation failed the run; then, after per-finding dropping replaced
+  that, when the lane's ONLY finding was such an observation and the zero-survivor rule
+  stopped the run with all four lanes `ok` and no report produced (observed on PR 2097).
+  The run still stops when every integration finding lacks even a locatable defect or
+  evidence — that is the case the fail-closed rule exists for: silently dropping the
   lane's only finding once yielded `consensusReached: true` while a required lane had
   contributed nothing.
 
-  "Unusable" is measured on what survives `intake()`, not on the coordinate check alone.
-  `intake()` independently drops a finding whose `evidence` is blank, so gating on
-  coordinates let a coordinate-complete, whitespace-evidence finding pass the filter and
-  then vanish inside `intake()` — zero candidates, `status: ok`, `consensusReached: true`.
-  That is the same false-clean, in a narrower form. One rule now covers both drop reasons:
-  a non-empty integration result that yields no accepted finding stops the run, and the
-  message says how many went for each reason.
+  "Contributed nothing" is measured on what survives `intake()`: a demoted finding passes
+  through the same coordinate and evidence gates as every other candidate, so a
+  consumer-less, whitespace-evidence finding cannot slip through demotion into a
+  false-clean. One rule covers the stop: a non-empty integration result that yields no
+  accepted finding — neither as an integration claim nor as a demoted ordinary finding —
+  stops the run, and the message says how many went for each reason.
 
   **Coordinates are validated by a single shared rule**, `hasCoords`, applied to a
   finding's own `path`/`line` in `intake()` — every lane, not just integration — and to
@@ -344,8 +446,21 @@ the consensus mechanics):
 - If it dies mid-run, **resume, don't restart**:
   `Workflow({scriptPath: ..., resumeFromRunId: "<wf_...>"})` — completed lanes replay
   from cache. Empty or odd result → read `<transcriptDir>/journal.jsonl` first.
-- The Codex lane fails in three distinct ways, and the dispatch protocol treats them
-  differently:
+- **The Codex round-1 lane is two agents, deliberately.** A dispatch agent composes the
+  lean Codex task, starts the background job (and owns the fast-transient retry-once
+  rule, decided inside a brief ~90-second launch watch that exactly covers the
+  under-60s retry window), and returns `{jobId, dispatchNote}`; the workflow then logs
+  `Codex job <id> dispatched — review running remotely` and hands the id to a wait
+  agent that runs the continuation-wait protocol unchanged and translates the result.
+  The split exists for progress visibility: a single opaque agent call shows "running"
+  from spawn, which cannot distinguish "remote job dispatched and working" from
+  "dispatch never happened" — a real run sat silent for 19 minutes with no way to tell
+  which. The logged job id is the visible "started" signal, and it doubles as the
+  recovery handle when everything after dispatch dies: a dispatch-agent failure or a
+  wait-agent loss surfaces exactly like any Codex-lane unavailability (`incomplete`,
+  with `codexJobId` whenever a live job id exists). The wait agent never dispatches.
+- The Codex lane fails in three distinct ways, and the dispatch and wait protocols
+  treat them differently:
   - **Lookup miss** — the status call exits 1 with empty stdout and `No job found` on
     stderr. Companion state is keyed by workspace root and each Bash call is a fresh
     shell, so an unpinned lookup resolves to a different workspace and reports a live job
@@ -361,7 +476,8 @@ the consensus mechanics):
     a pinned recheck has also missed, return `unavailable` saying the job could not be
     located — never re-dispatch (the original may still be running) and never record it as
     exhausted budget.
-  - **Fast transient failure** — retried **once**, and only when all three hold:
+  - **Fast transient failure** — retried **once**, in the dispatch agent's launch
+    watch (the wait agent never dispatches), and only when all three hold:
     `.job.status` is `failed` (never `cancelled`), the job died in **under 60 seconds**
     by its own timestamps, and the error names a known-retryable cause such as an upstream
     capacity rejection (`Selected model is at capacity`) or a transient dispatch fault.
@@ -377,53 +493,146 @@ the consensus mechanics):
   - **Wait elapsed, job still alive** (`.waitTimedOut` true with `.job.status` still
     `queued`/`running`) — not the end of the lane. The job is dispatched in the background
     and outlives the Bash call waiting on it, so it needs more **time**, not another
-    attempt — and the protocol now gives it exactly that: **one continuation wait** on the
-    *same* job id in a fresh call. That is not a retry; nothing is re-dispatched and no
-    work is duplicated. A second `.waitTimedOut` is then genuinely exhausted budget, and
-    the lane returns `unavailable` with the job id so the result can be fetched later.
+    attempt — and the protocol now gives it exactly that: **up to four continuation waits** on the
+    *same* job id in fresh calls. Those are not retries; nothing is re-dispatched and no
+    work is duplicated. A fifth `.waitTimedOut` is then genuinely exhausted budget, and
+    the lane returns `unavailable` with the job id in the structured `jobId` field —
+    required, not prose — so the result can be fetched or the run resumed later.
     Measured on a real run: the lane timed out at the full 540000 ms while the job was
     demonstrably mid-work, the job was **still** `running` long after the review was
     abandoned, and its result stayed retrievable — so reporting exhausted budget there
     discarded a required lane, and the whole review with it, over a job that had merely
     not finished.
-  - **Exhausted budget** — a second `.waitTimedOut`, or no parseable JSON at all because
+  - **Exhausted budget** — a fifth `.waitTimedOut`, or no parseable JSON at all because
     the outer timeout killed the call (a dead broker). No retry, no further wait.
 
   The ceiling is not tunable — the wait runs inside a Bash call, and that tool silently
   kills any foreground command at 600000 ms. Exceeding 10 minutes requires polling across
   several calls, which is exactly what the continuation wait above does: a live job gets
-  two waits, roughly eighteen minutes, without a longer single call. The inner wait is
+  five waits, roughly forty-five minutes, without a longer single call. The budget was
+  three waits until a real ~53-minute job on a +1951/−153 PR outlasted even that — hence
+  five waits, and a resumable `jobId` on exhaustion instead of lost work. The inner wait is
   therefore 540000 ms,
   deliberately **below** the outer cap: were the two equal, Bash could kill the command
   before it printed its JSON, leaving no `.waitTimedOut` to classify on. That is why an
   unclassifiable kill counts as exhausted-budget rather than a fast failure — guessing
-  wrong there costs another full window for nothing.
+  wrong there costs another full window for nothing. The lane still reports the job id
+  it was waiting on (`jobId`), so even that kill stays resumable.
 - Codex is required, so a lane that is still unavailable after its retry makes the run
   report `incomplete`; re-run rather than interpreting a partial result.
+- **`incomplete` with a `codexJobId` usually means the review is NOT lost.** That field
+  is the Codex job the run was waiting on, surfaced top-level (alongside
+  `reviewerStatus`) precisely so recovery is mechanical, not improvised. The lane
+  attaches it to every unavailable wait result deliberately — losing a live id costs a
+  whole review, a wasted resume costs minutes — so it can also reference a job that
+  already failed or was cancelled: a poll that shows a terminal non-completed state, or
+  a resume that comes back unavailable again, confirms the job is dead and the review
+  must be re-run rather than resumed. For a live job: poll it
+  with the companion status command until it is terminal (a background 60-second loop is
+  fine — polling is cheap once the workflow is no longer holding a lane open for it).
+
+  Resolve the companion the same way the lane does, with `-t` — the lane's messages
+  refer to `$comp` but cannot export it across Bash calls:
+
+  ```bash
+  comp=$(ls -t ~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs | head -1)
+  node "$comp" status <job-id> --cwd "<repo-path>" --json
+  ```
+
+  `ls -t` picks the most recently installed companion, which is the version the plugin
+  system has active. Dropping the `-t` sorts by version *name* instead and can select a
+  stale cached copy — polling a job with a different companion version than dispatched it
+  returns misleading results (`status` finding a job that `result` then reports as
+  unknown), which reads exactly like a dead job and is not one.
+
+  Then resume: `Workflow({scriptPath, resumeFromRunId: "<wf_...>", args: {...prevArgs,
+  codexResumeJobId: "<job id>"}})` — `prevArgs` is the previous run's args object, unchanged. The three completed lanes replay from cache, the
+  Codex dispatch agent is skipped entirely (the workflow logs
+  `Codex resume: waiting on existing job <id>`), the wait agent collects the existing
+  job without dispatching a second one, and the
+  run proceeds to cross-review and verification normally. A run interrupted *between*
+  dispatch and result needs no `codexResumeJobId` at all: on `resumeFromRunId` the
+  dispatch agent's cached `{jobId}` replays instantly, so the wait prompt is
+  byte-identical to the original run's and the resume lands in the same wait with no
+  re-dispatch. Proven live on PR 2097: a
+  ~53-minute job outlasted the then-three-wait budget, and the resumed run recovered it
+  with zero re-dispatched work.
+- **A dead job from broker teardown needs a private-broker resume, not a plain one.**
+  When a Codex lane reports the job killed by concurrent-session broker teardown
+  (`statusNote` names infra-kill-by-concurrent-session-teardown — the confirmed
+  `sessionRuntime` fingerprint, which W2 and W4 both run; a late `failed` with a
+  reaper/null error is a symptom, not the gate, and an UNCONFIRMED cause gets an
+  ordinary re-run under the shared broker instead), the job is terminal — there is
+  nothing to poll and `codexResumeJobId` does not apply. A plain `resumeFromRunId`
+  does not help either: the lane *completed* with its unavailable result, so the
+  cache replays the failure verbatim. And a re-dispatch under the same shared broker
+  (keyed to the repo path) faces the same teardown risk while the concurrent sessions
+  that caused it are still running. The remedy: copy `scripts/workflow.mjs` to a
+  scratch path (never edit the checked-in file), add a one-line nonce to the affected
+  lane's prompt, and in the scratch copy replace `${repoPath}` with the
+  session-private worktree path in that lane's `--cwd` interpolations — every
+  companion command: dispatch, status, result. Edit the interpolation itself, not an
+  appended prompt override: the generated prompt's literal commands pin
+  `--cwd "${repoPath}"` and insist on it for every call, so an override that
+  contradicts them may lose, and any call that keeps the shared path lands the
+  recovered job back under the broker being torn down. Then
+  `Workflow({scriptPath: "<scratch copy>", resumeFromRunId:
+  "<wf_...>", args: prevArgs})`. Every other lane replays from cache; only the edited
+  lane re-runs, and its job lives under a private workspace broker that no concurrent
+  session's SessionEnd hook will tear down. The task prompt's pinned `git -C` reads
+  still name the original repo path, so the review context is unchanged. Proven live
+  2026-08-08 on PR 2097: two evaluation jobs died to teardown under the shared broker;
+  the third, dispatched under a private broker, completed and the run reached
+  consensus with zero re-reviewed lanes.
+- **Execute the CodeRabbit lane's STEP blocks verbatim** — same commands and paths, no
+  substitutions; in particular never swap the `find … -delete` cleanup for `rm` (an
+  invented `rm -rf` cleanup once blocked a run for hours on a managed-policy
+  confirmation prompt). The no-`rm` rule covers **every** command composed in the lane,
+  ad-hoc diagnostics included — a self-written `.git/worktrees` writability probe with
+  `rm -f` cleanup once blocked a round the same way. `rmdir` for empty dirs,
+  `find <path> -maxdepth 0 -delete` for files, always.
 - CodeRabbit slow runs: check the newest file in `~/.coderabbit/logs/` (429/queue lines
   mean cloud-side queueing) and confirm `which -a coderabbit` resolves to the
   brew-managed binary — a stale `~/.local/bin` copy shadows it.
-- **A sandboxed CodeRabbit run hangs instead of failing.** `~/.coderabbit` is outside the
-  sandbox write allowlist, so the CLI cannot create its log or review store; it stalls at
-  `connecting_to_review_service` until the timebox kills it. The lane therefore runs the
-  `coderabbit` command with sandbox bypass, and only that command.
+- **A sandboxed CodeRabbit run hangs instead of failing.** The sandbox can deny the CLI
+  two independent ways, and both stall at `connecting_to_review_service` until the
+  timebox kills it: `~/.coderabbit` outside the write allowlist (the CLI cannot create
+  its log or review store), or the `coderabbit.ai` hosts outside the allowed-hosts list.
+  The lane therefore **probes both** in step 1 — writability of `~/.coderabbit` *and*
+  reachability of both CLI hosts, `cli.coderabbit.ai` (startup config fetch) and
+  `ide.coderabbit.ai` (the review session's WebSocket) — and runs the `coderabbit`
+  command (and only that command) with sandbox bypass when any check fails. The hosts
+  are probed separately because the allowlist is per-host: an entry naming only the
+  config host passes the first check and still hangs step 2 on the WebSocket connect.
 
-  **Why bypass rather than an allowlist entry.** Adding `~/.coderabbit` to the sandbox
-  write allowlist is the narrower grant and was considered first. It was rejected because
-  this skill is checked into the repo and has to work on a contributor's machine as
-  written: an allowlist entry lives in each person's local settings, so anyone who has not
-  made the same edit gets the silent ten-minute hang above rather than a usable lane. The
-  bypass is portable and self-documenting at the call site. Its cost is a permission
-  prompt on step 2 of every round, which is accepted. Adding the allowlist entry locally
-  is still worthwhile if you run this often — it does not conflict with the bypass — but
-  the skill must not depend on it.
+  **Why probe-gated bypass rather than an allowlist assumption.** Adding `~/.coderabbit`
+  to the sandbox write allowlist is the narrower grant, but this skill is checked into
+  the repo and has to work on a contributor's machine as written: an allowlist entry
+  lives in each person's local settings, so a lane that *assumed* it would hand anyone
+  who has not made the edit the silent ten-minute hang above rather than a usable lane.
+  And the hang means "try sandboxed, fall back on failure" without a probe costs a full
+  timebox per wrong guess. The step-1 probe settles it in milliseconds: machines with
+  the allowlist entry run step 2 fully sandboxed and pay **no bypass prompt at all**;
+  every other machine gets the bypass from the start, portable and self-documenting at
+  the call site. If you run this often, add **both** grants — `~/.coderabbit` (and
+  `~/.claude/plugins/data`, for the Codex companion's job log) to your local sandbox
+  `filesystem.allowWrite`, *and* the `coderabbit.ai` hosts to the network allowlist —
+  since that pair is what removes the per-round approval prompts. The skill must not
+  depend on either. Granting only the filesystem half is worse than granting neither:
+  it satisfies the write probe while the network stays blocked, and an earlier
+  writability-only probe read that state as sandbox-clean and hung the lane for a full
+  ten-minute timebox. The probe now tests both for exactly this reason.
 
-  **Diagnose it by absence:** a stall at `connecting` *with no new file in
-  `~/.coderabbit/logs/`* is sandbox denial — a process killed mid-run still flushes a
-  partial log, so zero bytes means it never created one. A real cloud problem leaves a log
-  with 429/queue lines. Do not read this stall as an outage or as contention with another
-  session: an unsandboxed run succeeding while a sandboxed one hangs looks exactly like
-  contention and is not.
+  **Diagnose it from the log directory**, since the two denials differ there. A stall at
+  `connecting` *with no new file in `~/.coderabbit/logs/`* is **filesystem** denial — a
+  process killed mid-run still flushes a partial log, so zero bytes means it never created
+  one. A stall *with* a log naming the allowlist (`403 Forbidden` on
+  `https://cli.coderabbit.ai/public-configs.json`, `"data":"Connection blocked by network
+  allowlist"`, then repeated `wss://ide.coderabbit.ai/ws` retries) is **network** denial —
+  do not read the presence of a log as proof the sandbox was not the cause. A real cloud
+  problem leaves a log with 429/queue lines instead. Do not read either stall as an outage
+  or as contention with another session: an unsandboxed run succeeding while a sandboxed
+  one hangs looks exactly like contention and is not.
 - **Persisted-store fallback.** If a run still fails, the lane checks
   `~/.coderabbit/reviews/*/*/reviews/*/git.json`, whichever session produced the record.
   Acceptance is `head` plus **the pinned change itself** — never `baseCommitId`. Measured:
@@ -553,6 +762,11 @@ Build from the workflow's return value plus the CI status line from Phase 3:
 | # | Changed File | Consumer File | Severity | Description | Confirmed By |
 |---|--------------|---------------|----------|-------------|--------------|
 
+<only findings with a verified consumer pair (non-null `consumerPath`/`consumerLine`)
+belong here. A finding flagged "demoted from integration claim" has no consumer pair —
+route it to Confirmed Issues like any ordinary finding, even though its `sources`
+include the integration lane; omit the section if empty>
+
 ### Unresolved (no settled disposition)
 
 | # | File | Line | Severity | Description | Why unresolved |
@@ -593,10 +807,27 @@ findings; omit the section if empty>
 **Default: do NOT post.** Present the full report in chat and stop. Do not ask
 whether to post.
 
-**Only when explicitly asked to post:** write the filtered summary to a file with the
-Write tool, then post it with `--body-file`. Never interpolate the report into a
-double-quoted shell argument — findings quote PR content, and backticks or `$(...)` in
-a finding would be executed by the shell before `gh` ever runs:
+**Only when explicitly asked to post**, publish two layers — one **brief** summary
+comment first, then one inline comment per finding that anchors to a changed line.
+The detail lives inline; the summary is an index, not a second copy.
+
+**Classify anchors before posting anything.** A finding is anchorable when its
+`path` is among the PR's changed files and its `line` falls inside the head commit's
+diff hunks (check against the pinned diff from Phase 1, not the mutable working
+copy). This classification decides where each finding's full text goes: anchorable →
+its inline comment; unanchorable → the summary, which is the only place it will
+appear.
+
+**1. Summary comment (first, brief).** The overview a reader sees before the diff:
+which commit was reviewed, a short overall assessment, and how many findings follow
+as inline comments — **do not list or index the individual findings here**; the
+inline comments are the findings. The only finding text that belongs in the summary
+is the **full text of an unanchorable finding** (and any open questions, which have
+no code anchor), since the summary is the only place those will appear.
+Write it to a file with the Write tool, then post with `--body-file`. Never
+interpolate the report into a double-quoted shell argument — findings quote PR
+content, and backticks or `$(...)` in a finding would be executed by the shell
+before `gh` ever runs:
 
 ```bash
 gh pr comment <n> --repo NVIDIA/aicr --body-file "<report-file>"
@@ -605,11 +836,44 @@ gh pr comment <n> --repo NVIDIA/aicr --body-file "<report-file>"
 `<report-file>` is the exact path you passed to Write — a Write-tool call cannot export
 a shell variable, so substitute the literal path here.
 
+**2. Inline comments — one per anchorable finding, full detail.** Each carries
+exactly one finding: the defect statement, the failure scenario, and the evidence
+`path:line`. Post each one as its own call — per-finding, so one rejected anchor
+cannot take down the rest. The whole payload goes through a file for quoting safety:
+`path` names a changed file in the PR under review and `line` comes from reviewer
+output, so both are PR-controlled — a path containing `$(...)` or backticks would
+execute if interpolated into shell source. Write the payload as JSON with the Write
+tool (require `line` to be a plain integer — reject anything else) and pass it with
+`--input`, so no finding-controlled value ever appears in the command line:
+
+```json
+{"body": "<finding text>", "commit_id": "<HEAD_SHA>",
+ "path": "<path>", "line": <line>, "side": "RIGHT"}
+```
+
+```bash
+gh api repos/NVIDIA/aicr/pulls/<n>/comments --input "<payload-file>"
+```
+
+If a call is rejected despite the pre-classification (the head moved between
+classification and post, a renamed path), do NOT re-anchor to a nearby line — a
+comment on the wrong line reads as a claim about that line. That finding's summary
+entry is now its only trace, so append the full finding text to the summary comment
+(`gh api --method PATCH repos/NVIDIA/aicr/issues/comments/<summary-comment-id>
+--input <payload-file>` with the updated body; capture the summary comment's id when
+posting it) so no finding is left as a bare one-liner.
+
+**Content rules for everything posted (summary and inline):**
+
 - Post **issues only**: Confirmed Issues (without the "Confirmed By" column),
   confirmed Integration Findings, Contested Issues, Unresolved, Open Questions.
-- **No reviewer-agent attribution and no severity-label prefixes** in posted
-  content. State each finding and its evidence plainly.
-- Never post Dismissed Findings or Positive Observations.
+  Never post Dismissed Findings or Positive Observations.
+- **The multi-agent machinery must be invisible in posted text.** Write as one
+  reviewer's plain findings: never use the words "cross-review", "review agent",
+  "reviewer", "consensus", "lane", "adversarial", "verification round", or any
+  agent name (Claude, Codex, CodeRabbit), and no severity-label prefixes or
+  vote/attribution columns. State each finding and its evidence plainly. The
+  machinery vocabulary belongs to the chat report only.
 
 ## Rules
 
@@ -619,23 +883,30 @@ a shell variable, so substitute the literal path here.
 - **This skill never executes the reviewed commit's code.** No builds, tests, coverage,
   package managers, or repository scripts. If a claim can only be settled by running
   something, it is an open question.
-- Confirmed integration findings identifying broken consumers escalate to at least
-  **medium** severity (done in-script).
+- Confirmed integration findings identifying broken consumers (a verified
+  `consumerPath`/`consumerLine` pair) escalate to at least **medium** severity
+  (done in-script); findings demoted from the integration lane do not.
 - Severity scale: critical (must fix) > major (should fix) > medium > minor.
 - Keep the report concise — actionable findings, not noise.
 - Never set `dangerouslyDisableSandbox` for reviewer or companion commands; they run
   fine sandboxed. **Exactly two exceptions**, both kept in sync with the protocols in
-  `scripts/workflow.mjs`, and both scoped to a single command that performs no Git
-  operation, no working-copy mutation, and no GitHub write. (They do *read* files —
-  CodeRabbit necessarily reads the detached worktree it was pointed at. The rule bars
-  bypassing calls that **act on** the working copy, not calls that read a path):
+  `scripts/workflow.mjs`, both conditional on the sandbox actually denying the write,
+  and both scoped to a single command that performs no Git operation, no working-copy
+  mutation, and no GitHub write. (They do *read* files — CodeRabbit necessarily reads
+  the detached worktree it was pointed at. The rule bars bypassing calls that **act on**
+  the working copy, not calls that read a path):
   - **Codex companion** — it writes its job log under `~/.claude/plugins/data`, which is
-    sandbox-denied. If dispatch fails on that write, bypass for that call only.
-  - **CodeRabbit review** — `~/.coderabbit` is outside the write allowlist, so a
-    sandboxed CLI cannot create its log or review store and hangs at
-    `connecting_to_review_service` until the timebox kills it. Bypass **step 2 only** of
-    the three-step CodeRabbit protocol, which is a lone `coderabbit review` command;
-    worktree setup and cleanup live in steps 1 and 3 and stay sandboxed.
+    sandbox-denied by default. If dispatch fails on that write, bypass for that call
+    only; a machine whose sandbox allowlist covers the path never needs the bypass.
+  - **CodeRabbit review** — `~/.coderabbit` is outside the default write allowlist and
+    the `coderabbit.ai` hosts are outside the default network allowlist; under either
+    denial a sandboxed CLI hangs at `connecting_to_review_service` until the timebox
+    kills it. Step 1 of the three-step CodeRabbit protocol probes writability of
+    `~/.coderabbit` and reachability of both `cli.coderabbit.ai` and
+    `ide.coderabbit.ai` (the WebSocket host); when any check fails, bypass
+    **step 2 only**, which is a lone `coderabbit review` command. When the
+    probe passes, step 2 runs sandboxed and no bypass happens at all. Worktree setup and
+    cleanup live in steps 1 and 3 and stay sandboxed always.
 
   Anything else stays sandboxed. In particular, never bypass a call that also performs
   `git` operations — that is why the CodeRabbit protocol is split into three calls rather
@@ -643,7 +914,7 @@ a shell variable, so substitute the literal path here.
 - **The tool shell is zsh, and every prompt that hands out a shell command says so.**
   `scripts/workflow.mjs` defines a single `SHELL_CONTRACT` constant, interpolated in
   **exactly one place** — `NO_EXECUTION`, which every prompt builder composes exactly
-  once. So all six assembled prompts carry it exactly once. Do not add a second
+  once. So all seven assembled prompts carry it exactly once. Do not add a second
   interpolation: `NO_EXECUTION` already embeds `PINNED_READS`, so putting it in
   `PINNED_READS` or `CODEX_LEAN` as well silently doubles it in every lane. That is how
   the first attempt got it wrong, and no block-level check can see it — the duplication
@@ -653,9 +924,17 @@ a shell variable, so substitute the literal path here.
   through literally, and `status` is readonly. Keep it in one place — the two blocks that
   once held hand-written copies each acquired theirs only after a zsh bug had already
   shipped in them, and a new lane must not be able to omit it by accident.
-- **Clean up before finishing:** `rm -f <the DIFFPATH echoed in Phase 1>` and delete the
+- **Clean up before finishing:** `find "<the DIFFPATH echoed in Phase 1>" -maxdepth 0 -delete
+  2>/dev/null || true` — idempotent, because under `set -e` a diff file already removed by an
+  earlier abort path would otherwise fail the call and skip the ref cleanup below —
+  and delete the
   two scoped refs captured in Phase 1 (`git -C "<repo-path>" update-ref -d "$PRREF"`,
-  same for `"$BASEREF"` — use the exact names echoed there, not a guess). Confirm no
+  same for `"$BASEREF"` — use the exact names echoed there, not a guess) and the
+  `RUNMARK` liveness marker (`find "<the RUNMARK echoed in Phase 1>" -maxdepth 0
+  -delete 2>/dev/null || true`). Delete the marker **last**: it is what tells Phase 1
+  Batch A step 3 the refs are still in use, so removing it before the refs invites a
+  concurrent session's reaper into the gap. If this run is killed before any of it
+  runs, step 3 reaps all three on a later run. Confirm no
   `${TMPDIR:-/tmp}/cr-rabbit.*` worktree path remains in `git worktree list` — write the
   fallback out, since setup creates the worktree under `${TMPDIR:-/tmp}` and with `TMPDIR`
   unset a bare `$TMPDIR/cr-rabbit.*` names `/cr-rabbit.*` while the leak sits in `/tmp` —
@@ -664,3 +943,7 @@ a shell variable, so substitute the literal path here.
   leaves one behind. Step 1 of the next run reaps `cr-rabbit.*` directories older than
   120 minutes, which bounds the leak but does not clear it now. Do not compare total
   worktree counts; concurrent sessions change the total legitimately.
+  Deletion is `find … -delete` rather than `rm` throughout this skill and its workflow —
+  managed (admin-deployed) permission policies commonly gate `rm` behind a confirmation
+  prompt (`Bash(rm:*)` ask rules match every sub-command and override allow rules), and a
+  background lane blocked on a prompt stalls the review. Do not "simplify" back to `rm`.

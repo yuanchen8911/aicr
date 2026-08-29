@@ -13,6 +13,155 @@ Releases follow a **bi-weekly cadence**. A new release is cut every two weeks.
 | Pre-release | Before a regular release, as needed | `rc` | Any maintainer can create for testing |
 | Major | Planned | `major` | Requires team agreement and advance communication |
 
+## Deprecation Policy
+
+AICR freezes four public surfaces at v1
+([ROADMAP §1](ROADMAP.md#1-defensible-api-stability)):
+the `aicr` CLI, the REST API, the Go SDK (`pkg/client/v1`), and the bundle
+layout plus artifact schemas. This section defines what counts as a breaking
+change on each, the notice a removal owes, and how a deprecation reaches the
+people affected by it. A change that is breaking under this table and ships
+without the notice below is a release blocker, not a release note.
+
+### What counts as breaking, per surface
+
+| Surface | Breaking | Additive |
+|---|---|---|
+| **CLI** — flags, subcommands, exit codes, stdout shape | Removing or renaming a flag or subcommand; changing a default such that identical input yields different output; narrowing an accepted value set; changing what an exit code means; removing a field from `--output json`/`yaml` | New flag whose default preserves current behavior; new subcommand; new accepted enum value; new field in structured output |
+| **REST** — `api/aicr/v1/server.yaml` | Removing a path or method; removing or renaming a response field; adding a required request field; narrowing a type; removing a value from a request enum | New optional request field; new response field; new path or method; new value in a response enum |
+| **Go SDK** — `pkg/client/v1` | Removing or renaming an exported identifier; changing a signature; narrowing a parameter type; changing documented semantics without changing the name | New exported function, method, or type; new functional option; new field on a struct the caller does not construct positionally |
+| **Bundle + schemas** — layout and artifact kinds | Removing or renaming a bundle path; removing a schema field; tightening a type; adding a required field; retiring an `apiVersion` | New optional field; new file in the bundle; new artifact kind |
+
+Adding a value to a *response* enum is additive for the server and breaking for
+a client that switches exhaustively on it, so it is announced but does not owe a
+window. Adding a value to a *request* enum is always additive; removing one is
+always breaking.
+
+### Notice owed before removal
+
+- **Before `v1.0.0`:** a minimum of **two minor releases** between the
+  deprecation shipping with a working warning and the removal. At the current
+  cadence that is roughly one month.
+- **After `v1.0.0`:** a breaking removal on any of the four frozen surfaces
+  requires the next `vMAJOR`. The deprecation may be announced at any time; the
+  removal waits for the major. This is what the freeze buys and it is not
+  waivable by a release manager.
+
+Artifact `apiVersion` retirement is the one surface with a maturity-scoped
+window rather than a flat one, because an alpha version never promised
+stability in the first place. Its rules are below and take precedence for that
+surface.
+
+**Closing a fail-open gate is not a deprecation.** When two enforcement paths
+disagree about the same document and one of them already rejected it, aligning
+the permissive path to the strict one owes no notice window. The permissive
+behavior was a defect, not a contract: it accepted input the project had
+already decided was invalid, and continuing to honor it for two releases would
+mean knowingly shipping the fail-open seam the stricter path exists to close.
+Such a change must still be recorded in
+[`docs/user/deprecations.md`](docs/user/deprecations.md) with its real release,
+and its rationale written down in the governing ADR.
+
+Exercised exactly once so far, in v0.21: a `RecipeMetadata` overlay with an
+empty `apiVersion` was rejected by the catalog scanner but silently hydrated on
+the direct-input path. ADR-022 §3 records the decision and
+[#2421](https://github.com/NVIDIA/aicr/issues/2421) the analysis; no committed
+artifact in the tree was affected. This clause is deliberately narrow — it does
+not cover tightening validation that both paths previously accepted, which is an
+ordinary breaking change and owes the full window.
+
+### How a deprecation is announced
+
+Every deprecation appears in all three places. One is not a substitute for
+another: release notes are read once, the durable page is read later by someone
+debugging, and the runtime warning reaches the user who never read either.
+
+1. A `### Deprecations` section in the release notes for the release that
+   introduces it, naming the replacement and the planned removal release. The
+   heading is an h3 sibling of `### Highlights`; the release-notes generator
+   (`.agents/skills/aicr-release-notes/SKILL.md`) emits it at that level.
+2. An entry on the durable page at
+   [`docs/user/deprecations.md`](docs/user/deprecations.md), which carries every
+   active deprecation and its removal release until the removal ships.
+3. A runtime warning on the affected surface, using that surface's mechanism:
+
+   | Surface | Mechanism |
+   |---|---|
+   | CLI | Warning on stderr naming the replacement and the removal release. Honors `NO_COLOR` and the existing logger conventions |
+   | REST | A `Deprecation` response header ([RFC 9745](https://www.rfc-editor.org/rfc/rfc9745.html)) carrying the deprecation date, a `Sunset` header ([RFC 8594](https://www.rfc-editor.org/rfc/rfc8594.html)) carrying the removal date, a `Link` with `rel="deprecation"`, and `deprecated: true` on the operation in `api/aicr/v1/server.yaml` |
+   | Go SDK | A `// Deprecated:` godoc marker, which `staticcheck` surfaces to consumers automatically |
+   | Bundle + schemas | The loader accepts the deprecated shape and warns, naming the file and the release that stops reading it |
+
+### Exercising the channel before `v1.0.0`
+
+ROADMAP [§1](ROADMAP.md#1-defensible-api-stability) requires this file to define
+breaking changes and the deprecation policy for every surface; it does not
+require a rehearsal. Manufacturing a deprecation to prove the channel works
+would prove only that we can manufacture one.
+
+**The channel will most likely reach `v1.0.0` mechanically tested but never
+exercised on an obligation it actually owed.** That is a deliberate, accepted
+position at this stage of the project, recorded here so it is a choice rather
+than something discovered later.
+
+Two candidates existed and neither turns out to be a real exercise:
+
+- **The `/v1/*` REST family is being collapsed, not deprecated.**
+  [#2112](https://github.com/NVIDIA/aicr/issues/2112) folds the profile-aware
+  `/v2` contract into `/v1` and removes the `/v2` paths. With no REST consumers
+  yet, that owes no notice window — it is a pre-adoption restructure. Spending
+  two releases deprecating an endpoint nobody calls would buy a worse end state
+  (two frozen path families instead of one) for the sake of a dry run.
+- **The ADR-022 alpha migration runs warn-then-remove across v0.22 and v0.23**
+  and will be the first end-to-end use of the loader-warning arm — once
+  [#2416](https://github.com/NVIDIA/aicr/issues/2416) wires `deprecation.Warn`
+  into the artifact loaders, which is still outstanding. Even then, alpha owes
+  no window under the table above, so it demonstrates the mechanism working
+  rather than the policy being honored.
+
+What that leaves untested is the *obligation*, not the machinery. The
+per-surface mechanisms have unit coverage in `pkg/deprecation` and `pkg/server`.
+The REST arm — the RFC 9745 `Deprecation` and RFC 8594 `Sunset` headers and the
+OpenAPI `deprecated` flag, which is what an integrator would actually consume —
+has no route marked deprecated and will not be driven by a shipped deprecation.
+The CLI arm has no deprecated flag or subcommand to warn about.
+
+The first surface change that genuinely owes a window is the real exercise, and
+it will most likely land after `v1.0.0`, when the notice owed is a `vMAJOR`
+rather than two minors. Treat the first such change as the moment to verify the
+channel end to end, and fix whatever it exposes then.
+
+## Artifact Compatibility and Deprecation
+
+Artifact `apiVersion` maturity is independent of the AICR release version and
+is governed by [ADR-022](docs/design/022-artifact-maturity-and-deprecation.md).
+Retiring an artifact version owes the following window on the AICR release
+axis:
+
+- Alpha: no deprecation window.
+- Beta: readable for two releases after deprecation.
+- GA: readable for the rest of the current AICR major version; removal requires
+  the next `vMAJOR` release.
+
+For beta and GA bumps, stage the new reader in Release N before switching the
+emitter in Release N+1. Release notes must identify any deprecation, the last
+release that reads the retiring version, and the required artifact recapture,
+regeneration, or authored-header edit.
+
+The initial alpha-to-target migration is the explicit three-release sequence in
+ADR-022 §3, bound to these releases:
+
+| Release | Reads | Emits | Tracking |
+|---|---|---|---|
+| v0.21 | alpha and target | alpha | [#2404](https://github.com/NVIDIA/aicr/pull/2404) |
+| v0.22 | alpha and target | target | [#2416](https://github.com/NVIDIA/aicr/issues/2416) |
+| v0.23 | target only | target | [#2417](https://github.com/NVIDIA/aicr/issues/2417) |
+
+Cutting v0.22 or v0.23 means completing the corresponding issue in that release,
+not after it. The consumer-facing form of this table, including the per-kind
+target values, is in
+[`docs/integrator/data-extension.md`](docs/integrator/data-extension.md#catalog-and-binary-compatibility).
+
 ## What Goes Into a Release
 
 A release includes everything merged to `main` since the last tag. There is no cherry-picking or feature branching for releases — if it's on `main`, it ships.
@@ -174,6 +323,7 @@ Published to GitHub Container Registry (`ghcr.io/nvidia/`):
 |-------|------|-------------|
 | `aicr` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Pure-Go CLI/agent (driver-free GPU discovery) |
 | `aicrd` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Minimal API server |
+| `aicr-gate` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Bundle readiness-gate Job image (emitted by `aicr bundle --readiness-hooks`) |
 
 Published to GitHub Container Registry (`ghcr.io/nvidia/aicr-validators/`):
 
@@ -182,7 +332,7 @@ Published to GitHub Container Registry (`ghcr.io/nvidia/aicr-validators/`):
 | `deployment` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Deployment validator |
 | `performance` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Performance validator |
 | `conformance` | `nvcr.io/nvidia/distroless/static:v4.0.0` | Conformance validator |
-| `aiperf-bench` | `python:3.12-slim` | AIPerf benchmark runner |
+| `aiperf-bench` | `nvcr.io/nvidia/distroless/python:3.13-v4.1.1` | AIPerf benchmark runner (built from `python:3.13-slim`) |
 
 Stable releases promote `vX.Y.Z` and `latest`; prereleases promote their
 `vX.Y.Z-rcN` version tags but never `latest`. The release workflow also retains
@@ -198,10 +348,18 @@ Every release includes:
 - **Sigstore Signatures** — keyless signing via Fulcio + Rekor
 - **Checksums** — SHA256 for all binaries
 - **Third-party notices** — `THIRD_PARTY_NOTICES.md` listing every
-  third-party Go dependency and embedding the verbatim text of each
-  license-bearing file shipped by the upstream module (e.g. `LICENSE`,
-  `NOTICE`) where available (generated by `make notices` via
-  `go-licenses`; uploaded as a top-level GitHub release asset). The file
+  third-party dependency AICR redistributes and embedding the verbatim
+  text of each license-bearing file shipped upstream (e.g. `LICENSE`,
+  `NOTICE`) where available (generated by `make notices`; uploaded as a
+  top-level GitHub release asset). It covers two surfaces: Go modules
+  linked into the released binaries (collected via `go-licenses` from the
+  Go module cache — `vendor/` until #2374 removed it, which is also why
+  each row now links to a version-pinned upstream license rather than an
+  in-repo path), and the Python packages installed into the released
+  `aiperf-bench` image (collected out-of-band by `make python-licenses`,
+  which needs network access to PyPI, then committed as a rendered
+  fragment). Note that `make notices` is no longer offline either: a cold
+  module cache means it fetches. The Go half
   is the union of the dependency graph across every released OS/arch
   target, generated deterministically so it is byte-identical on macOS and
   Linux; the `notices-freshness` merge-gate job fails any PR whose
@@ -218,32 +376,115 @@ Every release includes:
 
 ### Container Attestations
 
-```bash
-export TAG=$(curl -s https://api.github.com/repos/NVIDIA/aicr/releases/latest | jq -r '.tag_name')
+Verify the **digest-pinned** image that a tag currently resolves to. Tag refs
+are registry-rewritable; attestations bind to digests. Requires `crane` (or
+substitute `docker buildx imagetools inspect` for digest resolution).
 
-# GitHub CLI (core images)
-gh attestation verify oci://ghcr.io/nvidia/aicr:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
-gh attestation verify oci://ghcr.io/nvidia/aicrd:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+Predicate types attach at two different levels of the image index, so the
+digest you verify against depends on what you are asking for:
+
+| Predicate | Attached to | Verify against |
+|-----------|-------------|----------------|
+| SLSA provenance (`slsaprovenance1`) | multi-arch index | `crane digest <image>:<tag>` |
+| OpenVEX (`openvex`) | multi-arch index | `crane digest <image>:<tag>` |
+| SBOM (`spdxjson`) | per-platform child manifest | `crane digest --platform <os>/<arch> <image>:<tag>` |
+
+Asking for `spdxjson` against the index digest fails with `none of the
+attestations matched the predicate type`.
+
+```bash
+set -euo pipefail
+TAG=$(gh release view --repo NVIDIA/aicr --json tagName -q .tagName)
+[[ -n "${TAG}" ]] || { echo "failed to resolve latest TAG" >&2; exit 1; }
+
+# Resolve immutable digests up front so a missing image / crane failure
+# aborts here (set -e) instead of being attributed to a later gh/cosign step.
+AICR_INDEX=$(crane digest "ghcr.io/nvidia/aicr:${TAG}")
+AICRD_INDEX=$(crane digest "ghcr.io/nvidia/aicrd:${TAG}")
+GATE_INDEX=$(crane digest "ghcr.io/nvidia/aicr-gate:${TAG}")
+DEPLOY_INDEX=$(crane digest "ghcr.io/nvidia/aicr-validators/deployment:${TAG}")
+PERF_INDEX=$(crane digest "ghcr.io/nvidia/aicr-validators/performance:${TAG}")
+CONF_INDEX=$(crane digest "ghcr.io/nvidia/aicr-validators/conformance:${TAG}")
+AIPERF_INDEX=$(crane digest "ghcr.io/nvidia/aicr-validators/aiperf-bench:${TAG}")
+
+# GitHub CLI (core images) — --source-ref binds the attestation to this tag
+gh attestation verify "oci://ghcr.io/nvidia/aicr@${AICR_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicrd@${AICRD_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicr-gate@${GATE_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
 
 # GitHub CLI (validator images)
-gh attestation verify oci://ghcr.io/nvidia/aicr-validators/deployment:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
-gh attestation verify oci://ghcr.io/nvidia/aicr-validators/performance:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
-gh attestation verify oci://ghcr.io/nvidia/aicr-validators/conformance:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
-gh attestation verify oci://ghcr.io/nvidia/aicr-validators/aiperf-bench:${TAG} --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicr-validators/deployment@${DEPLOY_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicr-validators/performance@${PERF_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicr-validators/conformance@${CONF_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
+gh attestation verify "oci://ghcr.io/nvidia/aicr-validators/aiperf-bench@${AIPERF_INDEX}" --repo NVIDIA/aicr --signer-workflow NVIDIA/aicr/.github/workflows/attest-images.yaml --source-ref "refs/tags/${TAG}"
 
-# Cosign
+# Cosign — provenance and OpenVEX are on the index. Pin the workflow *and*
+# the exact tag ref (same binding as --source-ref above): without
+# --certificate-github-workflow-ref, the identity regexp alone would accept
+# an attestation signed for any release tag on a digest this tag was
+# rewritten to point at.
+IDENTITY='^https://github\.com/NVIDIA/aicr/\.github/workflows/attest-images\.yaml@refs/tags/.+$'
+for predicate in slsaprovenance1 openvex; do
+  cosign verify-attestation \
+    --type "${predicate}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    --certificate-identity-regexp "${IDENTITY}" \
+    --certificate-github-workflow-ref "refs/tags/${TAG}" \
+    "ghcr.io/nvidia/aicr@${AICR_INDEX}" >/dev/null
+done
+
+# Cosign — the SBOM is on the per-platform child manifest
+platform="linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+AICR_CHILD=$(crane digest --platform "${platform}" "ghcr.io/nvidia/aicr@${AICR_INDEX}")
 cosign verify-attestation \
   --type spdxjson \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  --certificate-identity-regexp '^https://github\.com/NVIDIA/aicr/\.github/workflows/attest-images\.yaml@refs/tags/.+$' \
-  ghcr.io/nvidia/aicr:${TAG}
+  --certificate-identity-regexp "${IDENTITY}" \
+  --certificate-github-workflow-ref "refs/tags/${TAG}" \
+  "ghcr.io/nvidia/aicr@${AICR_CHILD}" >/dev/null
 ```
 
 ### Binary Checksums
 
+`aicr_checksums.txt` lists digests for release archives (and SBOMs). Download
+the archive you intend to verify **and** the checksums file into the same
+directory, assert the archive is present and non-empty, then check **that**
+file’s line — do not use `--ignore-missing` (it can pass with zero files
+verified). On macOS, use `shasum -a 256` (built-in); on Linux, `sha256sum`
+(GNU coreutils).
+
 ```bash
-curl -sL "https://github.com/NVIDIA/aicr/releases/download/${TAG}/aicr_checksums.txt" -o checksums.txt
-sha256sum -c checksums.txt --ignore-missing
+set -euo pipefail
+TAG=$(gh release view --repo NVIDIA/aicr --json tagName -q .tagName)
+[[ -n "${TAG}" ]] || { echo "failed to resolve latest TAG" >&2; exit 1; }
+
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+archive="aicr_${TAG#v}_${os}_${arch}.tar.gz"
+
+tmpdir=$(mktemp -d)
+trap 'rm -rf "${tmpdir}"' EXIT
+gh release download "${TAG}" -R NVIDIA/aicr -D "${tmpdir}" \
+  -p "aicr_checksums.txt" \
+  -p "${archive}"
+
+cd "${tmpdir}"
+[[ -s "${archive}" ]] || { echo "missing or empty archive: ${archive}" >&2; exit 1; }
+[[ -s aicr_checksums.txt ]] || { echo "missing aicr_checksums.txt" >&2; exit 1; }
+
+# Fail closed: verify only the downloaded archive line from the checksums file.
+line=$(grep -F "  ${archive}" aicr_checksums.txt) || {
+  echo "no checksum entry for ${archive}" >&2
+  exit 1
+}
+if command -v sha256sum >/dev/null 2>&1; then
+  printf '%s\n' "${line}" | sha256sum -c -
+elif command -v shasum >/dev/null 2>&1; then
+  printf '%s\n' "${line}" | shasum -a 256 -c -
+else
+  echo "need sha256sum (GNU coreutils) or shasum" >&2
+  exit 1
+fi
 ```
 
 ## Demo Deployment

@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name: Daily Image Vulnerability Scan
+name: Weekly Image Vulnerability Scan
 
 on:
   schedule:
-    - cron: '0 6 * * *'  # Daily at 6:00 AM UTC
+    # Weekly on Thursday at 6:00 AM UTC. Every run reports the full HIGH+
+    # set, carried-over findings included -- an open vulnerability keeps
+    # being reported until it is fixed or VEX-suppressed.
+    - cron: '0 6 * * 4'
   workflow_dispatch:
     inputs:
       notify_slack:
@@ -78,7 +81,6 @@ jobs:
 
       - name: Build and push aicr
         env:
-          GOFLAGS: -mod=vendor
           KO_DOCKER_REPO: ghcr.io/nvidia/aicr
         run: |
           set -euo pipefail
@@ -90,7 +92,6 @@ jobs:
 
       - name: Build and push aicrd
         env:
-          GOFLAGS: -mod=vendor
           KO_DOCKER_REPO: ghcr.io/nvidia/aicrd
           # Base image inherited from .ko.yaml (nvcr.io/nvidia/distroless/static),
           # same as the aicr build above.
@@ -136,15 +137,29 @@ jobs:
           persist-credentials: false
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Authenticate to registry
         uses: ./.github/actions/ghcr-login
 
-      - name: Read Go version
-        id: go
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        if: matrix.phase != 'aiperf-bench'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+
+      - name: Build validator binary
+        if: matrix.phase != 'aiperf-bench'
         shell: bash
-        run: echo "version=$(cat .go-version)" >> "$GITHUB_OUTPUT"
+        env:
+          VALIDATOR_ARCHES: ${{ matrix.arch }}
+          VALIDATOR_PHASES: ${{ matrix.phase }}
+        run: ./tools/build-validator-binaries
 
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
@@ -153,15 +168,18 @@ jobs:
           file: ${{ matrix.dockerfile || format('validators/{0}/Dockerfile', matrix.phase) }}
           platforms: ${{ matrix.platform }}
           push: true
-          # CHAINSAW_* args were dropped in #1236 — the deployment validator
-          # no longer ships /usr/local/bin/chainsaw; it executes Chainsaw
-          # Test format in-process via validators/chainsaw/inprocess.go.
-          build-args: |
-            GO_VERSION=${{ steps.go.outputs.version }}
           tags: ${{ env.VALIDATOR_IMAGE_PREFIX }}/${{ matrix.phase }}:${{ env.SCAN_TAG }}-${{ matrix.arch }}
           provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # aiperf-bench builds without the layer cache on purpose (#2086).
+          # Its requirements.txt is deliberately unpinned so each rebuild
+          # resolves patched transitive versions, but `pip install` is opaque
+          # to BuildKit: neither the base image nor the COPY'd requirements.txt
+          # changes between releases, so a cache hit replays the old closure
+          # verbatim. Without this the weekly scan reports on a stale closure
+          # that a freshly built image would not contain. The Go validators
+          # have no resolution step, so they keep the cache.
+          cache-from: ${{ matrix.phase != 'aiperf-bench' && 'type=gha' || '' }}
+          cache-to: ${{ matrix.phase != 'aiperf-bench' && 'type=gha,mode=max' || '' }}
           labels: |
             org.opencontainers.image.title=${{ matrix.image_title || format('aicr-validator-{0}', matrix.phase) }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -171,8 +189,8 @@ jobs:
   # =============================================================================
   # The in-cluster readiness gate image (cmd/gate/Dockerfile) is published only
   # on release tags by on-tag.yaml, so without this it is never vuln-scanned and
-  # never refreshed on main. Mirror on-tag's build-args exactly (GO_VERSION +
-  # CHAINSAW_VERSION + VERSION) so the scanned image matches what ships.
+  # never refreshed on main. Mirror on-tag's runner-side compilation so the
+  # scanned image matches what ships.
 
   build-gate:
     name: Docker Gate (${{ matrix.arch }})
@@ -202,7 +220,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Authenticate to registry
         uses: ./.github/actions/ghcr-login
@@ -211,6 +229,25 @@ jobs:
         id: versions
         uses: ./.github/actions/load-versions
 
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+
+      - name: Build gate binary
+        shell: bash
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+          VERSION: ${{ env.SCAN_TAG }}
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH="${TARGET_ARCH}" GOFLAGS="-mod=readonly" \
+            go build -trimpath \
+            -ldflags="-s -w -extldflags '-static' -X main.version=${VERSION}" \
+            -o dist/gate ./cmd/gate
+          file dist/gate
+
       - name: Build and push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
@@ -218,10 +255,6 @@ jobs:
           file: cmd/gate/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          build-args: |
-            GO_VERSION=${{ steps.versions.outputs.go }}
-            CHAINSAW_VERSION=${{ steps.versions.outputs.chainsaw }}
-            VERSION=${{ env.SCAN_TAG }}
           tags: ${{ env.GATE_IMAGE }}:${{ env.SCAN_TAG }}-${{ matrix.arch }}
           provenance: false
           cache-from: type=gha
@@ -252,7 +285,7 @@ jobs:
         uses: ./.github/actions/ghcr-login
 
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
 
       - name: Create multi-arch manifests
         run: |

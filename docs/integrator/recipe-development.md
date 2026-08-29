@@ -171,11 +171,10 @@ Leaves that need topology-aware scheduling can optionally add `slinky-topograph`
     - slinky-slurm-operator-crds
     - slinky-slurm   # deploy after Slurm so Helm already owns config-extra
   overrides:
-    global:
-      provider:
-        name: gcp      # cloud provider: gcp | aws | oci | nebius | …
-      engine:
-        name: slinky   # scheduler consumer: slinky | slurm | k8s | graph
+    provider:
+      name: gcp      # cloud provider: gcp | aws | oci | nebius | …
+    engine:
+      name: slinky   # scheduler consumer: slinky | slurm | k8s | graph
 
 - name: slinky-slurm
   type: Helm
@@ -205,9 +204,8 @@ For cloud providers (gcp, aws, oci, nebius, …), `slinky-topograph` requires IA
 
 ```yaml
 overrides:
-  global:
-    provider:
-      name: gcp
+  provider:
+    name: gcp
   serviceAccount:
     annotations:
       iam.gke.io/gcp-service-account: <sa-name>@<project-id>.iam.gserviceaccount.com
@@ -466,22 +464,125 @@ identical to a sibling's — does not support the "validated against deployed
 config" claim and must not be declared. The snippet above shows the declaration
 shape only; it is not a declaration you should copy into an overlay.
 
+**When the distinguishing signal only exists after deployment**, declare it
+under the value's `readinessConstraints` instead of `constraints`. Both lists
+get the same catalog-load validation (names deduplicate per list; the same
+measurement path may appear in both, carrying a pre-condition at generation
+and a post-deployment state at readiness), but
+`readinessConstraints` are never evaluated at generation time — they route
+into `spec.validation.readiness.constraints` and are evaluated fail-closed by
+the `aicr validate` readiness pre-flight. Two kinds of state belong here:
+externally-grounded cluster state evaluated post-deployment (provider
+properties, node labels set at provisioning), and **deployment-outcome
+checks** — properties the value's own workload creates (the post-deployment
+form of a self-falsified pre-condition, or a node label its DaemonSet applies
+after a successful install), which a fresh deployment cannot find in the
+pre-deployment snapshot that generation-time constraints are checked against.
+Only the externally-grounded kind can **qualify** the value — establish that
+the cluster's pre-existing mode matches the selection. An outcome check
+observes post-deployment state without establishing which deployment
+produced it: the readiness gate compares only the snapshot value, with no
+deployment identity, owner, or timestamp binding, so a marker left by an
+earlier deployment satisfies a later check. Declare a workload-written
+marker only when its producer owns the marker's full lifecycle — clearing
+or versioning it when the outcome no longer holds. And because every
+value's own success satisfies its own markers, an outcome check can never
+distinguish one value from another (ADR-015, "Self-rendered readings do
+not qualify").
+
 **Constraint names must be measurement paths a supported snapshot producer
 actually emits** — a collector, or a provider projection attached at the
 snapshot orchestration layer (e.g. `K8s.aks-gpu-pools.gpu-driver` from
 `aicr snapshot --aks-gpu-pools`) — in
 `{Type}.{Subtype}.{Key}` form. The type must be one the snapshot carries —
-`K8s`, `GPU`, `OS`, `SystemD`, `NodeTopology`, or `NetworkTopology` —
-so `K8s.server.version` resolves while an unknown type is rejected outright as
-an invalid measurement type. Constraints are evaluated against the snapshot
-when one is supplied, and a name whose subtype nothing produces fails closed
-with `subtype not found`. Either way a fabricated path makes the whole value
-unselectable rather than unconstrained.
+`K8s`, `GPU`, `OS`, `SystemD`, `NodeTopology`, or `NetworkTopology`.
+
+**Paths are validated when recipe data is loaded, not when a snapshot is
+evaluated.** Every constraint name in `spec.constraints`,
+`spec.validation.readiness.constraints`, `spec.profile.values.*.constraints`,
+and `spec.profile.values.*.readinessConstraints`
+is checked against the measurement catalog (`pkg/measurement/catalog.go`) as the
+overlay, mixin, or base file is read. A path the catalog cannot address fails
+the load with the file, the field, and — where there is a near match — a
+suggestion:
+
+```text
+[INVALID_REQUEST] overlays/h100-eks-ubuntu-training.yaml: spec.constraints[0]:
+[INVALID_REQUEST] unknown key "verison" in subtype "server" of measurement
+type "K8s"; did you mean "version"?
+```
+
+This closes a false-PASS. Before, a typo'd-but-grammatical path evaluated as
+"reading absent from this snapshot", which the resolver treats as a signal to
+exclude the overlay gracefully — so the recipe resolved successfully with the
+constraint never evaluated. See
+[#1783](https://github.com/NVIDIA/aicr/issues/1783).
+
+Three rules follow from how the extractor addresses values, and each is
+enforced at load:
+
+- **Subtype-level `context` is not addressable.** `NetworkTopology.identity`
+  emits `identifier`, `machineType`, `gpuType`, `linkType`, and `nodeSelector`
+  to `context`, which extraction never reads. Only its `data` keys
+  (`pf-count`, `rail-count`) can be constrained.
+- **Item subtypes require a selector.** `NetworkTopology.pfs` carries only
+  `items`, so `NetworkTopology.pfs.rail` is rejected; write
+  `NetworkTopology.pfs[0].rail` or `NetworkTopology.pfs[rail=3].pciAddress`.
+- **Scalar subtypes reject a selector.** `NetworkTopology.capabilities` has no
+  `items`, so the `[0]` / `[key=value]` forms are invalid there and
+  `NetworkTopology.capabilities[0].sriov` is rejected. Write
+  `NetworkTopology.capabilities.sriov`.
+
+A predicate selector's key is validated too, so
+`NetworkTopology.pfs[raill=3].pciAddress` fails at load rather than silently
+matching nothing later. Index *values* are not checked — bounds depend on the
+snapshot, and an out-of-range index remains a runtime "not found".
+
+Where a producer's key space is genuinely open — `/etc/os-release` fields,
+sysctl paths, container image names, node label and taint keys, systemd unit
+names and their D-Bus properties — the catalog accepts any key, so those paths
+are still only as correct as the author makes them.
+
+**`SystemD` splits at the last dot, every other type at the first.** A SystemD
+subtype *is* a unit name that carries a dot (`containerd.service`) while its
+D-Bus property keys do not, so `SystemD.containerd.service.ActiveState` names
+subtype `containerd.service` and key `ActiveState`. Every other type has
+dot-free subtypes and possibly dotted keys, which is what makes
+`OS.sysctl./proc/sys/kernel/osrelease` and
+`NodeTopology.label.nvidia.com/gpu.present` resolve.
+
+Constraints are then evaluated against the snapshot when one is supplied. A
+path that is addressable but absent from a particular snapshot is still the
+designed graceful-exclusion signal: the catalog describes what a producer *can*
+emit, not what any one cluster does.
 
 Do not borrow paths from `validation.deployment.constraints`, such as
 `Deployment.gpu-operator.version`. Those are deployment-phase validator keys
 evaluated against a live cluster, not snapshot readings, and `Deployment` is
 not a measurement type.
+
+**One name is a node-set form, not a reading path:**
+`NodeTopology.gpu-nodes.label`
+([#1755](https://github.com/NVIDIA/aicr/issues/1755)). No snapshot producer
+emits a `gpu-nodes` subtype; the evaluator synthesizes the GPU-node set from
+the snapshot's `NodeTopology.label` readings (nodes carrying
+`cloud.google.com/gke-accelerator`) and quantifies a label predicate over it.
+Its value grammar is also not the operator grammar:
+`<label-key>=<value>` asserts every GPU node carries the label with exactly
+that value, and `!<label-key>` asserts no GPU node carries the key. Both
+directions fail closed on a truncated node list (a snapshot captured with
+`--max-nodes-per-entry` whose cap actually truncated a participating
+reading), on an empty GPU-node universe, and on malformed or ambiguous
+label readings (an encoding collision between a disambiguated entry and a
+distinct dotted label name — see #2003). It is consumed by the GKE
+`gpuStack` profile values (the positive form qualifies `bundle-installer`, the
+negated form `gke-default`), where each selected value's constraint is
+verified at generation when generating from a snapshot (criteria-only
+generation has no snapshot evaluator and defers entirely to the
+pre-flight) and re-evaluated by the validate readiness pre-flight. Outside a profile declaration, declare it under
+`validation.readiness.constraints`, not `spec.constraints` — as a top-level
+constraint it would exclude the overlay during snapshot-based generation on
+the very cluster the diagnostic exists to fix.
 
 **Which signal qualifies a driver-ownership profile depends on the service.**
 The example above names none, which is why it is shape only. `GPU.hardware`
@@ -497,7 +598,9 @@ is then checked against the reading — `azure-managed` requires `Install`,
 `--profile gpuStack=operator-managed` therefore fails closed on the azure-managed
 default rather than silently switching values. Unavailable, unknown, or
 mixed pool values fail closed against either selection. ADR-015 resolves
-this signal, and the AKS family above is the first embedded adopter.
+this signal. The AKS family above was the first embedded adopter; the GKE
+family's `gpuStack` (device-plugin ownership over the #1755 node-set form,
+with `advertiser: external` on `gke-default`) is the second.
 
 No equivalent reading exists for other services yet. Declare a
 driver-ownership profile only once the signal for that service exists, and
@@ -544,8 +647,11 @@ Profile declarations are intentionally narrow:
   for later validation. This qualification rule is enforced during catalog
   review; core admission does not infer whether arbitrary readings
   semantically distinguish two modes.
-- The GKE-only `advertiser` and allocation-policy selector paths are reserved
-  but rejected until the GKE extension lands.
+- A profile value may declare `advertiser: external` (the GKE `gke-default`
+  shape) to record a provider-managed plugin outside the recipe as THE
+  `nvidia.com/gpu` advertiser; the vocabulary is closed (empty or
+  `external`), and the declaration extends the #1327 dual-advertisement
+  gates and closure-locks the allocation-policy selector paths.
 
 Select with `aicr recipe --profile name=value`; omission uses the declared
 default. A profiled result uses `aicr.run/v1alpha3` and records
@@ -823,7 +929,28 @@ spec:
                 state: ready
 ```
 
-When `--readiness-hooks` is set, the bundler wraps this test into a `NNN-<name>-readiness/` folder containing a `Job` that runs the `gate` CLI (`ghcr.io/nvidia/aicr-gate`, which embeds Chainsaw). The deploy blocks on that Job — via `helm --wait` for the helm deployer (the gate Job is a `post-install,post-upgrade` hook, and `--wait` blocks on hook completion regardless of `--wait-for-jobs`), or via Argo CD's built-in `batch/Job` health on the next sync-wave for the `argocd`/`argocd-helm` deployers. Keep `spec.timeouts.assert` shorter than the gate's per-test timeout so a single poll can't outlast one gate iteration. See [Readiness Gates](../user/cli-reference.md#readiness-gates) for the deploy-time behavior.
+When `--readiness-hooks` is set, the bundler wraps this test into a `NNN-<name>-readiness/` folder containing a `Job` that runs the `gate` CLI (`ghcr.io/nvidia/aicr-gate`). The deploy blocks on that Job — via `helm --wait` for the helm deployer (the gate Job is a `post-install,post-upgrade` hook, and `--wait` blocks on hook completion regardless of `--wait-for-jobs`), or via Argo CD's built-in `batch/Job` health on the next sync-wave for the `argocd`/`argocd-helm` deployers. Keep `spec.timeouts.assert` shorter than the gate's per-test timeout so a single poll can't outlast one gate iteration. This is now enforced rather than advisory: the effective budget is the **smaller** of the authored `spec.timeouts.assert` and the caller's per-component budget, so an authored value larger than the caller allows is capped rather than honored. A shorter authored value still shortens the budget as before. That caller budget is the gate's `--timeout` (`defaults.ReadinessGateExecTimeout`, 2m) for a readiness Job, and `defaults.ChainsawAssertTimeout` for `aicr validate --phase deployment` — not the `expected-resources` catalog timeout, which is the outer Job envelope rather than a per-component assertion budget. See [Readiness Gates](../user/cli-reference.md#readiness-gates) for the deploy-time behavior.
+
+**Supported operations.** The gate evaluates the Test in-process against its own read-only ServiceAccount — it ships no Chainsaw binary and shells out to nothing. Only `assert` and `error` are honored; every other operation (`apply`, `create`, `delete`, `patch`, `update`, `script`, `command`, `wait`, `sleep`, `get`, `describe`, `events`, `podLogs`, `proxy`) is rejected before evaluation, as are `catch`, `finally`, and `cleanup` blocks. A readiness test that declares one fails the gate with an invalid-request error naming the offending step.
+
+One action per operation: a `try` entry that sets **both** `assert` and `error` is rejected. Chainsaw evaluates a single action per operation and the executor reaches `assert` first, so the `error` half — the one that forbids a shape — would never run. Split them into separate `try` entries.
+
+A Test declaring no `assert`/`error` operation at all is rejected rather than passing vacuously — a check that evaluates nothing must never report healthy. If the no-op is deliberate, because readiness for that component is enforced some other way, declare it with an annotation on the Test:
+
+```yaml
+metadata:
+  name: my-component-readiness
+  annotations:
+    aicr/no-op-check: "true"
+```
+
+The rule applies per document, so in a multi-document (`---`) stream each Test that carries no operations needs its own annotation.
+
+An **empty** readiness file — blank, whitespace-only, or nothing but comments and `---` separators — is rejected outright. There is no Test to carry the annotation, so the only honest verdict is a failure; a check whose content was lost to a truncated ConfigMap value or a bad template render must not report healthy.
+
+A multi-document stream may hold **only** Test documents. Once any document in the file is a chainsaw Test, the whole stream is evaluated by the in-process executor, and nothing else reads it — so a raw Kubernetes manifest sitting alongside a Test would be silently ignored while the component still reported ready. Such a stream is rejected by naming the offending document's kind. Ordinary punctuation (a trailing `---`, a comment-only or `null` document) is not content and is skipped.
+
+Resource blocks that omit `metadata.namespace` are scoped to the release namespace (the Job passes it via `--namespace`); cluster-scoped kinds, like the `ClusterPolicy` above, ignore it.
 
 ## Best Practices
 

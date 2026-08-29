@@ -113,7 +113,29 @@ const (
 	// the literal string "1" — fail closed: an empty or non-numeric count
 	// (e.g. a failed pipeline stage) lands in the FAIL branch instead of
 	// erroring inside a numeric `[ -ne ]` test and falling through to PASS.
-	gpuExclusiveGrantProbeScript = `uuids="$(nvidia-smi --query-gpu=uuid --format=csv,noheader)" || { echo "FAIL: nvidia-smi cannot enumerate GPUs - no usable GPU granted"; exit 1; }; ` +
+	//
+	// The prologue makes the probe advertiser-agnostic: under the GPU
+	// Operator's toolkit flow, nvidia-smi and libnvidia-ml are injected at
+	// standard paths and the exports are no-ops; under GKE's managed device
+	// plugin (the gke-default gpuStack value), the driver tree is mounted
+	// at /usr/local/nvidia/{bin,lib64} without touching the container's
+	// environment, so a bare `nvidia-smi` fails to resolve even though the
+	// GPU allocation succeeded (observed live: gke-default qualification on
+	// aicr-30948013962 — allocation fine, probe pod Failed).
+	// The ${VAR:+${VAR}:} guards matter in a security probe: appending to
+	// an UNSET LD_LIBRARY_PATH with a bare "${LD_LIBRARY_PATH}:..." yields
+	// a leading EMPTY entry, and an empty ld.so search-path entry means
+	// the current working directory — a library-injection foothold. Same
+	// guard on PATH for symmetry (an empty PATH entry also means CWD for
+	// command search). Appending (not prepending) is also deliberate: the
+	// image's own entries keep precedence, so the node-mounted tree is a
+	// fallback for images that ship no CUDA userland (cudaTestImage carries
+	// no nvidia-smi) rather than a shadow over image binaries — prepending
+	// a node path ahead of the image's PATH in a security probe would be
+	// the riskier ordering for no supported gain.
+	gpuExclusiveGrantProbeScript = `export PATH="${PATH:+${PATH}:}/usr/local/nvidia/bin"; ` +
+		`export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}/usr/local/nvidia/lib64"; ` +
+		`uuids="$(nvidia-smi --query-gpu=uuid --format=csv,noheader)" || { echo "FAIL: nvidia-smi cannot enumerate GPUs - no usable GPU granted"; exit 1; }; ` +
 		`count="$(printf '%s\n' "$uuids" | grep -c .)"; ` +
 		`echo "granted GPU count: ${count}"; echo "granted GPU UUIDs: ${uuids}"; ` +
 		`case "${count}" in 1) echo "PASS: exactly one usable GPU visible"; exit 0;; ` +
@@ -1587,7 +1609,7 @@ func buildNoAllocationProbePod(run *gpuTestRun, gpuNodeName string) *corev1.Pod 
 // no `exactly` wrapper — deviceClassName/allocationMode/count are direct
 // fields on the request (see k8s.io/api/resource/v1beta1.DeviceRequest).
 func buildResourceClaim(run *gpuTestRun, version string) *unstructured.Unstructured {
-	request := map[string]interface{}{
+	request := map[string]any{
 		keyName: gpuClaimName,
 	}
 	if version == versionV1beta1 {
@@ -1595,23 +1617,23 @@ func buildResourceClaim(run *gpuTestRun, version string) *unstructured.Unstructu
 		request["allocationMode"] = allocationModeExactCount
 		request["count"] = int64(1)
 	} else {
-		request["exactly"] = map[string]interface{}{
+		request["exactly"] = map[string]any{
 			"deviceClassName": draDriverGPU,
 			"allocationMode":  allocationModeExactCount,
 			"count":           int64(1),
 		}
 	}
 	return &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			keyAPIVersion: apiGroupResourceK8sIO + "/" + version,
 			keyKind:       "ResourceClaim",
-			keyMetadata: map[string]interface{}{
+			keyMetadata: map[string]any{
 				keyName:      run.claimName,
 				keyNamespace: run.namespace,
 			},
-			keySpec: map[string]interface{}{
-				"devices": map[string]interface{}{
-					"requests": []interface{}{request},
+			keySpec: map[string]any{
+				"devices": map[string]any{
+					"requests": []any{request},
 				},
 			},
 		},

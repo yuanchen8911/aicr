@@ -24,11 +24,26 @@ name: UAT Run
 #
 # The intent (training|inference) is rendered so nightly/daytime runs are
 # self-describing in the Actions list. It defaults to `training` on both the
-# dispatch and call paths, so it is always present. IMPORTANT: the nightly
-# (uat-nightly-batch.yaml) and daytime (uat-daytime.yaml) controllers rebuild
-# this exact title to resolve the run they dispatched — keep their `title=`
-# construction in lockstep with this format string.
-run-name: "UAT ${{ inputs.reservation }} ${{ inputs.intent }} @ ${{ inputs.aicr_version || 'main' }}${{ inputs.dispatch_key != '' && format(' #{0}', inputs.dispatch_key) || '' }}"
+# dispatch and call paths, so it is always present. The deployer is rendered
+# as `[<deployer>]` ONLY when it is non-empty and non-default (i.e. argocd
+# today) so nightly/daytime titles, which never dispatch a non-default
+# deployer, are unchanged. IMPORTANT: the nightly (uat-nightly-batch.yaml)
+# and daytime (uat-daytime.yaml) controllers rebuild this exact title to
+# resolve the run they dispatched — keep their `title=` construction in
+# lockstep with this format string; if either controller ever starts passing
+# `-f deployer=<x>` (x != helmfile), also add the `[<x>]` segment there.
+# Folded scalar (>-): each newline below joins as a single space, which
+# corresponds exactly to the literal single-space separators between the
+# segments (`UAT · reservation · intent · @ · version`). Line-break points
+# are chosen so no newline lands INSIDE an adjacent expression pair where
+# the absence of a literal separator is load-bearing (e.g. the intent+
+# deployer pair — deployer renders ' [<x>]' or '', its leading space is the
+# separator on its own — and version+dispatch_key, same shape). Keeps the
+# rendered title identical to the pre-fold single-line form.
+run-name: >-
+  UAT ${{ inputs.reservation }}
+  ${{ inputs.intent }}${{ inputs.deployer != 'helmfile' && format(' [{0}]', inputs.deployer) || '' }}
+  @ ${{ inputs.aicr_version || 'main' }}${{ inputs.dispatch_key != '' && format(' #{0}', inputs.dispatch_key) || '' }}
 
 # The shared UAT dispatch surface and reservation-lease owner (#1274, DC1).
 # A human (workflow_dispatch) or the nightly batch (workflow_call) requests a
@@ -44,8 +59,9 @@ run-name: "UAT ${{ inputs.reservation }} ${{ inputs.intent }} @ ${{ inputs.aicr_
 #     recipe criteria.
 #   - lifecycle (nightly|daytime-up|daytime-down) selects the cluster
 #     lifecycle: the nightly provision→CUJ→teardown, the daytime
-#     provision-and-hold (stable lease-tagged name, no teardown), or the
-#     evening teardown of that held daytime cluster.
+#     provision-and-hold (stable lease-tagged name; holds on success, tears
+#     down on failure or cancellation), or the evening teardown of that held
+#     daytime cluster.
 on:
   workflow_dispatch:
     inputs:
@@ -67,18 +83,36 @@ on:
         options: [training, inference]
         default: training
       lifecycle:
-        description: 'Cluster lifecycle. nightly: provision→CUJ→teardown. daytime-up: provision+deploy+HOLD (stable name, no teardown). daytime-down: tear down the held daytime cluster.'
+        description: 'Cluster lifecycle. nightly: provision→CUJ→teardown. daytime-up: stable-named cluster, holds on success, tears down on failure or cancellation. daytime-down: tear down cluster.'
         type: choice
         options: [nightly, daytime-up, daytime-down]
         default: nightly
+      slot:
+        description: 'Daytime cluster slot (ADR-017) — the <slot> in aicr-uat-day-<slug>-<slot>-. Only slot 0 is provisioned today.'
+        type: string
+        default: '0'
       skip_delete:
-        description: 'Skip cluster teardown (manual debugging only; ignored for daytime lifecycles).'
+        description: 'Skip cluster teardown (manual debugging only; ignored for daytime lifecycles). A retained cluster becomes eligible for janitor reclamation ~24h after the run finishes.'
         type: boolean
         default: false
       skip_tests:
         description: 'Skip UAT test execution (manual debugging only).'
         type: boolean
         default: false
+      deployer:
+        # helmfile = default via <accelerator>-<intent>-config.yaml (the
+        # existing filename shape every cell has always used, kept for
+        # backwards-compat). argocd = <accelerator>-<intent>-argocd-config.yaml
+        # (e.g. h100-training-argocd-config.yaml). Only aws-h100 training
+        # ships an argocd variant today; other cells fail with a missing
+        # test-config. See issue #2194. (actionlint rejects an empty
+        # string in a choice's options, so `helmfile` is the explicit
+        # default value here; the TEST_CONFIG resolver in uat-aws.yaml
+        # maps it to the unsuffixed filename.)
+        description: 'Deployer variant. See workflow file for the variant matrix.'
+        type: choice
+        options: [helmfile, argocd]
+        default: helmfile
   workflow_call:
     inputs:
       reservation:
@@ -96,12 +130,18 @@ on:
       lifecycle:
         type: string
         default: nightly
+      slot:
+        type: string
+        default: '0'
       skip_delete:
         type: boolean
         default: false
       skip_tests:
         type: boolean
         default: false
+      deployer:
+        type: string
+        default: helmfile
 
 permissions:
   contents: read
@@ -135,6 +175,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       cloud: ${{ steps.row.outputs.cloud }}
+      # Daytime cluster-name discovery slug (ADR-017); forwarded to the cloud
+      # pipelines that derive aicr-uat-day-<slug>-<slot>-<run_id>.
+      slug: ${{ steps.row.outputs.slug }}
       cluster_config_path: ${{ steps.row.outputs['cluster-config-path'] }}
       test_config_dir: ${{ steps.row.outputs['test-config-dir'] }}
       # Accelerator selects the per-accelerator test-config filename
@@ -157,16 +200,23 @@ jobs:
           cache: true
           cache-dependency-path: |
             go.sum
-            vendor/modules.txt
       - name: Resolve reservation row
         id: row
         env:
-          GOFLAGS: -mod=vendor
           # Pass via env (not inline interpolation) to avoid expression
           # injection through the dispatch input.
           RESERVATION: ${{ inputs.reservation }}
+          SLOT: ${{ inputs.slot }}
         run: |
           set -euo pipefail
+          # Only slot 0 is provisioned today (ADR-017). Reject any other value at
+          # this single dispatch surface — before it is forwarded to a cloud
+          # pipeline — so a daytime-up with slot=1 cannot stand up a second daytime
+          # cluster (and an unbounded value cannot blow the GKE name budget) until
+          # multi-slot capacity and scheduling land.
+          if [[ "${SLOT}" != "0" ]]; then
+            echo "::error::unsupported slot '${SLOT}' (only slot 0 is enabled today)"; exit 1
+          fi
           go build -o ./bin/uat-broker ./tools/uat-broker
           ./bin/uat-broker reservations --name "$RESERVATION" >> "$GITHUB_OUTPUT"
 
@@ -179,7 +229,7 @@ jobs:
   # (nested) evidence-ingest GCS WIF.
   run-aws:
     needs: resolve
-    if: needs.resolve.outputs.cloud == 'aws'
+    if: always() && needs.resolve.outputs.cloud == 'aws'
     # Superset ceiling for the nested pipeline (a reusable workflow's jobs
     # cannot exceed the caller's permissions).
     permissions:
@@ -193,15 +243,26 @@ jobs:
       aicr_version: ${{ inputs.aicr_version }}
       intent: ${{ inputs.intent }}
       lifecycle: ${{ inputs.lifecycle }}
+      # Daytime cluster-name axes (ADR-017): slug from the resolved registry row,
+      # slot from the dispatch input. Together with github.run_id they form
+      # aicr-uat-day-<slug>-<slot>-<run_id>.
+      slug: ${{ needs.resolve.outputs.slug }}
+      slot: ${{ inputs.slot }}
       cluster_config_path: ${{ needs.resolve.outputs.cluster_config_path }}
       test_config_dir: ${{ needs.resolve.outputs.test_config_dir }}
       accelerator: ${{ needs.resolve.outputs.accelerator }}
       skip_delete: ${{ inputs.skip_delete }}
       skip_tests: ${{ inputs.skip_tests }}
+      deployer: ${{ inputs.deployer }}
 
   run-gcp:
     needs: resolve
-    if: needs.resolve.outputs.cloud == 'gcp'
+    # deployer=argocd is aws-h100-scoped today (issue #2194): uat-gcp.yaml declares
+    # no deployer input, so passing one here would be silently ignored (green
+    # helmfile run against a request the user did not make). Skip this job when
+    # a non-helmfile deployer is dispatched; the unsupported-deployer-for-cloud
+    # guard job below emits the red-workflow signal for that combination.
+    if: always() && needs.resolve.outputs.cloud == 'gcp' && inputs.deployer == 'helmfile'
     # Superset ceiling for the nested pipeline (a reusable workflow's jobs
     # cannot exceed the caller's permissions).
     permissions:
@@ -215,6 +276,11 @@ jobs:
       aicr_version: ${{ inputs.aicr_version }}
       intent: ${{ inputs.intent }}
       lifecycle: ${{ inputs.lifecycle }}
+      # Daytime cluster-name axes (ADR-017): slug from the resolved registry row,
+      # slot from the dispatch input. Together with github.run_id they form
+      # aicr-uat-day-<slug>-<slot>-<run_id>.
+      slug: ${{ needs.resolve.outputs.slug }}
+      slot: ${{ inputs.slot }}
       cluster_config_path: ${{ needs.resolve.outputs.cluster_config_path }}
       test_config_dir: ${{ needs.resolve.outputs.test_config_dir }}
       skip_delete: ${{ inputs.skip_delete }}
@@ -222,7 +288,8 @@ jobs:
 
   run-azure:
     needs: resolve
-    if: needs.resolve.outputs.cloud == 'azure'
+    # See run-gcp for the deployer-scope rationale.
+    if: always() && needs.resolve.outputs.cloud == 'azure' && inputs.deployer == 'helmfile'
     # Superset ceiling for the nested pipeline (a reusable workflow's jobs
     # cannot exceed the caller's permissions).
     permissions:
@@ -236,6 +303,11 @@ jobs:
       aicr_version: ${{ inputs.aicr_version }}
       intent: ${{ inputs.intent }}
       lifecycle: ${{ inputs.lifecycle }}
+      # Daytime cluster-name axes (ADR-017): slug from the resolved registry row,
+      # slot from the dispatch input. Together with github.run_id they form
+      # aicr-uat-day-<slug>-<slot>-<run_id>.
+      slug: ${{ needs.resolve.outputs.slug }}
+      slot: ${{ inputs.slot }}
       cluster_config_path: ${{ needs.resolve.outputs.cluster_config_path }}
       test_config_dir: ${{ needs.resolve.outputs.test_config_dir }}
       skip_delete: ${{ inputs.skip_delete }}
@@ -250,7 +322,8 @@ jobs:
   # cloud lanes.
   run-kind:
     needs: resolve
-    if: needs.resolve.outputs.cloud == 'kind'
+    # See run-gcp for the deployer-scope rationale.
+    if: needs.resolve.outputs.cloud == 'kind' && inputs.deployer == 'helmfile'
     permissions:
       contents: read  # checkout inside the called pipeline
       actions: write  # nested evidence-ingest dashboard-publish dispatch (a reusable workflow cannot elevate the caller token, so grant the ceiling here)
@@ -266,6 +339,36 @@ jobs:
       test_config_dir: ${{ needs.resolve.outputs.test_config_dir }}
       skip_delete: ${{ inputs.skip_delete }}
       skip_tests: ${{ inputs.skip_tests }}
+
+  # Fail closed on a dispatched deployer variant this cell doesn't yet wire.
+  # Today only run-aws forwards the `deployer` input to its reusable pipeline;
+  # gcp/azure/kind reusable workflows declare no such input and would run the
+  # helmfile lane if we let them fire. The run-*.if:s above skip those jobs
+  # when a non-helmfile deployer is dispatched to a non-aws cell; this job
+  # provides the paired red-workflow signal so the requester never sees a
+  # green run for a request that was silently downgraded.
+  # Mirrors the unmapped-cloud pattern for the same "no silent no-op" reason.
+  unsupported-deployer-for-cloud:
+    needs: resolve
+    if: >-
+      inputs.deployer != 'helmfile' &&
+      needs.resolve.outputs.cloud != 'aws'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail on unsupported (deployer, cloud) combination
+        env:
+          CLOUD: ${{ needs.resolve.outputs.cloud }}
+          DEPLOYER: ${{ inputs.deployer }}
+        run: |
+          set -euo pipefail
+          echo "::error::deployer='${DEPLOYER}' is only wired for cloud='aws' today"
+          echo "::error::(this reservation resolved to cloud='${CLOUD}'). Only run-aws"
+          echo "::error::forwards the deployer input to its reusable pipeline; other"
+          echo "::error::run-<cloud> jobs would run the helmfile lane silently. See"
+          echo "::error::issue #2194 for the coverage roadmap. The run-<cloud>.if:"
+          echo "::error::guards above skipped the dispatched cell to prevent that"
+          echo "::error::silent downgrade."
+          exit 1
 
   # Fail closed on an unmapped cloud. The broker validates cloud membership
   # against its own set, but a cloud can be added there (and to the registry)

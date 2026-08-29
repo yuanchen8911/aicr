@@ -15,7 +15,7 @@ overview, see the [repository README](https://github.com/NVIDIA/aicr).
 | If you are a... | Start here |
 |-----------------|-----------|
 | **User** — operator deploying AICR to provision or validate a cluster | [User Guide](user/index.md) |
-| **Integrator** — engineer embedding AICR in a CI/CD pipeline, GitOps flow, or larger platform | [Integrator Guide](integrator/automation.md) |
+| **Integrator** — engineer embedding AICR in a CI/CD pipeline, GitOps flow, or larger platform | [Integrator Guide](integrator/index.md) |
 | **Contributor** — developer extending AICR or shipping recipes | [Contributor Guide](contributor/index.md) |
 
 ### User Guide
@@ -46,7 +46,7 @@ For pipelines and platforms that call AICR programmatically or host
 | Add or modify recipe metadata | [Recipe Development](integrator/recipe-development.md) |
 | Verify artifacts (SLSA, SBOM, attestations) | [Supply Chain Verification](integrator/supply-chain-verification.md) |
 | Ship custom validators via `--data` | [Validator Extension](integrator/validator-extension.md) |
-| Cloud-specific GPU setup | [AKS](integrator/aks-gpu-setup.md), [EKS networking](integrator/eks-dynamo-networking.md), [GKE networking](integrator/gke-tcpxo-networking.md), [Talos](integrator/talos-integration.md) |
+| Cloud-specific GPU setup | [AKS](integrator/aks-gpu-setup.md), [GKE](integrator/gke-gpu-setup.md), [EKS networking](integrator/eks-dynamo-networking.md), [GKE networking](integrator/gke-tcpxo-networking.md), [Talos](integrator/talos-integration.md) |
 
 ### Contributor Guide
 
@@ -90,7 +90,7 @@ Reference for the terms used across the docs site.
 |------|------------|
 | **Snapshot** | Captured state of a target system (OS, kernel, Kubernetes, GPU, SystemD). Produced by `aicr snapshot` or the in-cluster snapshot Job. |
 | **Recipe** | Resolved configuration spec — component refs, constraints, deployment order — produced by `aicr recipe` from criteria or from a snapshot. |
-| **Criteria** | Query parameters that select a recipe: `service`, `accelerator`, `intent`, `os`, `platform`, `nodes`. |
+| **Criteria** | Query parameters that select a recipe: `service`, `accelerator`, `intent`, `os`, `platform`. `nodes` is carried as advisory metadata and does not filter overlays. |
 | **Overlay** | A recipe metadata file (`kind: RecipeMetadata`) under `recipes/overlays/` matched by criteria. Composes via single-parent inheritance (`spec.base`). |
 | **Mixin** | A composable fragment (`kind: RecipeMixin`) under `recipes/mixins/` carrying only `constraints` and `componentRefs`, referenced via `spec.mixins`. |
 | **Bundle** | Deployment artifacts emitted by `aicr bundle`: Helm values, manifests, install scripts, checksums. |

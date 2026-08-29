@@ -33,6 +33,16 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 )
 
+// terminationWaitTimeout bounds waits that are expected to return on a watch
+// event the test itself sends — hitting this bound means the wait never
+// observed the event, not that the test is slow.
+const terminationWaitTimeout = 2 * time.Second
+
+// expiringCtxTimeout is the deliberately short deadline used by the tests that
+// assert the timeout path: no terminal event is ever sent, so this bound is the
+// behavior under test rather than a safety net.
+const expiringCtxTimeout = 50 * time.Millisecond
+
 // fakeWatchReactor returns a reactor function suitable for PrependWatchReactor
 // that always serves the supplied watcher.
 func fakeWatchReactor(w watch.Interface) k8stesting.WatchReactionFunc {
@@ -175,7 +185,7 @@ func TestWaitForTermination_WatchClosureRetrySucceeds(t *testing.T) {
 		second.Modify(modified)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), terminationWaitTimeout)
 	defer cancel()
 
 	if err := pod.WaitForTermination(ctx, client, "default", "test-pod"); err != nil {
@@ -218,7 +228,7 @@ func TestWaitForTermination_WatchClosureRetryFails(t *testing.T) {
 		second.Stop()
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), terminationWaitTimeout)
 	defer cancel()
 
 	err := pod.WaitForTermination(ctx, client, "default", "test-pod")
@@ -244,7 +254,7 @@ func TestWaitForTermination_ContextTimeout(t *testing.T) {
 	w := watch.NewFake()
 	client.PrependWatchReactor("pods", fakeWatchReactor(w))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), expiringCtxTimeout)
 	defer cancel()
 
 	err := pod.WaitForTermination(ctx, client, "default", "test-pod")
@@ -440,7 +450,6 @@ func TestWaitForJobTerminal_StaleObjectRVResyncsViaList(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default", ResourceVersion: "1"},
 	})
 
-	const freshCollectionRV = "100"
 	var lists, fromStale, fromFresh atomic.Int32
 	client.PrependReactor("list", "jobs", func(_ k8stesting.Action) (bool, runtime.Object, error) {
 		lists.Add(1)
@@ -449,23 +458,9 @@ func TestWaitForJobTerminal_StaleObjectRVResyncsViaList(t *testing.T) {
 			Items:    []batchv1.Job{{ObjectMeta: metav1.ObjectMeta{Name: "test-job", Namespace: "default", ResourceVersion: "1"}}},
 		}, nil
 	})
-	client.PrependWatchReactor("jobs", func(action k8stesting.Action) (bool, watch.Interface, error) {
-		rv := action.(k8stesting.WatchActionImpl).WatchRestrictions.ResourceVersion
-		fw := watch.NewFake()
-		if rv == freshCollectionRV {
-			fromFresh.Add(1)
-			terminal := jobWithCondition(batchCond("Complete"))
-			terminal.ResourceVersion = "101"
-			go func() { fw.Modify(terminal) }()
-		} else {
-			fromStale.Add(1)
-			go func() {
-				expired := apierrors.NewResourceExpired("too old resource version: " + rv)
-				fw.Error(&expired.ErrStatus)
-			}()
-		}
-		return true, fw, nil
-	})
+	terminal := jobWithCondition(batchCond("Complete"))
+	terminal.ResourceVersion = "101"
+	client.PrependWatchReactor("jobs", staleRVWatchReactor(&fromStale, &fromFresh, terminal))
 
 	got, err := pod.WaitForJobTerminal(context.Background(), client, "default", "test-job", 3*time.Second)
 	if err != nil {

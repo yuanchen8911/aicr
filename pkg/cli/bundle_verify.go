@@ -22,7 +22,7 @@ import (
 	"log/slog"
 	"path/filepath"
 
-	"github.com/NVIDIA/aicr/pkg/bundler/verifier"
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/urfave/cli/v3"
 )
@@ -65,6 +65,9 @@ Require a minimum CLI version (bare version defaults to >= semantics):
 Verify a privately-signed bundle against an org trusted root:
   aicr verify ./my-bundle --trust-root ./trusted_root.json
 
+Read the verification policy from a committed AICRConfig (spec.verify):
+  aicr verify ./my-bundle --config aicr-config.yaml
+
 Verify an offline/air-gapped bundle (no transparency-log network calls; use a
 local PEM key for fully offline operation, since a KMS URI still resolves remotely):
   aicr verify ./bundle --key ./bundle-signer.pub --insecure-ignore-tlog
@@ -79,7 +82,7 @@ Output as JSON:
 				Usage: `Minimum required trust level. "max" (default) auto-detects the highest
 	achievable level for this bundle and verifies against it.
 	Explicit levels: verified, attested, unverified, unknown`,
-			}, verifier.GetTrustLevels),
+			}, aicr.TrustLevels),
 			&cli.StringFlag{
 				Name:  "require-creator",
 				Usage: "Require a specific creator identity (matched against bundle attestation certificate)",
@@ -93,7 +96,8 @@ Output as JSON:
 			&cli.StringFlag{
 				Name: "certificate-identity-regexp",
 				Usage: `Override the certificate identity pattern for binary attestation verification.
-	Must contain "NVIDIA/aicr". Default pins to the release workflow on tag refs.`,
+	Must begin with "https://github.com/NVIDIA/aicr/" (a leading "^" is allowed) and
+	must not use top-level alternation. Default pins to the release workflow on tag refs.`,
 			},
 			&cli.StringFlag{
 				Name:  "key",
@@ -112,6 +116,7 @@ Output as JSON:
 				Value: verifyFormatText,
 				Usage: "Output format: text, json",
 			}, func() []string { return []string{verifyFormatJSON, verifyFormatText} }),
+			configFlag(),
 		},
 		Action: runBundleVerifyCmd,
 	}
@@ -134,46 +139,69 @@ func runBundleVerifyCmd(ctx context.Context, cmd *cli.Command) error {
 		return errors.New(errors.ErrCodeInvalidRequest, "invalid --format: must be text or json")
 	}
 
+	// Load and resolve --config before any verification work so a malformed
+	// spec.verify fails immediately, with spec-path attribution, rather than
+	// after a full verification pass.
+	cfg, err := loadFacadeConfig(ctx, cmd)
+	if err != nil {
+		return err
+	}
+	// Derive the config-supplied options through the facade, so an SDK caller
+	// reading the same document gets the same values. The flag overlay below
+	// stays here: only this layer knows whether a flag was explicitly set.
+	resolved, err := cfg.BundleVerifyOptions()
+	if err != nil {
+		return err
+	}
+
 	slog.Info("verifying bundle", "dir", absDir)
 
-	// Build verify options
-	verifyOpts := &verifier.VerifyOptions{}
-	identityRegexp := cmd.String("certificate-identity-regexp")
-	if identityRegexp != "" {
-		if validErr := verifier.ValidateIdentityPattern(identityRegexp); validErr != nil {
-			return validErr
-		}
-		verifyOpts.CertificateIdentityRegexp = identityRegexp
+	// A config-supplied floor can be *lower* than the "max" default, and
+	// stringFlagOrConfig only logs when a CLI flag overrides config, so that
+	// case would otherwise be silent. Surface it: the trust floor is the one
+	// setting here where a committed value quietly weakening the gate is worth
+	// an audit line.
+	if !cmd.IsSet("min-trust-level") && resolved.MinTrustLevel != "" && resolved.MinTrustLevel != "max" {
+		slog.Info("trust floor set by config", "minTrustLevel", resolved.MinTrustLevel,
+			"source", "spec.verify.policy.minTrustLevel")
 	}
-	verifyOpts.Key = cmd.String("key")
-	verifyOpts.TrustRoot = cmd.String("trust-root")
-	verifyOpts.IgnoreTLog = cmd.Bool("insecure-ignore-tlog")
 
-	// Offline/air-gapped verification is key-based only: reject the flag combo up
-	// front so the user gets a clear message instead of a downstream failure.
-	if verifyOpts.IgnoreTLog && verifyOpts.Key == "" {
+	// Overlay the flags. Every field is CLI-flag-over-config, matching the
+	// precedence the other --config-aware commands use.
+	//
+	// Note the derivation above validated none of this: cfg.BundleVerifyOptions
+	// only projects spec.verify, and IgnoreTLog has no config field at all.
+	// Client.VerifyBundle is what rejects a bad identity pattern and an
+	// IgnoreTLog without a Key, before any verification work runs. The pairing
+	// check is repeated below purely to word the message in flags rather than
+	// struct fields.
+	opts := aicr.BundleVerifyOptions{
+		CertificateIdentityRegexp: stringFlagOrConfig(cmd, "certificate-identity-regexp", resolved.CertificateIdentityRegexp),
+		Key:                       stringFlagOrConfig(cmd, "key", resolved.Key),
+		TrustRoot:                 stringFlagOrConfig(cmd, "trust-root", resolved.TrustRoot),
+		MinTrustLevel:             stringFlagOrConfig(cmd, "min-trust-level", resolved.MinTrustLevel),
+		RequireCreator:            stringFlagOrConfig(cmd, "require-creator", resolved.RequireCreator),
+		CLIVersionConstraint:      stringFlagOrConfig(cmd, "cli-version-constraint", resolved.CLIVersionConstraint),
+		IgnoreTLog:                cmd.Bool("insecure-ignore-tlog"),
+	}
+	if opts.IgnoreTLog && opts.Key == "" {
+		// Reworded for the CLI so the message names flags, not fields.
 		return errors.New(errors.ErrCodeInvalidRequest,
 			"--insecure-ignore-tlog requires --key: offline verification is key-based (verify a bundle signed with `bundle --signing-key ... --tlog-upload=false`)")
 	}
 
-	// Run verification
-	result, err := verifier.Verify(ctx, absDir, verifyOpts)
+	client, err := embeddedClient(ctx)
 	if err != nil {
-		// Preserve a coded error from Verify (e.g. ErrCodeInvalidRequest for a
-		// bad --trust-root file, ErrCodeNotFound for a missing bundle dir) so
-		// the user sees the real classification instead of a blanket Internal.
-		return errors.PropagateOrWrap(err, errors.ErrCodeInternal, "bundle verification failed")
+		return err
 	}
+	defer func() { _ = client.Close() }()
 
-	// Check policy requirements
-	policy := verifier.Policy{
-		MinTrustLevel:     cmd.String("min-trust-level"),
-		RequireCreator:    cmd.String("require-creator"),
-		VersionConstraint: cmd.String("cli-version-constraint"),
-	}
-	policyFailure, policyErr := result.CheckPolicy(policy)
-	if policyErr != nil {
-		return policyErr
+	verification, err := client.VerifyBundle(ctx, absDir, opts)
+	if err != nil {
+		// The facade already propagates coded errors from the verifier (e.g.
+		// ErrCodeInvalidRequest for a bad --trust-root file, ErrCodeNotFound
+		// for a missing bundle dir), so the user sees the real classification.
+		return err
 	}
 
 	// Output results with final verdict. Route through cmd.Root().Writer
@@ -181,25 +209,25 @@ func runBundleVerifyCmd(ctx context.Context, cmd *cli.Command) error {
 	// everywhere else in pkg/cli).
 	out := cmd.Root().Writer
 	if format == verifyFormatJSON {
-		if jsonErr := outputJSON(out, result); jsonErr != nil {
+		if jsonErr := outputJSON(out, verification.Report); jsonErr != nil {
 			return jsonErr
 		}
 	} else {
-		outputText(out, result, policyFailure)
+		outputText(out, verification.Report, verification.PolicyFailure)
 	}
 
-	if policyFailure != "" {
-		return errors.New(errors.ErrCodeInvalidRequest, policyFailure)
+	if verification.PolicyFailure != "" {
+		return errors.New(errors.ErrCodeInvalidRequest, verification.PolicyFailure)
 	}
 
-	if len(result.Errors) > 0 {
-		return errors.New(errors.ErrCodeUnauthorized, "bundle verification failed: "+result.Errors[0])
+	if len(verification.Report.Errors) > 0 {
+		return errors.New(errors.ErrCodeUnauthorized, "bundle verification failed: "+verification.Report.Errors[0])
 	}
 
 	return nil
 }
 
-func outputText(w io.Writer, r *verifier.VerifyResult, policyFailure string) {
+func outputText(w io.Writer, r *aicr.BundleVerifyReport, policyFailure string) {
 	if r.ChecksumsPassed {
 		fmt.Fprintf(w, "  ✓ Checksums verified (%d files)\n", r.ChecksumFiles)
 	} else {
@@ -241,7 +269,7 @@ func outputText(w io.Writer, r *verifier.VerifyResult, policyFailure string) {
 	}
 }
 
-func outputJSON(w io.Writer, r *verifier.VerifyResult) error {
+func outputJSON(w io.Writer, r *aicr.BundleVerifyReport) error {
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeInternal, "failed to marshal verification result", err)

@@ -441,7 +441,7 @@ func TestReadBoundedFile_OversizedFile(t *testing.T) {
 	}
 	// Write 11 MiB (over the 10 MiB limit)
 	buf := make([]byte, 1024*1024)
-	for i := 0; i < 11; i++ {
+	for range 11 {
 		if _, writeErr := f.Write(buf); writeErr != nil {
 			t.Fatal(writeErr)
 		}
@@ -885,11 +885,9 @@ func TestVerificationSnapshot_Cleanup(t *testing.T) {
 	errs := make([]error, callers)
 	var wg sync.WaitGroup
 	for index := range errs {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errs[index] = snapshot.cleanup()
-		}()
+		})
 	}
 	wg.Wait()
 	for index, cleanupErr := range errs {
@@ -1605,5 +1603,17 @@ func TestVerifyBinaryStep_PropagatesTimeout(t *testing.T) {
 	}
 	if result.TrustLevel != "" {
 		t.Errorf("TrustLevel = %s, want unset for propagated timeout", result.TrustLevel)
+	}
+}
+
+// TestValidateIdentityPattern_RejectsUncompilablePattern covers a pattern that
+// carries the required repository anchor (so the substring check passes) but is
+// not a valid regexp. Callers validate up-front precisely so a bad pattern is
+// reported against its own input rather than surfacing later from the identity
+// matcher, so the compile has to happen here.
+func TestValidateIdentityPattern_RejectsUncompilablePattern(t *testing.T) {
+	err := ValidateIdentityPattern("https://github.com/NVIDIA/aicr/[")
+	if err == nil {
+		t.Fatal("ValidateIdentityPattern() error = nil, want rejection of an uncompilable pattern")
 	}
 }

@@ -21,9 +21,11 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -181,6 +183,10 @@ func New(opts ...Option) (*DefaultBundler, error) {
 	for _, opt := range opts {
 		opt(db)
 	}
+	if err := db.Config.Validate(); err != nil {
+		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid bundler configuration")
+	}
 
 	// Fail fast: if attestation is requested, verify that the binary attestation
 	// file exists before any expensive work (OIDC auth, recipe resolution, bundle
@@ -257,6 +263,10 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, errors.New(errors.ErrCodeInvalidRequest,
 			"bundler config is required; construct the bundler with New")
 	}
+	if err := b.Config.Validate(); err != nil {
+		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
+			"invalid bundler configuration")
+	}
 
 	// Reject incoherent component refs (e.g. a Helm ref that also carries a
 	// Kustomize tag/path, which the deployers silently build as Kustomize)
@@ -278,9 +288,17 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, err
 	}
 
-	enabledRefs, filteredOrder, filterErr := b.filterEnabledComponents(recipeResult)
+	enabledRefs, filteredOrder, excludedReasons, filterErr := b.filterEnabledComponents(recipeResult)
 	if filterErr != nil {
 		return nil, filterErr
+	}
+
+	// A --set / --set-json / --set-file naming a component that is not in
+	// the generated bundle cannot take effect. Reject it rather than drop
+	// it on the floor. Runs immediately after filtering, so the "present"
+	// set is exactly what will be rendered.
+	if overrideErr := b.rejectOverridesForAbsentComponents(recipeResult, enabledRefs, excludedReasons); overrideErr != nil {
+		return nil, overrideErr
 	}
 
 	// Work on a shallow copy so the caller's RecipeResult is not mutated
@@ -309,13 +327,22 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 	if validationErr := ValidateAccountingValues(recipeResult, componentValues); validationErr != nil {
 		return nil, validationErr
 	}
+	dynamicValues, err := b.buildDynamicValuesMap(recipeResult.DataProvider())
+	if err != nil {
+		return nil, err
+	}
+	if dynamicErr := rejectDRAEvictionDynamicPaths(recipeResult, dynamicValues); dynamicErr != nil {
+		return nil, dynamicErr
+	}
 
-	// Bundler-derived annotations that must reflect the final resolved
-	// recipe state, applied AFTER extractComponentValues so that user
-	// --set overrides cannot defeat them. Every deployer (Helm,
-	// helmfile, Flux, Argo CD, argocd-helm) sees the same final map.
-	// See issue #973.
+	// Bundler-derived integration values that must reflect the final resolved
+	// recipe state are applied AFTER extractComponentValues so global
+	// scheduling and user overrides cannot make either cross-chart contract
+	// drift. Every deployer sees the same final map.
 	b.injectDRAChartVersionAnnotation(componentValues, recipeResult)
+	if evictionErr := b.injectDRAEvictionLabel(componentValues, recipeResult); evictionErr != nil {
+		return nil, evictionErr
+	}
 
 	if warningErr := b.warnMissingStorageClassForPVCs(ctx, recipeResult, componentValues); warningErr != nil {
 		return nil, warningErr
@@ -325,18 +352,29 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, exposureErr
 	}
 
-	dynamicValues, err := b.buildDynamicValuesMap(recipeResult.DataProvider())
-	if err != nil {
-		return nil, err
-	}
 	if lockErr := profileBaseline.ValidateProfileLock(
 		ctx, recipeResult.ComponentRefs, componentValues, dynamicValues,
 	); lockErr != nil {
 		return nil, lockErr
 	}
 
-	// Run component-specific validations
-	if validationErr := b.runComponentValidations(ctx, recipeResult); validationErr != nil {
+	// Run component-specific validations against the SAME resolved values
+	// this bundle emits. componentValues (extractComponentValues plus the
+	// bundler-derived mutations above) is what the deployers render;
+	// pinning it via WithResolvedValues makes the gates read-once coherent
+	// with the artifact (issue #1873 item A — Client.BundleComponents has
+	// pinned since then; this path re-read through the DataProvider, so a
+	// LayeredDataProvider re-reading external --data files between
+	// extraction and validation could let a gate validate values the
+	// bundle does not contain).
+	// profileBaseline still carries the PRE-filter component union, so
+	// cross-component gates keep their evidence: a subset bundle (e.g.
+	// bundlers=nvsentinel) must not skip the NVSentinel gates just
+	// because the gpu-operator ref they key on was filtered out of the
+	// OUTPUT — the declaration still describes the platform.
+	if validationErr := b.runComponentValidations(ctx,
+		recipeResult.WithResolvedValues(componentValues).
+			WithDeclaredComponents(profileBaseline.ComponentRefs)); validationErr != nil {
 		return nil, componentValidationError(validationErr)
 	}
 
@@ -626,13 +664,7 @@ func (b *DefaultBundler) warnLegacyAccountingOverride(provider recipe.DataProvid
 	if err != nil {
 		return err
 	}
-	dynamicPresent := false
-	for _, path := range dynamicValues["slinky-slurm"] {
-		if path == accountingEnabledPath {
-			dynamicPresent = true
-			break
-		}
-	}
+	dynamicPresent := slices.Contains(dynamicValues["slinky-slurm"], accountingEnabledPath)
 	if scalarPresent || typedPresent || dynamicPresent {
 		warning := "deprecated: bundle-time slinky-slurm:accounting.enabled on a legacy recipe " +
 			"selects only customer-managed accounting and is not recorded in recipe evidence; " +
@@ -1071,6 +1103,9 @@ func (b *DefaultBundler) extractComponentValues(ctx context.Context, recipeResul
 
 		// Apply node selectors, tolerations, workload selector, and taints based on component type
 		b.applyNodeSchedulingOverrides(ref.Name, values, provider, policy)
+		if sharedStorageErr := b.applySharedStorageClassOverride(ref.Name, values, provider); sharedStorageErr != nil {
+			return nil, sharedStorageErr
+		}
 
 		// Apply structured --set-json / --set-file overrides last so they take
 		// precedence over base values, scalar --set, and scheduling injection.
@@ -1096,6 +1131,13 @@ func (b *DefaultBundler) extractComponentValues(ctx context.Context, recipeResul
 					"failed to apply --set-json/--set-file value overrides",
 					applyErr,
 					map[string]any{errCtxKeyComponent: ref.Name})
+			}
+		}
+
+		if ref.Name == slinkySlurmComponentName {
+			supported := hasSlinkySharedStoragePreManifest(ref.PreManifestFiles)
+			if materializeErr := materializeSlinkySharedStorage(values, supported); materializeErr != nil {
+				return nil, materializeErr
 			}
 		}
 
@@ -1144,17 +1186,15 @@ func mergeOverridesAcrossKeys[V any](allOverrides map[string]map[string]V, keys 
 	var merged map[string]V
 	// Apply in reverse priority order so earlier (higher-priority) keys
 	// overwrite later ones on a path collision.
-	for i := len(keys) - 1; i >= 0; i-- {
-		overrides, ok := allOverrides[keys[i]]
+	for _, key := range slices.Backward(keys) {
+		overrides, ok := allOverrides[key]
 		if !ok {
 			continue
 		}
 		if merged == nil {
 			merged = make(map[string]V, len(overrides))
 		}
-		for path, value := range overrides {
-			merged[path] = value
-		}
+		maps.Copy(merged, overrides)
 	}
 	return merged
 }
@@ -1197,7 +1237,9 @@ func (b *DefaultBundler) getTypedValueOverridesForComponent(componentName string
 // recipe-level overrides.enabled, bundle-time --set enabled toggles, and the
 // positive bundlers component-name filter (config.WithBundlers, #1531), then
 // returns the enabled refs (with dangling dependency edges pruned) alongside
-// the deployment order filtered to those refs.
+// the deployment order filtered to those refs and a name-keyed map of why
+// each excluded component was dropped (consumed by
+// rejectOverridesForAbsentComponents).
 //
 // Bundle-time --set can disable a component the recipe enabled
 // (--set <c>:enabled=false), but it cannot re-enable a component the recipe
@@ -1205,7 +1247,7 @@ func (b *DefaultBundler) getTypedValueOverridesForComponent(componentName string
 // already provides it (e.g. a CSP-managed cert-manager on OKE), so re-enabling
 // would install a conflicting second copy and there is no authored deployment
 // order for it. Such an attempt is rejected with ErrCodeInvalidRequest.
-func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResult) ([]recipe.ComponentRef, []string, error) {
+func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResult) ([]recipe.ComponentRef, []string, map[string]string, error) {
 	// declaredSet is every component the recipe names, regardless of enabled
 	// state. It distinguishes a declared-but-disabled dependency (prune the
 	// edge — satisfied externally) from an undeclared one (keep it so topology
@@ -1217,26 +1259,39 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 
 	enabledRefs := make([]recipe.ComponentRef, 0, len(recipeResult.ComponentRefs))
 	enabledSet := make(map[string]struct{})
+	// excludedReasons records, per dropped component, the reason phrase
+	// rejectOverridesForAbsentComponents quotes back to the operator.
+	excludedReasons := make(map[string]string)
 	for _, ref := range recipeResult.ComponentRefs {
 		setEnabled, ok, overrideErr := b.getSetEnabledOverride(ref.Name, recipeResult.DataProvider())
 		if overrideErr != nil {
-			return nil, nil, overrideErr
+			return nil, nil, nil, overrideErr
 		}
 		recipeEnabled := ref.IsEnabled()
 		if ok {
 			if setEnabled && !recipeEnabled {
-				return nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+				return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
 					"component %q is disabled by the recipe and cannot be re-enabled with "+
 						"--set %s:%s=true", ref.Name, ref.Name, config.ComponentEnabledKey))
 			}
 			if !setEnabled {
 				slog.Info("skipping component disabled via --set", "component", ref.Name)
+				// A redundant enabled=false on a component the recipe
+				// already disables keeps the recipe-disabled reason — it
+				// is the more fundamental one, and the override merely
+				// agrees with it.
+				if recipeEnabled {
+					excludedReasons[ref.Name] = "an " + config.ComponentEnabledKey + "=false value override removed it"
+				} else {
+					excludedReasons[ref.Name] = "the recipe disables it"
+				}
 				b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled via --set")
 				continue
 			}
 			// setEnabled && recipeEnabled: explicit --set enabled=true is a no-op.
 		} else if !recipeEnabled {
 			slog.Info("skipping disabled component", "component", ref.Name)
+			excludedReasons[ref.Name] = "the recipe disables it"
 			b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled by the recipe")
 			continue
 		}
@@ -1261,12 +1316,12 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 					for _, ref := range recipeResult.ComponentRefs {
 						declaredNames = append(declaredNames, ref.Name)
 					}
-					return nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
 						"unknown component %q in bundlers filter; recipe declares: %s",
 						name, strings.Join(declaredNames, ", ")))
 				}
 				if _, enabled := enabledSet[name]; !enabled {
-					return nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
 						"component %q is disabled and cannot be selected via the bundlers filter", name))
 				}
 				requestedSet[name] = struct{}{}
@@ -1275,6 +1330,7 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 			for _, ref := range enabledRefs {
 				if _, ok := requestedSet[ref.Name]; !ok {
 					slog.Info("skipping component excluded by bundlers filter", "component", ref.Name)
+					excludedReasons[ref.Name] = "the bundlers filter excludes it"
 					b.warnExcludedDriverInstaller(recipeResult, ref.Name, "excluded by the bundlers filter")
 					delete(enabledSet, ref.Name)
 					continue
@@ -1286,7 +1342,7 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 	}
 
 	if len(enabledRefs) == 0 {
-		return nil, nil, errors.New(errors.ErrCodeInvalidRequest,
+		return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest,
 			"recipe has no enabled components after filtering")
 	}
 
@@ -1327,7 +1383,191 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 		}
 	}
 
-	return enabledRefs, filteredOrder, nil
+	return enabledRefs, filteredOrder, excludedReasons, nil
+}
+
+// rejectOverridesForAbsentComponents rejects a value override
+// (--set / --set-json / --set-file, and the equivalent REST `set`
+// parameters) whose component key names something that will not appear
+// in the generated bundle. Such an override is silently discarded
+// otherwise: the operator asked for a configuration change and got a
+// bundle that does not contain it, exit 0, no warning. The likeliest
+// causes are a typo in the component name or alias, and a
+// misunderstanding of what `--set <c>:enabled=false` removed —
+// `--set nv-sentinel:enabled=false --set nv-sentinel:labeler.x=true` is
+// two contradictory requests, one of which used to vanish.
+//
+// This closes the last gap in a rule the neighboring paths already
+// enforce: an unknown name in the `bundlers=` filter and an unknown
+// component in a `--dynamic` declaration are both already rejected with
+// ErrCodeInvalidRequest. Value overrides were the outlier.
+//
+// Scope, in order of the checks below:
+//
+//   - The reserved `deployer:` key carries Argo deployer options rather
+//     than component values, so it is never a component name.
+//   - A component present in the bundle accepts every path, as before.
+//   - On an ABSENT but recipe-declared component, the `enabled` path
+//     itself is still accepted: `--set <c>:enabled=false` is the
+//     supported way to remove a component, and it is also accepted (as a
+//     no-op that agrees with reality) on one the recipe already
+//     disabled. Only the OTHER paths on such a component are rejected.
+//     `--set <c>:enabled=true` on a recipe-disabled component never
+//     reaches here — filterEnabledComponents rejects it first — so the
+//     two errors cannot double-report.
+//   - On a name the recipe does not declare at all, every path is
+//     rejected including `enabled`: nothing can act on it. The message
+//     lists the declared component names, mirroring the `bundlers=`
+//     rejection.
+//
+// Alias resolution matches the bundler's own: an override supplied under
+// a registry alias (gpuoperator, nv-sentinel) resolves to its canonical
+// component exactly as extractComponentValues would resolve it.
+func (b *DefaultBundler) rejectOverridesForAbsentComponents(
+	recipeResult *recipe.RecipeResult,
+	enabledRefs []recipe.ComponentRef,
+	excludedReasons map[string]string,
+) error {
+
+	if b.Config == nil {
+		return nil
+	}
+	provider := recipeResult.DataProvider()
+
+	// present holds every override key (canonical name plus registry
+	// aliases) of a component that WILL be rendered; declared maps the
+	// same key space to a canonical name for everything the recipe names,
+	// rendered or not. The two populations are what the checks below
+	// distinguish.
+	present := make(map[string]struct{})
+	for i := range enabledRefs {
+		for _, key := range b.componentOverrideKeys(enabledRefs[i].Name, provider) {
+			present[key] = struct{}{}
+		}
+	}
+	declared := make(map[string]string)
+	declaredNames := make([]string, 0, len(recipeResult.ComponentRefs))
+	for i := range recipeResult.ComponentRefs {
+		name := recipeResult.ComponentRefs[i].Name
+		declaredNames = append(declaredNames, name)
+		for _, key := range b.componentOverrideKeys(name, provider) {
+			declared[key] = name
+		}
+	}
+
+	check := func(overrideKey, valuePath, flag string, expressesDisable bool) error {
+		if overrideKey == config.DeployerOverrideKey {
+			return nil
+		}
+		if _, ok := present[overrideKey]; ok {
+			return nil
+		}
+		canonical, isDeclared := declared[overrideKey]
+		if isDeclared {
+			// Only enabled=FALSE is exempt on an absent component: it is
+			// the supported removal mechanism (and a truthful no-op on
+			// one the recipe already disables). enabled=TRUE on an
+			// absent component is a discarded request — reachable when
+			// the bundlers filter removed the component, since
+			// filterEnabledComponents treats enabled=true as a no-op and
+			// the positive filter then drops the component AFTER it
+			// (recipe-disabled re-enables never get here; they are
+			// rejected in filterEnabledComponents first).
+			if valuePath == config.ComponentEnabledKey && expressesDisable {
+				return nil
+			}
+			reason := excludedReasons[canonical]
+			if reason == "" {
+				reason = "it is not in the generated bundle"
+			}
+			return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+				"%s %s:%s cannot take effect: component %q is not in the generated bundle "+
+					"because %s. Drop the override, or keep the component in the bundle",
+				flag, overrideKey, valuePath, canonical, reason))
+		}
+		return errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+			"%s %s:%s cannot take effect: unknown component %q; recipe declares: %s",
+			flag, overrideKey, valuePath, overrideKey, strings.Join(declaredNames, ", ")))
+	}
+
+	// expressesDisable resolver — scalar --set ONLY: strconv.ParseBool,
+	// matching getSetEnabledOverride. An unparseable value on a declared
+	// component never reaches here (filterEnabledComponents rejects it
+	// first), and on an undeclared name every path is rejected anyway.
+	// The typed sources get no exemption: "enabled" is valid only on
+	// scalar --set (config.ComponentEnabledKey's contract — the typed
+	// path would write a stray literal `enabled:` into chart values, and
+	// extractComponentValues rejects it on every PRESENT component), so
+	// a typed enabled on an ABSENT component is rejected here too rather
+	// than exempted into silence.
+	// Config.ValueOverrides() deep-copies the whole map on every call, so
+	// snapshot it once instead of once per checked path.
+	scalarOverrides := b.Config.ValueOverrides()
+	scalarDisables := func(overrideKey, valuePath string) bool {
+		raw, ok := scalarOverrides[overrideKey][valuePath]
+		if !ok {
+			return false
+		}
+		parsed, err := strconv.ParseBool(raw)
+		return err == nil && !parsed
+	}
+
+	// --dynamic declarations follow the same rule: a dynamic path on a
+	// component absent from the bundle exports nothing (there is no
+	// cluster-values.yaml to defer it to), so it is a discarded request
+	// exactly like a --set. Never a removal idiom, so no path — enabled
+	// included — is exempt. This check OWNS the registry-known-but-
+	// recipe-absent rejection, which buildDynamicValuesMap accepts.
+	// Registry-UNKNOWN names are rejected with ErrCodeInvalidRequest by
+	// whichever gate sees them first — this check ("recipe declares:
+	// ...") or buildDynamicValuesMap ("not found in component
+	// registry") — and WHICH fires first depends on recipe
+	// configuration (enforceAccountingOwnership walks dynamic values on
+	// some accounting shapes and not others; both orders verified end
+	// to end). No caller may rely on a specific message, only on the
+	// invariant: an unknown name never survives to bundle output, this
+	// check is the unconditional backstop for names it sees, and
+	// buildDynamicValuesMap is the registry-membership authority for
+	// what reaches it (including the reserved deployer: key, which this
+	// check exempts).
+	dynamicPaths := make(map[string][]string, len(b.Config.DynamicValues()))
+	for componentKey, paths := range b.Config.DynamicValues() {
+		dynamicPaths[componentKey] = slices.Sorted(slices.Values(paths))
+	}
+	never := func(string, string) bool { return false }
+
+	// Deterministic order so a bundle with several bad overrides always
+	// reports the same one first.
+	for _, source := range []struct {
+		flag     string
+		paths    map[string][]string
+		disables func(overrideKey, valuePath string) bool
+	}{
+		{"--set", overridePathsByComponent(b.Config.ValueOverrides()), scalarDisables},
+		{"--set-json/--set-file", overridePathsByComponent(b.Config.ValueOverridesTyped()), never},
+		{"--dynamic", dynamicPaths, never},
+	} {
+		for _, overrideKey := range slices.Sorted(maps.Keys(source.paths)) {
+			for _, valuePath := range source.paths[overrideKey] {
+				if err := check(overrideKey, valuePath, source.flag,
+					source.disables(overrideKey, valuePath)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// overridePathsByComponent flattens a value-override map to sorted value
+// paths per component key, so rejection order does not depend on Go map
+// iteration order.
+func overridePathsByComponent[V any](overrides map[string]map[string]V) map[string][]string {
+	out := make(map[string][]string, len(overrides))
+	for componentKey, paths := range overrides {
+		out[componentKey] = slices.Sorted(maps.Keys(paths))
+	}
+	return out
 }
 
 // warnExcludedDriverInstaller surfaces a driverless-cluster hazard when
@@ -1344,7 +1584,7 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 // rejection) turns into late, opaque scheduling failures on driverless
 // GPU nodes. Warn at the point of exclusion instead.
 func (b *DefaultBundler) warnExcludedDriverInstaller(recipeResult *recipe.RecipeResult, componentName, how string) {
-	if componentName != gpuOperatorComponentName {
+	if !isGPUOperatorComponent(componentName) {
 		return
 	}
 	if recipeResult.Metadata.GPUDriverState != recipe.GPUDriverStateAbsent {
@@ -1654,6 +1894,49 @@ func (b *DefaultBundler) applyNodeSchedulingOverrides(componentName string, valu
 			}
 		}
 	}
+}
+
+// applySharedStorageClassOverride injects the dedicated RWX StorageClass
+// without allowing the generic, commonly RWO-only class to leak into shared
+// filesystem PVCs.
+func (b *DefaultBundler) applySharedStorageClassOverride(
+	componentName string,
+	values map[string]any,
+	provider recipe.DataProvider,
+) error {
+
+	if b.Config == nil || b.Config.SharedStorageClass() == "" {
+		return nil
+	}
+	registry, err := recipe.GetComponentRegistryFor(provider)
+	if err != nil {
+		return errors.WrapWithContext(errors.ErrCodeInternal,
+			"failed to load component registry for shared storage",
+			err,
+			map[string]any{errCtxKeyComponent: componentName})
+	}
+	comp := registry.Get(componentName)
+	if comp == nil || len(comp.GetSharedStorageClassPaths()) == 0 {
+		return nil
+	}
+
+	explicitOverrides := b.getValueOverridesForComponent(componentName, provider)
+	overrides := make(map[string]string, len(comp.GetSharedStorageClassPaths()))
+	for _, path := range comp.GetSharedStorageClassPaths() {
+		if _, isExplicit := explicitOverrides[path]; !isExplicit {
+			overrides[path] = b.Config.SharedStorageClass()
+		}
+	}
+	if len(overrides) == 0 {
+		return nil
+	}
+	if err := component.ApplyMapOverrides(values, overrides); err != nil {
+		return errors.WrapWithContext(errors.ErrCodeInvalidRequest,
+			"failed to apply shared storage class",
+			err,
+			map[string]any{errCtxKeyComponent: componentName})
+	}
+	return nil
 }
 
 // warnMissingStorageClassForPVCs emits a bundle note when a rendered component creates
@@ -2554,14 +2837,284 @@ func renderGKECriticalPriorityQuota(namespace string, pods int) ([]byte, error) 
 // would otherwise pin to the pre-migration driver state.
 const draChartVersionAnnotation = header.Domain + "/gpu-operator-chart-version"
 
-// draComponentName / gpuOperatorComponentName are the registry-level
-// component names this injection couples together. Both must be
-// enabled in the filtered resolved recipe before the annotation is
-// written; recipes that disable either remain untouched.
+// draComponentName / gpuOperatorComponentName are the registry-level names
+// coupled by the bundler-owned DRA integrations. Both must be enabled in the
+// filtered resolved recipe before derived values are written; recipes that
+// disable either remain untouched.
 const (
-	draComponentName         = "nvidia-dra-driver-gpu"
-	gpuOperatorComponentName = "gpu-operator"
+	gpuOperatorComponentName      = "gpu-operator"
+	draComponentName              = "nvidia-dra-driver-gpu"
+	draEvictionEnvName            = "NODE_LABEL_FOR_GPU_POD_EVICTION"
+	draEvictionNodeSelectorPath   = "kubeletPlugin.nodeSelector"
+	gpuOperatorDRAEvictionEnvPath = "driver.manager.env"
 )
+
+var (
+	gpuOperatorComponentNames = []string{gpuOperatorComponentName, "gpu-operator-ocp"}
+	draComponentNames         = []string{draComponentName, "nvidia-dra-driver-gpu-ocp"}
+)
+
+func isDRAComponent(name string) bool {
+	return slices.Contains(draComponentNames, name)
+}
+
+func isGPUOperatorComponent(name string) bool {
+	return slices.Contains(gpuOperatorComponentNames, name)
+}
+
+func draEvictionComponentNames(recipeResult *recipe.RecipeResult) ([]string, []string) {
+	if recipeResult == nil {
+		return nil, nil
+	}
+
+	draNames := make([]string, 0, 1)
+	gpuOperatorNames := make([]string, 0, 1)
+	for _, ref := range recipeResult.ComponentRefs {
+		switch {
+		case isDRAComponent(ref.Name):
+			draNames = append(draNames, ref.Name)
+		case isGPUOperatorComponent(ref.Name):
+			gpuOperatorNames = append(gpuOperatorNames, ref.Name)
+		}
+	}
+	return draNames, gpuOperatorNames
+}
+
+// rejectDRAEvictionDynamicPaths keeps the bundler-owned eviction contract
+// static. Dynamic values are moved into operator-editable install-time files,
+// where either half could otherwise be changed independently after AICR has
+// made them consistent.
+func rejectDRAEvictionDynamicPaths(
+	recipeResult *recipe.RecipeResult,
+	dynamicValues map[string][]string,
+) error {
+
+	draNames, gpuOperatorNames := draEvictionComponentNames(recipeResult)
+	if len(draNames) == 0 || len(gpuOperatorNames) == 0 {
+		return nil
+	}
+
+	managedPaths := []struct {
+		componentNames []string
+		path           string
+	}{
+		{componentNames: draNames, path: draEvictionNodeSelectorPath},
+		{componentNames: gpuOperatorNames, path: gpuOperatorDRAEvictionEnvPath},
+	}
+	for _, managed := range managedPaths {
+		for _, componentName := range managed.componentNames {
+			for _, dynamicPath := range dynamicValues[componentName] {
+				if !valuePathsIntersect(dynamicPath, managed.path) {
+					continue
+				}
+				return errors.NewWithContext(
+					errors.ErrCodeInvalidRequest,
+					fmt.Sprintf("--dynamic declaration %s:%s intersects AICR-managed DRA eviction path %q", componentName, dynamicPath, managed.path),
+					map[string]any{
+						errCtxKeyComponent: componentName,
+						"path":             dynamicPath,
+						"managedPath":      managed.path,
+					},
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func valuePathsIntersect(left, right string) bool {
+	return left == right || strings.HasPrefix(left, right+".") || strings.HasPrefix(right, left+".")
+}
+
+// injectDRAEvictionLabel wires the GPU Operator and DRA driver halves of the
+// Driver Manager eviction contract when both components are enabled. DRA
+// kubelet plugins receive the configured key/value node selector, while GPU
+// Operators receive the same label key through their documented environment
+// variable. Injection happens after scheduling and user overrides so the two
+// values cannot drift; unrelated selectors and environment entries are kept.
+func (b *DefaultBundler) injectDRAEvictionLabel(
+	componentValues map[string]map[string]any,
+	recipeResult *recipe.RecipeResult,
+) error {
+
+	if b == nil || b.Config == nil || componentValues == nil || recipeResult == nil {
+		return nil
+	}
+
+	draNames, gpuOperatorNames := draEvictionComponentNames(recipeResult)
+	if len(draNames) == 0 || len(gpuOperatorNames) == 0 {
+		return nil
+	}
+
+	label := b.Config.DRAEvictionNodeLabel()
+	for _, name := range draNames {
+		values := componentValues[name]
+		if values == nil {
+			values = make(map[string]any)
+			componentValues[name] = values
+		}
+		if err := mergeDRAEvictionNodeSelector(name, values, label); err != nil {
+			return err
+		}
+	}
+	for _, name := range gpuOperatorNames {
+		values := componentValues[name]
+		if values == nil {
+			values = make(map[string]any)
+			componentValues[name] = values
+		}
+		if err := upsertGPUOperatorDRAEvictionEnv(name, values, label.Key); err != nil {
+			return err
+		}
+	}
+
+	b.warnDRAEvictionNodeLabelRequired(draNames, label)
+
+	return nil
+}
+
+// warnDRAEvictionNodeLabelRequired emits the non-blocking bundle-time warning
+// for the DRA eviction node label, mirroring warnMissingStorageClassForPVCs:
+// both describe a rendered dependency on cluster state AICR cannot verify or
+// own. The kubelet-plugin nodeSelector is load-bearing for the Driver Manager
+// blank/restore contract, so an unlabeled GPU node runs no kubelet plugin and
+// publishes no ResourceSlices for itself, with no error from Helm or deploy.sh
+// (see issue #2456).
+//
+// Partial coverage is the ordinary case, not an edge one: node replacement,
+// recycling, autoscaling and scale-from-zero all add unlabeled nodes to a
+// cluster whose existing nodes are labeled. Those nodes keep advertising
+// nvidia.com/gpu through the device plugin, so they look healthy while
+// silently lacking DRA — measured on an EKS GB300 cluster, where unlabeling
+// one of two nodes moved the DaemonSet to DESIRED=1, not 0. DESIRED=0 applies
+// only when no GPU node carries the label at all.
+func (b *DefaultBundler) warnDRAEvictionNodeLabelRequired(draNames []string, label config.NodeLabel) {
+	for _, name := range draNames {
+		msg := fmt.Sprintf(
+			"%s schedules its kubelet plugin only on nodes labeled %s=%s; apply that label to every GPU node at node-pool provisioning time (EKS managed nodegroup labels, Karpenter NodePool spec.template.metadata.labels, or equivalent) — including when upgrading an existing cluster. Unlabeled GPU nodes silently run without DRA: they publish no ResourceSlices, and if no GPU node carries the label the kubelet-plugin DaemonSet sits at DESIRED=0. Neither Helm nor deploy.sh reports an error either way",
+			name,
+			label.Key,
+			label.Value,
+		)
+		b.appendWarning(msg)
+		slog.Warn("DRA kubelet plugin requires a node label",
+			"component", name,
+			"label", label.String(),
+		)
+	}
+}
+
+func mergeDRAEvictionNodeSelector(componentName string, values map[string]any, label config.NodeLabel) error {
+	var kubeletPlugin map[string]any
+	rawKubeletPlugin, hasKubeletPlugin := values["kubeletPlugin"]
+	if !hasKubeletPlugin || rawKubeletPlugin == nil {
+		kubeletPlugin = make(map[string]any)
+		values["kubeletPlugin"] = kubeletPlugin
+	} else {
+		var ok bool
+		kubeletPlugin, ok = rawKubeletPlugin.(map[string]any)
+		if !ok {
+			return invalidDRAEvictionManagedValue(componentName, "kubeletPlugin", "an object", rawKubeletPlugin)
+		}
+	}
+
+	var nodeSelector map[string]any
+	rawNodeSelector := kubeletPlugin["nodeSelector"]
+	switch current := rawNodeSelector.(type) {
+	case nil:
+		nodeSelector = make(map[string]any)
+	case map[string]any:
+		nodeSelector = current
+	case map[string]string:
+		nodeSelector = make(map[string]any, len(current)+1)
+		for key, value := range current {
+			nodeSelector[key] = value
+		}
+	default:
+		return invalidDRAEvictionManagedValue(
+			componentName, draEvictionNodeSelectorPath, "an object", rawNodeSelector)
+	}
+	if label.Key != defaults.DRAEvictionNodeLabelKey {
+		delete(nodeSelector, defaults.DRAEvictionNodeLabelKey)
+	}
+	nodeSelector[label.Key] = label.Value
+	kubeletPlugin["nodeSelector"] = nodeSelector
+	return nil
+}
+
+func upsertGPUOperatorDRAEvictionEnv(componentName string, values map[string]any, labelKey string) error {
+	var driver map[string]any
+	rawDriver, hasDriver := values["driver"]
+	if !hasDriver || rawDriver == nil {
+		driver = make(map[string]any)
+		values["driver"] = driver
+	} else {
+		var ok bool
+		driver, ok = rawDriver.(map[string]any)
+		if !ok {
+			return invalidDRAEvictionManagedValue(componentName, "driver", "an object", rawDriver)
+		}
+	}
+
+	var manager map[string]any
+	rawManager, hasManager := driver["manager"]
+	if !hasManager || rawManager == nil {
+		manager = make(map[string]any)
+		driver["manager"] = manager
+	} else {
+		var ok bool
+		manager, ok = rawManager.(map[string]any)
+		if !ok {
+			return invalidDRAEvictionManagedValue(componentName, "driver.manager", "an object", rawManager)
+		}
+	}
+
+	var existingEnv []any
+	rawEnv, hasEnv := manager["env"]
+	if hasEnv && rawEnv != nil {
+		var ok bool
+		existingEnv, ok = rawEnv.([]any)
+		if !ok {
+			return invalidDRAEvictionManagedValue(componentName, gpuOperatorDRAEvictionEnvPath, "an array", rawEnv)
+		}
+	}
+	env := make([]any, 0, len(existingEnv)+1)
+	found := false
+	for _, entry := range existingEnv {
+		envMap, ok := entry.(map[string]any)
+		if !ok || envMap["name"] != draEvictionEnvName {
+			env = append(env, entry)
+			continue
+		}
+		if found {
+			continue
+		}
+		delete(envMap, "valueFrom")
+		envMap["value"] = labelKey
+		env = append(env, envMap)
+		found = true
+	}
+	if !found {
+		env = append(env, map[string]any{
+			"name":  draEvictionEnvName,
+			"value": labelKey,
+		})
+	}
+	manager["env"] = env
+	return nil
+}
+
+func invalidDRAEvictionManagedValue(componentName, path, wantType string, value any) error {
+	return errors.NewWithContext(
+		errors.ErrCodeInvalidRequest,
+		fmt.Sprintf("component %q value %q must be %s", componentName, path, wantType),
+		map[string]any{
+			errCtxKeyComponent: componentName,
+			"path":             path,
+			"type":             fmt.Sprintf("%T", value),
+		},
+	)
+}
 
 // injectDRAChartVersionAnnotation writes the resolved gpu-operator
 // chart version into the nvidia-dra-driver-gpu controller and
@@ -2614,13 +3167,16 @@ func (b *DefaultBundler) injectDRAChartVersionAnnotation(
 
 	var gpuOperatorEnabled, draEnabled bool
 	var gpuOperatorVersion string
+	var gpuOperatorComponentName, draComponentName string
 	for _, ref := range recipeResult.ComponentRefs {
-		switch ref.Name {
-		case gpuOperatorComponentName:
+		switch {
+		case isGPUOperatorComponent(ref.Name):
 			gpuOperatorEnabled = true
 			gpuOperatorVersion = ref.Version
-		case draComponentName:
+			gpuOperatorComponentName = ref.Name
+		case isDRAComponent(ref.Name):
 			draEnabled = true
+			draComponentName = ref.Name
 		}
 	}
 	if !draEnabled || !gpuOperatorEnabled {

@@ -22,9 +22,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/NVIDIA/aicr/pkg/bundler/attestation"
 	"github.com/NVIDIA/aicr/pkg/bundler/result"
@@ -64,7 +68,10 @@ func newTestBundleHandler(t *testing.T) *bundleHandler {
 		t.Fatalf("NewClient: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
-	return newBundleHandler(client, nil, nil)
+	// Tests default to allowVendorCharts=true so pre-existing coverage of the
+	// vendor-charts path keeps running; the new "disabled" case gets its own
+	// dedicated test with the flag off.
+	return newBundleHandler(client, nil, nil, true)
 }
 
 func TestDecodeRecipeResultRequestStrictForConfiguredRecipes(t *testing.T) {
@@ -84,8 +91,17 @@ func TestDecodeRecipeResultRequestStrictForConfiguredRecipes(t *testing.T) {
 			body: `{"apiVersion":"aicr.run/v1alpha3","kind":"RecipeResult","configuration":{"slurm":{"accounting":{"mode":"disabled"}}}}`,
 		},
 		{
+			name: "Release N target configured recipe succeeds",
+			body: `{"apiVersion":"aicr.run/v1beta2","kind":"RecipeResult","configuration":{"slurm":{"accounting":{"mode":"disabled"}}}}`,
+		},
+		{
 			name:    "configured rejects unknown field",
 			body:    `{"apiVersion":"aicr.run/v1alpha3","kind":"RecipeResult","configuration":{"slurm":{"accounting":{"mode":"disabled"}}},"unknownField":true}`,
+			wantErr: true,
+		},
+		{
+			name:    "Release N target configured rejects unknown field",
+			body:    `{"apiVersion":"aicr.run/v1beta2","kind":"RecipeResult","unknownField":true}`,
 			wantErr: true,
 		},
 		{
@@ -264,6 +280,19 @@ func TestProfileAwareBundleEndpoints(t *testing.T) {
 		}
 		if w.Header().Get("Content-Type") != "application/zip" {
 			t.Fatalf("Content-Type = %q, want application/zip", w.Header().Get("Content-Type"))
+		}
+	})
+
+	t.Run("v2 accepts Release N target profile artifact", func(t *testing.T) {
+		body := bytes.Replace(
+			profileBundleBody(t),
+			[]byte(recipe.RecipeProfileAPIVersion),
+			[]byte(header.GroupVersionV1Beta2),
+			1,
+		)
+		w := post(t, true, "", body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
 		}
 	})
 
@@ -629,6 +658,64 @@ func TestBundleHandler_EmptyComponentRefs(t *testing.T) {
 	}
 }
 
+// TestBundleHandler_VendorChartsDisabled pins issue #2118: an aicrd instance
+// that has NOT opted into vendor-charts (allowVendorCharts=false, the safe
+// default) must reject vendor-charts=true with 400 BEFORE it decodes the
+// body or reaches the vendoring code. The rejection is what prevents an
+// untrusted caller from steering server-side helm pull at an internal URL.
+func TestBundleHandler_VendorChartsDisabled(t *testing.T) {
+	t.Parallel()
+	client, err := aicr.NewClient(aicr.WithRecipeSource(aicr.EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	// allowVendorCharts=false — the default in Serve() unless the operator
+	// sets AICR_ALLOW_VENDOR_CHARTS.
+	h := newBundleHandler(client, nil, nil, false)
+
+	// Body is deliberately garbage: the vendor-charts gate must fire on the
+	// query string before the body decoder even runs, so a malformed body
+	// must not change the response code.
+	req := httptest.NewRequest(http.MethodPost, "/v1/bundle?vendor-charts=true", strings.NewReader("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.HandleBundles(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d. Body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "vendor-charts is not enabled") {
+		t.Errorf("body does not mention the gate: %s", w.Body.String())
+	}
+}
+
+// TestBundleHandler_VendorChartsFalseAllowed verifies vendor-charts=false is
+// always allowed regardless of the server opt-in — the gate only guards the
+// egress-triggering true value.
+func TestBundleHandler_VendorChartsFalseAllowed(t *testing.T) {
+	t.Parallel()
+	client, err := aicr.NewClient(aicr.WithRecipeSource(aicr.EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	h := newBundleHandler(client, nil, nil, false)
+
+	// Empty componentRefs is rejected downstream — proves we got PAST the
+	// vendor-charts gate rather than being short-circuited by it.
+	body := `{"apiVersion": "aicr.run/v1alpha2", "kind": "RecipeResult", "componentRefs": []}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/bundle?vendor-charts=false", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.HandleBundles(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d. Body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "vendor-charts is not enabled") {
+		t.Errorf("vendor-charts gate fired on false; body: %s", w.Body.String())
+	}
+}
+
 // TestBundleHandler_IncoherentComponentRef verifies the HTTP decode-to-bundle
 // path rejects an incoherent ref (a Helm component carrying a Kustomize tag)
 // with 400 rather than producing a mismatched bundle. Pins issue #1584 at the
@@ -671,8 +758,8 @@ func TestBundleHandler_LegacyRecipeHeaders(t *testing.T) {
 	if got := fixture["kind"]; got != recipe.RecipeResultKind {
 		t.Fatalf("fixture kind = %v, want %q", got, recipe.RecipeResultKind)
 	}
-	if got := fixture["apiVersion"]; got != recipe.RecipeAPIVersion {
-		t.Fatalf("fixture apiVersion = %v, want %q", got, recipe.RecipeAPIVersion)
+	if got := fixture["apiVersion"]; got != recipe.RecipeResultAPIVersion {
+		t.Fatalf("fixture apiVersion = %v, want %q", got, recipe.RecipeResultAPIVersion)
 	}
 
 	tests := []struct {
@@ -682,6 +769,12 @@ func TestBundleHandler_LegacyRecipeHeaders(t *testing.T) {
 		{
 			name:   "canonical headers (control)",
 			mutate: func(map[string]any) {},
+		},
+		{
+			name: "Release N target apiVersion",
+			mutate: func(body map[string]any) {
+				body["apiVersion"] = header.GroupVersionV1
+			},
 		},
 		{
 			name: "both headers absent",
@@ -764,10 +857,115 @@ func TestBundleHandler_LegacyRecipeHeaders(t *testing.T) {
 			h.HandleBundles(w, req)
 
 			if w.Code != http.StatusOK {
-				t.Errorf("status = %d, want %d. Body: %s", w.Code, http.StatusOK, w.Body.String())
+				t.Fatalf("status = %d, want %d. Body: %s", w.Code, http.StatusOK, w.Body.String())
+			}
+
+			// Round-trip: the emitted artifact must carry the canonical kind
+			// and load back through the CLI file loader, whatever legacy
+			// header shape the body used. Before #1953 a legacy "Recipe" kind
+			// was echoed into recipe.yaml, which the loader rejects.
+			emitted := bundleRecipeYAML(t, w.Body.Bytes())
+			var emittedHeader struct {
+				Kind string `yaml:"kind"`
+			}
+			if err := yaml.Unmarshal(emitted, &emittedHeader); err != nil {
+				t.Fatalf("unmarshal emitted recipe.yaml header: %v", err)
+			}
+			if emittedHeader.Kind != recipe.RecipeResultKind {
+				t.Errorf("emitted recipe.yaml kind = %q, want %q", emittedHeader.Kind, recipe.RecipeResultKind)
+			}
+
+			// Named recipePath, not path: the file-level `path` import is used
+			// by bundleRecipeYAML below.
+			recipePath := filepath.Join(t.TempDir(), "recipe.yaml")
+			if err := os.WriteFile(recipePath, emitted, 0o600); err != nil {
+				t.Fatalf("write emitted recipe: %v", err)
+			}
+			if _, err := recipe.LoadFromFileWithProvider(
+				t.Context(), recipePath, "", "v-test", nil,
+			); err != nil {
+				t.Errorf("emitted recipe.yaml is not reloadable: %v", err)
 			}
 		})
 	}
+}
+
+// TestBundleHandler_UnsupportedRecipeKind pins the other half of the ingest
+// kind contract: only the shapes BundleRecipeRequest advertises ("",
+// RecipeResult, and the legacy Recipe) are accepted. An off-contract kind is
+// rejected rather than echoed into an artifact the CLI file loader would then
+// refuse to read back — matching the file loader and the strict /v2/bundle
+// decode path. See issue #1953.
+func TestBundleHandler_UnsupportedRecipeKind(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"RecipeMetadata", "Snapshot", "reciperesult"} {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
+			var body map[string]any
+			if err := json.Unmarshal(resolveEmbeddedBundleBody(t), &body); err != nil {
+				t.Fatalf("unmarshal fixture: %v", err)
+			}
+			body["kind"] = kind
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				t.Fatalf("marshal body: %v", err)
+			}
+
+			h := newTestBundleHandler(t)
+			req := httptest.NewRequest(http.MethodPost, "/v1/bundle", bytes.NewReader(encoded))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.HandleBundles(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d. Body: %s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			// Assert the reason, not just the status: a 400 from an unrelated
+			// decode change would otherwise keep this green for the wrong reason.
+			var resp struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("unmarshal error response: %v (body: %s)", err, w.Body.String())
+			}
+			if resp.Code != string(aicrerrors.ErrCodeInvalidRequest) {
+				t.Errorf("error code = %q, want %q", resp.Code, aicrerrors.ErrCodeInvalidRequest)
+			}
+			if !strings.Contains(resp.Message, kind) {
+				t.Errorf("error message %q does not name the rejected kind %q", resp.Message, kind)
+			}
+		})
+	}
+}
+
+// bundleRecipeYAML returns the bundle's recipe.yaml from an in-memory bundle
+// zip response, failing the test when the archive does not contain one.
+func bundleRecipeYAML(t *testing.T, archive []byte) []byte {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+	if err != nil {
+		t.Fatalf("open bundle zip: %v", err)
+	}
+	for _, f := range zr.File {
+		if path.Base(f.Name) != "recipe.yaml" {
+			continue
+		}
+		rc, openErr := f.Open()
+		if openErr != nil {
+			t.Fatalf("open %s in zip: %v", f.Name, openErr)
+		}
+		data, readErr := io.ReadAll(rc)
+		_ = rc.Close()
+		if readErr != nil {
+			t.Fatalf("read %s in zip: %v", f.Name, readErr)
+		}
+		return data
+	}
+	t.Fatal("bundle zip contains no recipe.yaml")
+	return nil
 }
 
 func TestBundleHandler_StreamZipFailureBeforeCommit(t *testing.T) {

@@ -24,11 +24,10 @@ import (
 
 	"github.com/urfave/cli/v3"
 
+	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
 	"github.com/NVIDIA/aicr/pkg/defaults"
-	"github.com/NVIDIA/aicr/pkg/diff"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/serializer"
-	"github.com/NVIDIA/aicr/pkg/snapshotter"
 )
 
 // diffCmd creates the "diff" CLI command.
@@ -107,19 +106,29 @@ func runDiffCmd(ctx context.Context, cmd *cli.Command) error {
 
 	slog.Debug("snapshot diff", slog.String("baseline", baselinePath), slog.String("target", targetPath))
 
-	baseline, err := snapshotter.LoadFromFileWithKubeconfig(ctx, baselinePath, kubeconfig)
+	client, err := embeddedClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	baseline, err := client.LoadSnapshot(ctx, baselinePath, kubeconfig)
 	if err != nil {
 		return err
 	}
 
-	target, err := snapshotter.LoadFromFileWithKubeconfig(ctx, targetPath, kubeconfig)
+	target, err := client.LoadSnapshot(ctx, targetPath, kubeconfig)
 	if err != nil {
 		return err
 	}
 
-	result := diff.Snapshots(baseline, target)
-	result.BaselineSource = baselinePath
-	result.TargetSource = targetPath
+	result, err := client.DiffSnapshots(ctx, baseline, target, aicr.SnapshotDiffOptions{
+		BaselineSource: baselinePath,
+		TargetSource:   targetPath,
+	})
+	if err != nil {
+		return err
+	}
 
 	slog.Info("snapshot diff complete",
 		slog.Int("added", result.Summary.Added),
@@ -145,7 +154,7 @@ func runDiffCmd(ctx context.Context, cmd *cli.Command) error {
 //
 // kubeconfig is propagated through to ConfigMap writers so multi-cluster
 // workflows write back to the same cluster the snapshots were read from.
-func writeDiffResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, kubeconfig string, result *diff.Result) (err error) {
+func writeDiffResult(ctx context.Context, cmd *cli.Command, outFormat serializer.Format, kubeconfig string, result *aicr.SnapshotDiff) (err error) {
 	output := cmd.String("output")
 
 	// Use custom table writer for human-readable output
@@ -167,7 +176,7 @@ func writeDiffResult(ctx context.Context, cmd *cli.Command, outFormat serializer
 			}()
 			w = f
 		}
-		return diff.WriteTable(w, result)
+		return aicr.WriteSnapshotDiffTable(w, result)
 	}
 
 	// JSON/YAML use standard serializer; thread kubeconfig so ConfigMap

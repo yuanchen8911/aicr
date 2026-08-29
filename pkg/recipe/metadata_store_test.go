@@ -747,6 +747,209 @@ func TestSlurmLeavesClearInheritedPerformancePhase(t *testing.T) {
 	}
 }
 
+func TestSlurmLeavesIncludeSharedStoragePreManifest(t *testing.T) {
+	ctx := context.Background()
+	store, err := loadMetadataStore(ctx)
+	if err != nil {
+		t.Fatalf("failed to load metadata store: %v", err)
+	}
+	const wantManifest = "components/slinky-slurm/manifests/shared-storage-pvcs.yaml"
+	for _, name := range []string{
+		"gb200-eks-ubuntu-training-slurm",
+		"h100-aks-ubuntu-training-slurm",
+		"h100-eks-ubuntu-training-slurm",
+		"h100-gke-cos-training-slurm",
+	} {
+		t.Run(name, func(t *testing.T) {
+			leaf, ok := store.GetRecipeByName(name)
+			if !ok {
+				t.Fatalf("overlay %q not found in store", name)
+			}
+			result, buildErr := store.BuildRecipeResult(ctx, leaf.Spec.Criteria)
+			if buildErr != nil {
+				t.Fatalf("BuildRecipeResult failed: %v", buildErr)
+			}
+			slurm := result.GetComponentRef("slinky-slurm")
+			if slurm == nil {
+				t.Fatal("resolved recipe missing slinky-slurm")
+			}
+			if !slices.Contains(slurm.PreManifestFiles, wantManifest) {
+				t.Errorf("preManifestFiles = %v, want %q", slurm.PreManifestFiles, wantManifest)
+			}
+		})
+	}
+}
+
+func TestSlurmLeavesIncludeEnrootPreManifest(t *testing.T) {
+	ctx := context.Background()
+	store, err := loadMetadataStore(ctx)
+	if err != nil {
+		t.Fatalf("failed to load metadata store: %v", err)
+	}
+	const wantManifest = "components/slinky-slurm/manifests/enroot-config.yaml"
+	for _, name := range []string{
+		"gb200-eks-ubuntu-training-slurm",
+		"h100-aks-ubuntu-training-slurm",
+		"h100-eks-ubuntu-training-slurm",
+		"h100-gke-cos-training-slurm",
+		"h100-kind-training-slurm",
+	} {
+		t.Run(name, func(t *testing.T) {
+			leaf, ok := store.GetRecipeByName(name)
+			if !ok {
+				t.Fatalf("overlay %q not found in store", name)
+			}
+			result, buildErr := store.BuildRecipeResult(ctx, leaf.Spec.Criteria)
+			if buildErr != nil {
+				t.Fatalf("BuildRecipeResult failed: %v", buildErr)
+			}
+			slurm := result.GetComponentRef("slinky-slurm")
+			if slurm == nil {
+				t.Fatal("resolved recipe missing slinky-slurm")
+			}
+			if !slices.Contains(slurm.PreManifestFiles, wantManifest) {
+				t.Errorf("preManifestFiles = %v, want %q", slurm.PreManifestFiles, wantManifest)
+			}
+		})
+	}
+}
+
+func TestSlinkySlurmEnrootDefaultsRenderConfigMap(t *testing.T) {
+	ctx := context.Background()
+	store, err := loadMetadataStore(ctx)
+	if err != nil {
+		t.Fatalf("failed to load metadata store: %v", err)
+	}
+	leaf, ok := store.GetRecipeByName("h100-eks-ubuntu-training-slurm")
+	if !ok {
+		t.Fatal("overlay h100-eks-ubuntu-training-slurm not found")
+	}
+	result, err := store.BuildRecipeResult(ctx, leaf.Spec.Criteria)
+	if err != nil {
+		t.Fatalf("BuildRecipeResult failed: %v", err)
+	}
+	slurm := result.GetComponentRef("slinky-slurm")
+	if slurm == nil {
+		t.Fatal("resolved recipe missing slinky-slurm")
+	}
+	values, err := result.GetValuesForComponentWithContext(ctx, slurm.Name)
+	if err != nil {
+		t.Fatalf("GetValuesForComponentWithContext(%s) failed: %v", slurm.Name, err)
+	}
+
+	config := valueAtPath[map[string]any](t, values, "enroot", "config")
+	if got := len(config); got != 2 {
+		t.Errorf("len(enroot.config) = %d, want 2: %v", got, config)
+	}
+	for _, key := range []string{"ENROOT_MOUNT_HOME", "ENROOT_REMAP_ROOT"} {
+		if got := config[key]; got != "yes" {
+			t.Errorf("enroot.config.%s = %v, want yes", key, got)
+		}
+	}
+	env := valueAtPath[map[string]any](t, values, "enroot", "env")
+	if got := env["NCCL_DEBUG"]; got != "WARN" {
+		t.Errorf("enroot.env.NCCL_DEBUG = %v, want WARN", got)
+	}
+
+	for _, path := range [][]string{
+		{"loginsets", "slinky", "podSpec", "volumes"},
+		{"nodesets", "slinky", "podSpec", "volumes"},
+	} {
+		volumes := valueAtPath[[]any](t, values, path...)
+		assertSingleNameField(t, volumes, "name", "enroot-config")
+		volume := volumes[0].(map[string]any)
+		configMap, ok := volume["configMap"].(map[string]any)
+		if !ok {
+			t.Fatalf("%v[0].configMap = %T, want map[string]any", path, volume["configMap"])
+		}
+		if got := configMap["name"]; got != "slinky-slurm-enroot-config" {
+			t.Errorf("%v[0].configMap.name = %v, want slinky-slurm-enroot-config", path, got)
+		}
+	}
+
+	for _, tt := range []struct {
+		name string
+		path []string
+	}{
+		{name: "login", path: []string{"loginsets", "slinky", "login", "volumeMounts"}},
+		{name: "compute", path: []string{"nodesets", "slinky", "slurmd", "volumeMounts"}},
+	} {
+		t.Run(tt.name+" mounts", func(t *testing.T) {
+			mounts := valueAtPath[[]any](t, values, tt.path...)
+			want := map[string]string{
+				"/etc/enroot/enroot.conf":                    "enroot.conf",
+				"/etc/enroot/environ.d/99-aicr-defaults.env": "99-aicr-defaults.env",
+			}
+			seen := make(map[string]int, len(want))
+			for _, item := range mounts {
+				mount, mountOK := item.(map[string]any)
+				if !mountOK {
+					t.Fatalf("%v item = %T, want map[string]any", tt.path, item)
+				}
+				mountPath, _ := mount["mountPath"].(string)
+				if subPath, found := want[mountPath]; found {
+					seen[mountPath]++
+					if got := mount["name"]; got != "enroot-config" {
+						t.Errorf("mount %q name = %v, want enroot-config", mountPath, got)
+					}
+					if got := mount["subPath"]; got != subPath {
+						t.Errorf("mount %q subPath = %v, want %q", mountPath, got, subPath)
+					}
+				}
+			}
+			for mountPath := range want {
+				if seen[mountPath] != 1 {
+					t.Errorf("%v mount %q count = %d, want 1", tt.path, mountPath, seen[mountPath])
+				}
+			}
+		})
+	}
+
+	const manifestPath = "components/slinky-slurm/manifests/enroot-config.yaml"
+	content, err := GetManifestContentWithContext(ctx, result.DataProvider(), manifestPath)
+	if err != nil {
+		t.Fatalf("GetManifestContentWithContext(%q) failed: %v", manifestPath, err)
+	}
+	rendered, err := manifest.Render(content, manifest.RenderInput{
+		ComponentName: slurm.Name,
+		Namespace:     slurm.Namespace,
+		ChartName:     slurm.Chart,
+		ChartVersion:  slurm.Version,
+		Values:        values,
+	})
+	if err != nil {
+		t.Fatalf("render Enroot ConfigMap: %v", err)
+	}
+	var configMap struct {
+		APIVersion string `yaml:"apiVersion"`
+		Kind       string `yaml:"kind"`
+		Metadata   struct {
+			Name      string `yaml:"name"`
+			Namespace string `yaml:"namespace"`
+		} `yaml:"metadata"`
+		Data map[string]string `yaml:"data"`
+	}
+	if err := yaml.Unmarshal(rendered, &configMap); err != nil {
+		t.Fatalf("unmarshal rendered Enroot ConfigMap: %v\n%s", err, rendered)
+	}
+	if configMap.APIVersion != "v1" || configMap.Kind != "ConfigMap" {
+		t.Errorf("rendered object type = %s/%s, want v1/ConfigMap", configMap.APIVersion, configMap.Kind)
+	}
+	if configMap.Metadata.Name != "slinky-slurm-enroot-config" || configMap.Metadata.Namespace != "slurm" {
+		t.Errorf("rendered ConfigMap identity = %s/%s, want slurm/slinky-slurm-enroot-config",
+			configMap.Metadata.Namespace, configMap.Metadata.Name)
+	}
+	enrootConfig := configMap.Data["enroot.conf"]
+	hasMountHome := strings.Contains(enrootConfig, "ENROOT_MOUNT_HOME=yes")
+	hasRemapRoot := strings.Contains(enrootConfig, "ENROOT_REMAP_ROOT=yes")
+	if !hasMountHome || !hasRemapRoot {
+		t.Errorf("rendered enroot.conf missing defaults:\n%s", enrootConfig)
+	}
+	if got := configMap.Data["99-aicr-defaults.env"]; !strings.Contains(got, "NCCL_DEBUG=WARN") {
+		t.Errorf("rendered 99-aicr-defaults.env missing default:\n%s", got)
+	}
+}
+
 func TestGPUSlurmLeavesConfigureGRESAndTaskCgroup(t *testing.T) {
 	ctx := context.Background()
 	store, err := loadMetadataStore(ctx)
@@ -1528,7 +1731,7 @@ func TestMixinConstraintFailureExcludesOnlyAffectedCandidateChain(t *testing.T) 
 		Mixins: map[string]*RecipeMixin{
 			"kernel-gate": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{
@@ -1545,7 +1748,7 @@ func TestMixinConstraintFailureExcludesOnlyAffectedCandidateChain(t *testing.T) 
 			},
 			"monitoring-gate": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{
@@ -1715,7 +1918,7 @@ func TestMixinConstraintFailurePreservesSharedAncestorsForSurvivingLeaf(t *testi
 		Mixins: map[string]*RecipeMixin{
 			"failing-mixin": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{Name: "failing-mixin"},
@@ -1728,7 +1931,7 @@ func TestMixinConstraintFailurePreservesSharedAncestorsForSurvivingLeaf(t *testi
 			},
 			"passing-mixin": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{Name: "passing-mixin"},
@@ -1870,7 +2073,7 @@ func TestMixinConstraintFailureDegradesForUnstatedDimension(t *testing.T) {
 		Mixins: map[string]*RecipeMixin{
 			"monitoring-gate": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{Name: "monitoring-gate"},
@@ -1970,7 +2173,7 @@ func TestMixinConstraintFailClosedOnInternalEvaluatorError(t *testing.T) {
 		Mixins: map[string]*RecipeMixin{
 			"os-gate": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{Name: "os-gate"},
@@ -2035,7 +2238,7 @@ func TestMixinConstraintFailClosedOnUnstructuredEvaluatorError(t *testing.T) {
 		Mixins: map[string]*RecipeMixin{
 			"os-gate": {
 				Kind:       RecipeMixinKind,
-				APIVersion: RecipeAPIVersion,
+				APIVersion: RecipeMetadataAPIVersion,
 				Metadata: struct {
 					Name string `json:"name" yaml:"name"`
 				}{Name: "os-gate"},
@@ -2513,8 +2716,169 @@ spec:
 	if !errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "")) {
 		t.Fatalf("error code = %v, want ErrCodeInvalidRequest", err)
 	}
-	if !strings.Contains(err.Error(), `requires kind "RecipeMetadata"`) {
+	if !strings.Contains(err.Error(), `expected "RecipeMetadata"`) {
 		t.Fatalf("error = %v, want RecipeMetadata kind requirement", err)
+	}
+}
+
+func TestLoadMetadataStore_AcceptsReleaseNTargetCatalogHeaders(t *testing.T) {
+	provider := newInMemoryProvider("target-catalog", map[string][]byte{
+		"overlays/base.yaml": []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: base
+spec:
+  componentRefs: []
+`),
+		"overlays/target.yaml": []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: target
+spec:
+  criteria:
+    service: eks
+  componentRefs: []
+`),
+		"overlays/headerless.yaml": []byte(`spec:
+  criteria:
+    service: gke
+  componentRefs: []
+`),
+		"mixins/target.yaml": []byte(`kind: RecipeMixin
+apiVersion: aicr.run/v1beta1
+metadata:
+  name: target-mixin
+spec: {}
+`),
+		"evidence/unrelated.yaml": []byte("signers:\n  first-party: []\n"),
+		"strict-config.yaml": []byte(`kind: AICRConfig
+apiVersion: aicr.run/v1alpha2
+spec:
+  recipe:
+    criteriaStrict: true
+`),
+	})
+	t.Cleanup(func() { EvictCachedStore(provider) })
+
+	store, err := LoadMetadataStoreFor(t.Context(), provider)
+	if err != nil {
+		t.Fatalf("LoadMetadataStoreFor() error = %v", err)
+	}
+	if _, ok := store.GetRecipeByName("target"); !ok {
+		t.Fatal("target-version RecipeMetadata was not loaded")
+	}
+	if _, ok := store.Mixins["target-mixin"]; !ok {
+		t.Fatal("target-version RecipeMixin was not loaded")
+	}
+	if _, ok := store.Overlays[""]; ok {
+		t.Fatal("unrelated headerless YAML was misclassified as RecipeMetadata")
+	}
+	if got := len(store.Overlays); got != 1 {
+		t.Fatalf("loaded %d overlays, want only the declared target overlay", got)
+	}
+}
+
+func TestLoadMetadataStore_AcceptsReleaseNProfileTarget(t *testing.T) {
+	provider := newInMemoryProvider("target-profile-catalog", map[string][]byte{
+		"overlays/base.yaml": []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: base
+spec:
+  componentRefs: []
+`),
+		"overlays/profile.yaml": []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1beta2
+metadata:
+  name: profile
+spec:
+  criteria:
+    service: aks
+  profile:
+    name: gpuStack
+    default: driver-installed
+    values:
+      driver-installed: {}
+`),
+	})
+	t.Cleanup(func() { EvictCachedStore(provider) })
+
+	store, err := LoadMetadataStoreFor(t.Context(), provider)
+	if err != nil {
+		t.Fatalf("LoadMetadataStoreFor() error = %v", err)
+	}
+	if _, ok := store.GetRecipeByName("profile"); !ok {
+		t.Fatal("target-version profile RecipeMetadata was not loaded")
+	}
+}
+
+func TestLoadMetadataStore_RejectsInvalidCatalogHeaders(t *testing.T) {
+	validBase := []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: base
+spec:
+  componentRefs: []
+`)
+	tests := []struct {
+		name    string
+		path    string
+		data    []byte
+		wantSub string
+	}{
+		{
+			name:    "empty RecipeMetadata version",
+			path:    "overlays/bad.yaml",
+			data:    []byte("kind: RecipeMetadata\napiVersion: \nmetadata:\n  name: bad\nspec: {}\n"),
+			wantSub: `apiVersion ""`,
+		},
+		{
+			name:    "unknown RecipeMetadata version",
+			path:    "overlays/bad.yaml",
+			data:    []byte("kind: RecipeMetadata\napiVersion: aicr.run/v9\nmetadata:\n  name: bad\nspec: {}\n"),
+			wantSub: `apiVersion "aicr.run/v9"`,
+		},
+		{
+			name:    "wrong AICR kind",
+			path:    "overlays/bad.yaml",
+			data:    []byte("kind: RecipeMetdata\napiVersion: aicr.run/v1alpha2\nmetadata:\n  name: bad\nspec: {}\n"),
+			wantSub: `kind "RecipeMetdata"`,
+		},
+		{
+			name:    "empty RecipeMixin version",
+			path:    "mixins/bad.yaml",
+			data:    []byte("kind: RecipeMixin\napiVersion: \nmetadata:\n  name: bad\nspec: {}\n"),
+			wantSub: `apiVersion ""`,
+		},
+		{
+			name:    "unknown RecipeMixin version",
+			path:    "mixins/bad.yaml",
+			data:    []byte("kind: RecipeMixin\napiVersion: aicr.run/v9\nmetadata:\n  name: bad\nspec: {}\n"),
+			wantSub: `apiVersion "aicr.run/v9"`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := newInMemoryProvider("invalid-catalog-"+tt.name, map[string][]byte{
+				"overlays/base.yaml": validBase,
+				tt.path:              tt.data,
+			})
+			t.Cleanup(func() { EvictCachedStore(provider) })
+
+			_, err := LoadMetadataStoreFor(t.Context(), provider)
+			if err == nil {
+				t.Fatal("LoadMetadataStoreFor() error = nil, want header rejection")
+			}
+			if !errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "")) {
+				t.Fatalf("error = %v, want ErrCodeInvalidRequest", err)
+			}
+			if got := aicrerrors.ExitCodeFromError(err); got != aicrerrors.ExitInvalidInput {
+				t.Fatalf("exit code = %d, want %d", got, aicrerrors.ExitInvalidInput)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not contain %q", err, tt.wantSub)
+			}
+		})
 	}
 }
 
@@ -2948,6 +3312,53 @@ func TestH100AKSUbuntuTrainingSlurmFloorNotClobbered(t *testing.T) {
 			},
 			wantK8sFloor: ">= 1.34",
 		},
+		// AKS inference family (see #1969, the inference-family sibling of
+		// #1772/#1908 above): aks-inference.yaml sat at >= 1.30 and the H100
+		// leaves at >= 1.32.4, below the >= 1.34 floor aks.yaml itself
+		// claims. h100-aks-ubuntu-inference-dynamo was already correct
+		// (added directly at >= 1.34) and is included here for completeness.
+		{
+			name:     "aks inference (accelerator-generic) preserves >= 1.34 floor",
+			leafName: "aks-inference",
+			criteria: &Criteria{
+				Service: CriteriaServiceAKS,
+				Intent:  CriteriaIntentInference,
+			},
+			wantK8sFloor: ">= 1.34",
+		},
+		{
+			name:     "h100 aks inference preserves >= 1.34 floor",
+			leafName: "h100-aks-inference",
+			criteria: &Criteria{
+				Service:     CriteriaServiceAKS,
+				Accelerator: CriteriaAcceleratorH100,
+				Intent:      CriteriaIntentInference,
+			},
+			wantK8sFloor: ">= 1.34",
+		},
+		{
+			name:     "h100 aks ubuntu inference preserves >= 1.34 floor",
+			leafName: "h100-aks-ubuntu-inference",
+			criteria: &Criteria{
+				Service:     CriteriaServiceAKS,
+				Accelerator: CriteriaAcceleratorH100,
+				Intent:      CriteriaIntentInference,
+				OS:          CriteriaOSUbuntu,
+			},
+			wantK8sFloor: ">= 1.34",
+		},
+		{
+			name:     "h100 aks ubuntu dynamo inference preserves >= 1.34 floor",
+			leafName: "h100-aks-ubuntu-inference-dynamo",
+			criteria: &Criteria{
+				Service:     CriteriaServiceAKS,
+				Accelerator: CriteriaAcceleratorH100,
+				Intent:      CriteriaIntentInference,
+				OS:          CriteriaOSUbuntu,
+				Platform:    CriteriaPlatformDynamo,
+			},
+			wantK8sFloor: ">= 1.34",
+		},
 	}
 
 	for _, tt := range tests {
@@ -3221,34 +3632,104 @@ func TestBuildRecipeResult_CriteriaCoverage(t *testing.T) {
 	})
 }
 
-// TestBuildRecipeResult_GuardAndCoverageComposition pins design 4.1: the
-// joint service+accelerator OS guard fires where per-dimension coverage
-// alone would pass (service and accelerator covered by SEPARATE overlays).
-func TestBuildRecipeResult_GuardAndCoverageComposition(t *testing.T) {
+// TestBuildRecipeResult_JointSufficiency pins issue #1782 on the catalog the
+// issue describes: service and accelerator honored by SEPARATE overlays, with
+// the combination living only on an os-gated leaf.
+//
+// Per-dimension coverage passes here — service and accelerator are each
+// carried by something — so it is joint sufficiency, not completeness, that
+// must reject the query. This is the case the retired requireOSIfNeeded guard
+// existed for, and the one an external --data catalog can present even though
+// the embedded catalog cannot.
+func TestBuildRecipeResult_JointSufficiency(t *testing.T) {
 	ctx := context.Background()
 	base := &RecipeMetadata{}
 	base.Metadata.Name = testRecipeBase
-	a := &RecipeMetadata{}
-	a.Metadata.Name = "svc-foo"
-	a.Spec.Criteria = &Criteria{Service: CriteriaServiceEKS}
-	b := &RecipeMetadata{}
-	b.Metadata.Name = "accel-gpu"
-	b.Spec.Criteria = &Criteria{Accelerator: CriteriaAcceleratorH100}
-	c := &RecipeMetadata{}
-	c.Metadata.Name = "svc-accel-ubuntu"
-	c.Spec.Criteria = &Criteria{Service: CriteriaServiceEKS,
-		Accelerator: CriteriaAcceleratorH100, OS: CriteriaOSUbuntu}
+	mk := func(name string, c *Criteria) *RecipeMetadata {
+		o := &RecipeMetadata{}
+		o.Metadata.Name = name
+		o.Spec.Criteria = c
+		return o
+	}
 	store := &MetadataStore{Base: base, Overlays: map[string]*RecipeMetadata{
-		"svc-foo": a, "accel-gpu": b, "svc-accel-ubuntu": c,
+		"svc-foo":   mk("svc-foo", &Criteria{Service: CriteriaServiceEKS}),
+		"accel-gpu": mk("accel-gpu", &Criteria{Accelerator: CriteriaAcceleratorH100}),
+		"svc-accel-ubuntu": mk("svc-accel-ubuntu", &Criteria{Service: CriteriaServiceEKS,
+			Accelerator: CriteriaAcceleratorH100, OS: CriteriaOSUbuntu}),
+	}}
+	criteria := &Criteria{Service: CriteriaServiceEKS, Accelerator: CriteriaAcceleratorH100}
+
+	// Precondition: per-dimension coverage alone does NOT catch this. If this
+	// ever starts reporting uncovered dimensions, the test has stopped
+	// exercising joint sufficiency and is passing for the wrong reason.
+	matched := store.FindMatchingOverlays(criteria)
+	applied := make([]string, 0, len(matched))
+	for _, m := range matched {
+		applied = append(applied, store.inheritanceChainNames(m)...)
+	}
+	if uncovered := store.uncoveredDimensions(criteria, applied); len(uncovered) != 0 {
+		t.Fatalf("precondition failed: coverage alone reports %v; this catalog must be covered per-dimension", uncovered)
+	}
+
+	_, err := store.BuildRecipeResult(ctx, criteria)
+	if !errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "")) {
+		t.Fatalf("expected ErrCodeInvalidRequest, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "specify os") {
+		t.Fatalf("expected the message to name os, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ubuntu") {
+		t.Fatalf("expected the message to offer ubuntu, got: %v", err)
+	}
+
+	// The failure must carry strictDimensions, NOT uncovered: pkg/client/v1
+	// relaxation clears uncovered dimensions and retries, which here would
+	// discard the check and return the partial recipe #1542 fixed.
+	var se *aicrerrors.StructuredError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected StructuredError, got %v", err)
+	}
+	if se.Context["uncovered"] != nil {
+		t.Error("joint-sufficiency failure must not report `uncovered` (relaxation would clear it)")
+	}
+	entries, ok := se.Context["strictDimensions"].([]map[string]any)
+	if !ok || len(entries) != 1 {
+		t.Fatalf("expected one strictDimensions entry, got %#v", se.Context["strictDimensions"])
+	}
+	if entries[0]["dimension"] != "os" {
+		t.Errorf("dimension = %v, want os", entries[0]["dimension"])
+	}
+}
+
+// TestBuildRecipeResult_JointSufficiencyEscapeHatch pins the other half of the
+// rule: when ONE applied overlay carries every stated dimension, the generic
+// tier is a complete answer and no further criteria are demanded — even though
+// an os-gated leaf below it would add content. This is what keeps queries like
+// `--service eks` and `--service eks --accelerator h100 --intent training`
+// working, and what a rule based on "would stating os enlarge the applied set"
+// alone would break.
+func TestBuildRecipeResult_JointSufficiencyEscapeHatch(t *testing.T) {
+	ctx := context.Background()
+	base := &RecipeMetadata{}
+	base.Metadata.Name = testRecipeBase
+	mk := func(name string, c *Criteria) *RecipeMetadata {
+		o := &RecipeMetadata{}
+		o.Metadata.Name = name
+		o.Spec.Criteria = c
+		return o
+	}
+	store := &MetadataStore{Base: base, Overlays: map[string]*RecipeMetadata{
+		// Carries the whole stated combination with no os.
+		"svc-accel": mk("svc-accel", &Criteria{Service: CriteriaServiceEKS,
+			Accelerator: CriteriaAcceleratorH100}),
+		// Richer, but os-gated. Skipping it is a choice, not a loss.
+		"svc-accel-ubuntu": mk("svc-accel-ubuntu", &Criteria{Service: CriteriaServiceEKS,
+			Accelerator: CriteriaAcceleratorH100, OS: CriteriaOSUbuntu}),
 	}}
 
-	_, err := store.BuildRecipeResult(ctx, &Criteria{
-		Service: CriteriaServiceEKS, Accelerator: CriteriaAcceleratorH100})
-	if !errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "")) {
-		t.Fatalf("expected guard ErrCodeInvalidRequest, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "specify an OS") {
-		t.Fatalf("expected the OS-guard message (guard runs before coverage), got: %v", err)
+	if _, err := store.BuildRecipeResult(ctx, &Criteria{
+		Service: CriteriaServiceEKS, Accelerator: CriteriaAcceleratorH100}); err != nil {
+		t.Fatalf("generic tier must resolve without an os, got: %v", err)
 	}
 }
 
@@ -3434,5 +3915,120 @@ func TestBuildRecipeResultWithEvaluator_CoverageAfterExclusion(t *testing.T) {
 	}
 	if se.Context["constraintWarnings"] == nil {
 		t.Error("coverage error should carry constraintWarnings context")
+	}
+}
+
+// TestLoadMetadataStore_ExternalOverlayNodesError verifies that loading an
+// external overlay whose criteria.nodes is non-zero returns an error (#1781).
+// Since nodes no longer participates in Matches(), such an overlay would
+// silently match every query — failing closed at load time is safer than
+// warn-and-continue.
+func TestLoadMetadataStore_ExternalOverlayNodesError(t *testing.T) {
+	t.Cleanup(ResetMetadataStoreForTesting)
+
+	baseYAML := []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: base
+spec:
+  componentRefs: []
+`)
+	// External overlay with criteria.nodes set — must be rejected.
+	externalYAML := []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: nodes-gated
+spec:
+  criteria:
+    nodes: 8
+  componentRefs: []
+`)
+
+	dp := &externalSourceProvider{files: map[string][]byte{
+		"overlays/base.yaml":        baseYAML,
+		"overlays/nodes-gated.yaml": externalYAML,
+	}}
+
+	_, err := LoadMetadataStoreFor(context.Background(), dp)
+	if err == nil {
+		t.Fatal("expected error loading external overlay with criteria.nodes, got nil")
+	}
+	if !strings.Contains(err.Error(), "criteria.nodes") {
+		t.Errorf("error = %v, want it to mention criteria.nodes", err)
+	}
+	if !strings.Contains(err.Error(), "nodes-gated") {
+		t.Errorf("error = %v, want it to name the overlay 'nodes-gated'", err)
+	}
+	// Verify the error code so callers can distinguish this from internal errors.
+	// Use errors.Is with a sentinel StructuredError — the project-preferred pattern
+	// per CLAUDE.md (see e.g. line 1179 in this file).
+	if !errors.Is(err, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest, "")) {
+		t.Errorf("error code = %v, want ErrCodeInvalidRequest", err)
+	}
+}
+
+// externalSourceProvider is an in-memory DataProvider whose Source() always
+// returns CatalogSourceExternal, simulating an overlay loaded via --data.
+type externalSourceProvider struct {
+	files map[string][]byte
+}
+
+func (p *externalSourceProvider) ReadFile(_ context.Context, path string) ([]byte, error) {
+	content, ok := p.files[path]
+	if !ok {
+		return nil, fs.ErrNotExist
+	}
+	return content, nil
+}
+
+func (p *externalSourceProvider) WalkDir(_ context.Context, _ string, fn fs.WalkDirFunc) error {
+	for path := range p.files {
+		if err := fn(path, inMemoryDirEntry{name: path}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *externalSourceProvider) Source(_ string) string {
+	return CatalogSourceExternal
+}
+
+// TestLoadMetadataStore_EmbeddedOverlayNodesDoesNotError verifies that an
+// embedded (non-external) overlay with criteria.nodes != 0 loads without
+// error — the hard-error guard must fire only for external --data overlays.
+func TestLoadMetadataStore_EmbeddedOverlayNodesDoesNotError(t *testing.T) {
+	t.Cleanup(ResetMetadataStoreForTesting)
+
+	baseYAML := []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: base
+spec:
+  componentRefs: []
+`)
+	embeddedYAML := []byte(`kind: RecipeMetadata
+apiVersion: aicr.run/v1alpha2
+metadata:
+  name: nodes-embedded
+spec:
+  criteria:
+    nodes: 8
+  componentRefs: []
+`)
+
+	// inMemoryDataProvider.Source() returns tag+":"+path, not CatalogSourceExternal.
+	dp := newInMemoryProvider("embedded", map[string][]byte{
+		"overlays/base.yaml":           baseYAML,
+		"overlays/nodes-embedded.yaml": embeddedYAML,
+	})
+
+	store, err := LoadMetadataStoreFor(context.Background(), dp)
+	if err != nil {
+		t.Fatalf("embedded overlay with criteria.nodes should load without error, got: %v", err)
+	}
+	// Also verify the overlay was actually loaded, not silently discarded.
+	if _, ok := store.GetRecipeByName("nodes-embedded"); !ok {
+		t.Error("embedded overlay with criteria.nodes was not loaded into the store")
 	}
 }

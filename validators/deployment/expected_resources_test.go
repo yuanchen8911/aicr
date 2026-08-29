@@ -594,6 +594,77 @@ func TestCheckExpectedResources_IgnoresUnrelatedDaemonSetInNamespace(t *testing.
 	}
 }
 
+// TestCheckExpectedResources_NodewrightLiveness pins that readiness keys on the
+// declared CR being live, not merely on some Skyhook reporting complete.
+//
+// The component health check's assert is deliberately name-agnostic, so a stale
+// or unrelated live complete Skyhook satisfies it on its own. Only this
+// per-name check binds liveness to the CR the recipe actually declared, so a
+// Terminating CR must fail even while it still reports complete — Nodewright
+// uses a deletion finalizer, so that state persists. Passing there would be a
+// false PASS on state about to disappear, the same direction the Chainsaw
+// executor guards by skipping ghosts on positive assertions (#2041).
+//
+// The live row is the control: without it a gate that rejected everything would
+// still satisfy the terminating row.
+func TestCheckExpectedResources_NodewrightLiveness(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		nodewrights []runtime.Object
+		wantErr     bool
+		wantNeedles []string
+	}{
+		{
+			name: "terminating declared CR fails despite a stale live complete CR",
+			nodewrights: []runtime.Object{
+				nodewrightTerminatingWithStatus("no-op", "complete"),
+				nodewrightWithStatus("some-other-skyhook", "complete"),
+			},
+			wantErr:     true,
+			wantNeedles: []string{"no-op", "terminating"},
+		},
+		{
+			name:        "live complete declared CR passes",
+			nodewrights: []runtime.Object{nodewrightWithStatus("no-op", "complete")},
+			wantErr:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := newDeploymentTestContext(t,
+				[]runtime.Object{activeNamespace("skyhook")},
+				tt.nodewrights,
+				[]recipe.ComponentRef{
+					{
+						Name:      nodewrightCustomizationsComponent,
+						Namespace: "skyhook",
+						ManifestFiles: []string{
+							"components/nodewright-customizations/manifests/no-op.yaml",
+						},
+					},
+				},
+			)
+
+			err := checkExpectedResources(ctx)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("checkExpectedResources() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			for _, needle := range tt.wantNeedles {
+				if !strings.Contains(err.Error(), needle) {
+					t.Fatalf("expected %q in failure, got: %v", needle, err)
+					return
+				}
+			}
+		})
+	}
+}
+
 // TestCheckExpectedResources_SurfacesMultipleNodewrightFailures pins Codex's
 // non-blocking observation #1: when a recipe declares multiple Nodewright CRs
 // and several are non-complete, all failures must surface in the error so
@@ -1337,20 +1408,316 @@ func nodeWithRuntimeRequiredTaint(name string) *corev1.Node {
 
 // nodewrightWithStatus builds a Nodewright fixture. Nodewright is a cluster-scoped CR,
 // so metadata.namespace is intentionally not set.
+// nodewrightTerminatingWithStatus builds a Skyhook that is mid-deletion
+// (deletionTimestamp set, as Nodewright's finalizer leaves it) while still
+// reporting the given status. The combination is the trap: status.status alone
+// says "ready" about a CR that is on its way out.
+func nodewrightTerminatingWithStatus(name, status string) *unstructured.Unstructured {
+	sk := nodewrightWithStatus(name, status)
+	meta, _ := sk.Object["metadata"].(map[string]interface{})
+	meta["deletionTimestamp"] = "2026-01-01T00:00:00Z"
+	meta["finalizers"] = []interface{}{"skyhook.nvidia.com/finalizer"}
+	return sk
+}
+
 func nodewrightWithStatus(name, status string) *unstructured.Unstructured {
 	return &unstructured.Unstructured{
-		Object: map[string]interface{}{
+		Object: map[string]any{
 			"apiVersion": "skyhook.nvidia.com/v1alpha1",
 			"kind":       "Skyhook",
-			"metadata": map[string]interface{}{
+			"metadata": map[string]any{
 				"name": name,
-				"labels": map[string]interface{}{
+				"labels": map[string]any{
 					testAICRCreatedByLabelKey: testAICRCreatedByLabelValue,
 				},
 			},
-			"status": map[string]interface{}{
+			"status": map[string]any{
 				"status": status,
 			},
 		},
 	}
+}
+
+// TestRDMAFabricCoverage_Disclosure exercises the headline behavior of #1952 as a
+// pure function of the partition: a cordoned Mellanox RDMA node must be listed
+// "skipped (cordoned)", counted in nodesTotal, and never omitted — the same
+// spuriously-narrowed-pass guard check-nvidia-smi got in #1668/#1936, applied to
+// the RDMA fabric gate. It also pins the two zero-cordoned/zero-total phrasings.
+func TestRDMAFabricCoverage_Disclosure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name             string
+		cov              rdmaFabricCoverage
+		validated        int
+		wantTotal        int
+		wantEnumeration  []string
+		wantCoverageLine string
+	}{
+		{
+			name:      "cordoned RDMA node is disclosed and counted",
+			cov:       rdmaFabricCoverage{schedulable: 1, cordoned: []string{"rdma-drain-0"}},
+			validated: 1,
+			wantTotal: 2,
+			wantEnumeration: []string{
+				"Found 2 Mellanox RDMA-capable GPU node(s), 1 schedulable, 1 cordoned:",
+				"  rdma-drain-0: skipped (cordoned)",
+			},
+			wantCoverageLine: "RESULT: nodesValidated: 1/2 (1 cordoned, skipped)",
+		},
+		{
+			name:      "fail-closed exit reports zero validated but still counts cordoned",
+			cov:       rdmaFabricCoverage{schedulable: 2, cordoned: []string{"rdma-drain-0", "rdma-drain-1"}},
+			validated: 0,
+			wantTotal: 4,
+			wantEnumeration: []string{
+				"Found 4 Mellanox RDMA-capable GPU node(s), 2 schedulable, 2 cordoned:",
+				"  rdma-drain-0: skipped (cordoned)",
+				"  rdma-drain-1: skipped (cordoned)",
+			},
+			wantCoverageLine: "RESULT: nodesValidated: 0/4 (2 cordoned, skipped)",
+		},
+		{
+			name:             "no cordoned nodes omits the parenthetical",
+			cov:              rdmaFabricCoverage{schedulable: 3},
+			validated:        3,
+			wantTotal:        3,
+			wantEnumeration:  []string{"Found 3 Mellanox RDMA-capable GPU node(s), 3 schedulable, 0 cordoned:"},
+			wantCoverageLine: "RESULT: nodesValidated: 3/3",
+		},
+		{
+			name:             "zero total nodes gets a plain sentence",
+			cov:              rdmaFabricCoverage{},
+			validated:        0,
+			wantTotal:        0,
+			wantEnumeration:  []string{"Found 0 Mellanox RDMA-capable GPU node(s)."},
+			wantCoverageLine: "RESULT: nodesValidated: 0/0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.cov.total(); got != tt.wantTotal {
+				t.Errorf("total() = %d, want %d", got, tt.wantTotal)
+			}
+			gotEnum := tt.cov.enumerationLines()
+			if len(gotEnum) != len(tt.wantEnumeration) {
+				t.Fatalf("enumerationLines() = %v, want %v", gotEnum, tt.wantEnumeration)
+			}
+			for i, want := range tt.wantEnumeration {
+				if gotEnum[i] != want {
+					t.Errorf("enumerationLines()[%d] = %q, want %q", i, gotEnum[i], want)
+				}
+			}
+			if got := tt.cov.coverageLine(tt.validated); got != tt.wantCoverageLine {
+				t.Errorf("coverageLine(%d) = %q, want %q", tt.validated, got, tt.wantCoverageLine)
+			}
+		})
+	}
+}
+
+// TestRDMAFabricCoverageExtra proves the structured coverage disclosure carries
+// exactly the two allowlisted count keys (nodesValidated/nodesTotal) as decimal
+// strings and nothing else — no node names or IPs leak into the Extra channel.
+func TestRDMAFabricCoverageExtra(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		validated     int
+		total         int
+		wantValidated string
+		wantTotal     string
+	}{
+		{"full cohort, one cordoned excluded", 1, 2, "1", "2"},
+		{"uniform cohort no cordoned", 2, 2, "2", "2"},
+		{"fail-closed zero validated", 0, 3, "0", "3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			extra := rdmaFabricCoverageExtra(tt.validated, tt.total)
+			if extra["nodesValidated"] != tt.wantValidated {
+				t.Errorf("nodesValidated = %q, want %q", extra["nodesValidated"], tt.wantValidated)
+			}
+			if extra["nodesTotal"] != tt.wantTotal {
+				t.Errorf("nodesTotal = %q, want %q", extra["nodesTotal"], tt.wantTotal)
+			}
+			if len(extra) != 2 {
+				t.Errorf("coverage extra must carry exactly the two count keys, got %v", extra)
+			}
+		})
+	}
+}
+
+// TestRDMAFabricProbeCoverage_DisclosesCordoned is the end-to-end proof of #1952:
+// a cordoned Mellanox RDMA GPU node is enumerated (via helper.FindGpuNodes) and
+// surfaced in the coverage partition — visible and counted — while still being
+// excluded from the validated cohort. Under the pre-fix code path
+// (FindSchedulableGpuNodes) the cordoned node vanished entirely, so this test
+// fails without the production change.
+func TestRDMAFabricProbeCoverage_DisclosesCordoned(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset(
+		rdmaGPUNode("rdma-gpu-0", 8, 1000),         // schedulable, fabric ready → validated cohort
+		cordon(rdmaGPUNode("rdma-drain-0", 8, -1)), // cordoned RDMA node → disclosed, not dropped
+	)
+	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+	cov, err := rdmaFabricProbeCoverage(ctx)
+	if err != nil {
+		t.Fatalf("rdmaFabricProbeCoverage() error = %v, want nil (the one schedulable RDMA node carries the fabric)", err)
+	}
+	if cov.schedulable != 1 {
+		t.Errorf("schedulable cohort = %d, want 1 (cordoned node excluded from validation)", cov.schedulable)
+	}
+	if len(cov.cordoned) != 1 || cov.cordoned[0] != "rdma-drain-0" {
+		t.Errorf("cordoned = %v, want [rdma-drain-0] (must be disclosed, not silently dropped)", cov.cordoned)
+	}
+	if got := cov.total(); got != 2 {
+		t.Errorf("total() = %d, want 2 (schedulable + cordoned, never narrowed)", got)
+	}
+}
+
+// TestRDMAFabricProbeCoverage_CountsCordonedOnFailClosed proves the cordoned
+// disclosure survives the fail-closed paths too: when the sole schedulable RDMA
+// node has not finished rolling out the fabric, the probe returns an error AND
+// still reports the cordoned node in the coverage so the terminal disclosure can
+// name it.
+func TestRDMAFabricProbeCoverage_CountsCordonedOnFailClosed(t *testing.T) {
+	t.Parallel()
+
+	clientset := k8sfake.NewClientset(
+		rdmaGPUNode("rdma-gpu-0", 8, -1),           // schedulable but fabric absent → not ready
+		cordon(rdmaGPUNode("rdma-drain-0", 8, -1)), // cordoned RDMA node → still disclosed
+	)
+	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+	cov, err := rdmaFabricProbeCoverage(ctx)
+	if err == nil {
+		t.Fatal("expected a fail-closed error while the fabric is absent, got nil")
+	}
+	if !strings.Contains(err.Error(), "not yet allocatable") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(cov.cordoned) != 1 || cov.cordoned[0] != "rdma-drain-0" {
+		t.Errorf("cordoned = %v, want [rdma-drain-0] even on the fail-closed path", cov.cordoned)
+	}
+	if got := cov.total(); got != 2 {
+		t.Errorf("total() = %d, want 2 (cordoned counted even on failure)", got)
+	}
+}
+
+// TestGatedHealthCheckSuppressed pins the render-aware static-assert
+// suppression dispatch for values-gated components: the gcp-driver-installer
+// health check is skipped exactly when the effective values gate the render
+// off, other components' asserts queue unconditionally, and render/read
+// failures propagate rather than being read as "nothing to assert".
+func TestGatedHealthCheckSuppressed(t *testing.T) {
+	t.Parallel()
+
+	installerManifest := "components/gcp-driver-installer/manifests/nvidia-driver-installer.yaml"
+	tests := []struct {
+		name           string
+		ref            recipe.ComponentRef
+		wantSuppressed bool
+		wantErr        bool
+	}{
+		{
+			name: "installer gated off (default values) suppresses the assert",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ValuesFile:    "components/gcp-driver-installer/values.yaml",
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: true,
+		},
+		{
+			// A wholesale override can drop the gate key entirely; the
+			// template must fail closed to not-rendering, never panic.
+			name: "missing gate key renders nothing and suppresses",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: true,
+		},
+		{
+			name: "installer gated on renders objects and keeps the assert",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+				Overrides: map[string]any{
+					"installer": map[string]any{"enabled": true},
+				},
+			},
+			wantSuppressed: false,
+		},
+		{
+			name: "no manifests leaves the assert in place",
+			ref: recipe.ComponentRef{
+				Name: "gcp-driver-installer",
+				Type: recipe.ComponentTypeHelm,
+			},
+			wantSuppressed: false,
+		},
+		{
+			name: "unreadable manifest fails closed",
+			ref: recipe.ComponentRef{
+				Name:          "gcp-driver-installer",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{"components/gcp-driver-installer/manifests/no-such-file.yaml"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "non-gated component queues unconditionally",
+			ref: recipe.ComponentRef{
+				Name:          "gpu-operator",
+				Type:          recipe.ComponentTypeHelm,
+				ManifestFiles: []string{installerManifest},
+			},
+			wantSuppressed: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			suppressed, reason, err := gatedHealthCheckSuppressed(t.Context(), tt.ref)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("gatedHealthCheckSuppressed() error = nil, want failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("gatedHealthCheckSuppressed() error = %v", err)
+			}
+			if suppressed != tt.wantSuppressed {
+				t.Errorf("suppressed = %v, want %v", suppressed, tt.wantSuppressed)
+			}
+			if suppressed && reason == "" {
+				t.Error("suppressed with an empty reason — operators need the why")
+			}
+		})
+	}
+
+	t.Run("canceled context stops manifest evaluation", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, _, err := gatedHealthCheckSuppressed(ctx, recipe.ComponentRef{
+			Name:          "gcp-driver-installer",
+			Type:          recipe.ComponentTypeHelm,
+			ManifestFiles: []string{installerManifest},
+		})
+		if err == nil {
+			t.Fatal("gatedHealthCheckSuppressed() error = nil, want cancellation")
+		}
+	})
 }

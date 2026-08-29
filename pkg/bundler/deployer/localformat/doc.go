@@ -63,6 +63,16 @@
 // applied raw manifests before the chart and retried on "CRD not found"
 // errors) structurally unnecessary.
 //
+// VendorCharts uses the same split (#1835): the vendored primary wraps only
+// the upstream tarball, and the -post folder carries the manifests. Embedding
+// them in the wrapper chart as helm.sh/hook resources instead — the shape
+// shipped before #1835 — made them fire-and-forget: skipped by helm upgrade,
+// left behind by helm uninstall, and mapped by Argo CD to a PostSync hook that
+// never fires under syncPolicy.automated. Adding post-upgrade to those hooks
+// is not a fix; combined with helm.sh/hook-delete-policy: before-hook-creation
+// it deletes and recreates the resource on every upgrade, which cascades to
+// CRs of a deleted CRD and objects in a deleted Namespace.
+//
 // # Base-format invariants
 //
 // These are load-bearing contracts. Callers and contributors should not
@@ -99,9 +109,9 @@
 //     each component's primary chart (e.g. an OS-specific namespace).
 //     Populated from ComponentRef.PreManifestFiles. The writer emits a
 //     wrapped "<name>-pre" local-helm folder ahead of the primary
-//     folder when this map has entries for the component; install.sh
-//     in the pre folder omits --create-namespace because the chart's
-//     Namespace template owns namespace creation.
+//     folder when at least one entry renders a YAML object; fully empty
+//     conditional output is omitted. The pre folder creates the release
+//     namespace unless one of its templates owns that Namespace resource.
 //
 // Write returns a []Folder manifest so deployers can generate their own
 // orchestration files without re-classifying or re-reading disk.

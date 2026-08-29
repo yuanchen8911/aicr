@@ -12,30 +12,71 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package aicr is the stable, public Go library surface for external
-// consumers of the AI Cluster Runtime.
+// Package aicr is the public, compatibility-reviewed Go library surface for
+// external consumers of the AI Cluster Runtime.
 //
 // External projects should import THIS package and use the types and
 // constructors re-exported here. The underlying pkg/* packages are
-// public and will remain importable, but this facade is the contract
-// the project commits to via semver.
+// public and will remain importable, but this facade is the reviewed
+// compatibility contract the project intends to stabilize at v1.0.
 //
 // # Surface
 //
-// Client exposes the four end-to-end operations the CLI / server share:
+// Client exposes the end-to-end operations the CLI / server share:
 //
 //   - ResolveRecipe / ResolveRecipeFromCriteria / ResolveRecipeFromSnapshot
 //     and LoadRecipe — produce or load a *RecipeResult.
 //   - BundleComponents — resolve Helm values and stitched manifests for
 //     each component in a *RecipeResult.
 //   - CollectSnapshot — deploy the snapshotter Job and retrieve a *Snapshot.
+//   - LoadSnapshot — read a previously captured *Snapshot from a file,
+//     URL, or cm:// ConfigMap, for the common case where the snapshot
+//     already exists and no cluster is needed.
+//   - DiffSnapshots — compare two loaded or collected snapshots in memory and
+//     return facade-owned field-level changes for drift detection.
 //   - ValidateState — evaluate a resolved recipe against a snapshot,
 //     running deployment / conformance / performance phases.
+//   - LoadConfig — read and validate the AICRConfig a team commits, from a
+//     file or an HTTP(S) URL. WrapConfig lifts one already parsed elsewhere;
+//     it does no parsing itself. Either way the resulting Config DERIVES
+//     options (Config.BundleVerifyOptions, Config.RecipeSource,
+//     Config.RecipeCriteria, ...) rather than applying them: a Config never
+//     attaches to a Client and is never consulted implicitly, so caller
+//     precedence stays one readable line at the call site.
 //
-// All facade types (Snapshot, AgentConfig, Criteria, RecipeRequest,
-// RecipeResult, ComponentBundle, ComponentRef, PhaseResult, AllowLists)
-// are facade-owned structs translated to and from the upstream pkg/*
-// shapes, so internal field renames don't churn external callers.
+// Resolution behavior is tuned per call with RecipeResolveOption —
+// WithProfile, WithAccountingMode, and WithSnapshotCriteriaRelaxation (the
+// relax-and-retry policy behind `aicr recipe --snapshot`, which takes the
+// criteria dimensions the caller stated explicitly and may clear the rest).
+//
+// The supply-chain half covers both producing and checking artifacts:
+//
+//   - VerifyBundle — check a deployment bundle's checksums and attestation
+//     chain, and evaluate a trust-floor / creator / version policy.
+//   - VerifyEvidence — check a recipe-evidence bundle's signature and hash
+//     chain, from a pointer file, an OCI reference, or a directory.
+//   - VerifyCatalog / SignCatalog — check or produce the Sigstore signature
+//     over this Client's recipe catalog.
+//   - RecipeDigest — the canonical recipe digest an evidence predicate
+//     records, for CI gates detecting stale evidence.
+//   - EmitRecipeEvidence / PublishEvidence — build, then sign and push, a
+//     recipe-evidence bundle.
+//   - VerifyBinaryAttestation — package-level; prove an aicr binary was
+//     built by NVIDIA CI.
+//
+// All facade types (Snapshot, SnapshotDiff, SnapshotChange, AgentConfig,
+// Criteria, RecipeRequest, RecipeResult, ComponentBundle, ComponentRef,
+// PhaseResult, AllowLists) are facade-owned structs translated to and from the
+// upstream pkg/* shapes, so internal field renames don't churn external callers.
+//
+// Seven types remain deliberate transparent aliases: BundleConfig,
+// BundleAttester, BundleArtifact, OIDCResolveOptions, CriteriaRegistry,
+// BundleVerifyReport, and EvidenceVerification.
+// They preserve direct interoperability with the configuration builders,
+// attestation implementations, bundle results, and provider-scoped criteria
+// registry used elsewhere in AICR. The API compatibility gate compares their
+// repository-local reachable type closure without freezing unrelated exports
+// in the evolving target packages.
 //
 // # Example
 //
@@ -45,7 +86,11 @@
 //	if err != nil {
 //	    return err
 //	}
-//	defer client.Close()
+//	defer func() {
+//	    if closeErr := client.Close(); closeErr != nil {
+//	        slog.Error("failed to close AICR client", "error", closeErr)
+//	    }
+//	}()
 //
 //	result, err := client.ResolveRecipe(ctx, aicr.RecipeRequest{
 //	    Service:     "eks",
@@ -57,16 +102,22 @@
 //
 // # Stability
 //
-// This package's exported API follows semver. The underlying pkg/*
-// packages may introduce breaking changes between minor releases; if
-// you depend on them directly, pin AICR to a patch version and audit
-// upgrades.
+// AICR is currently pre-1.0. Under Go module versioning, a v0 minor release may
+// contain breaking API changes. The project detects and explicitly records
+// incompatible changes to this facade, but v0 consumers must pin a patch
+// version and audit upgrades.
+//
+// Starting with v1.0, this package's exported API follows semantic versioning:
+// breaking changes require a major release, minor releases may add API, and
+// patch releases contain compatible fixes. The underlying pkg/* packages may
+// continue to evolve under the stability tiers documented in
+// docs/integrator/public-api.md.
 //
 // # Concurrency and Client lifecycle
 //
 // Each Client owns its own DataProvider and per-DataProvider cached
-// metadata store and component registry. Multiple Clients constructed
-// from different sources can resolve recipes concurrently without
+// metadata store, component registry, and criteria registry. Multiple Clients
+// constructed from different sources can resolve recipes concurrently without
 // clobbering each other — a property multi-tenant consumers (e.g., a
 // controller managing one Client per per-tenant configuration) rely
 // on. This is a v0.12+ guarantee; earlier facade builds mutated a
@@ -84,8 +135,8 @@
 //
 // **Call Close when done.** When a Client is no longer needed
 // (cache eviction, controller shutdown), call Close to drop its
-// metadata store and component registry from the recipe package's
-// internal caches. Without this, memory grows monotonically with
+// metadata store, component registry, and criteria registry from the recipe
+// package's internal caches. Without this, memory grows monotonically with
 // the number of unique DataProviders ever observed.
 //
 // See docs/integrator/go-library.md for the integration guide.
@@ -93,9 +144,12 @@ package aicr
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -105,7 +159,9 @@ import (
 	"github.com/NVIDIA/aicr/pkg/constraints"
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/oci"
 	"github.com/NVIDIA/aicr/pkg/recipe"
+	"github.com/NVIDIA/aicr/pkg/recipe/ocisource"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
 	"github.com/NVIDIA/aicr/pkg/validator"
 	validatorv1 "github.com/NVIDIA/aicr/pkg/validator/v1"
@@ -114,11 +170,9 @@ import (
 )
 
 // Compile-time assertion that *Client satisfies io.Closer. Anchoring the
-// Close() error signature against the standard interface documents why the
-// method returns an error even though the current implementation can't fail
-// — composite cleanup chains (errgroup.Go with deferred Close, defer-with-
-// error patterns) rely on io.Closer's shape, and future cleanup steps may
-// legitimately fail (e.g., flushing a metrics buffer on Close).
+// Close() error signature against the standard interface documents its
+// checked teardown contract. OCI-backed Clients own a private materialized
+// workspace whose removal can fail and must be reported to the caller.
 var _ io.Closer = (*Client)(nil)
 
 // Client is the single entry point for external Go consumers.
@@ -151,28 +205,96 @@ type Client struct {
 	// change after construction, so it doesn't need locking.
 	allowLists *AllowLists
 
+	// ociSource captures source-only workspace settings.
+	// Options are recorded independently of source so their order is
+	// irrelevant; NewClient rejects them when the final source is not OCI.
+	ociSource ociSourceConfig
+
 	// inflight tracks in-flight cache-using operations so Close
 	// can drain them before evicting the per-Client metadata-store
-	// and component-registry caches. Without this, a ResolveRecipe
-	// goroutine that releases mu before calling LoadMetadataStoreFor
+	// component-registry, and criteria-registry caches. Without this, a
+	// ResolveRecipe goroutine that releases mu before calling LoadMetadataStoreFor
 	// can repopulate storeCache[dp] AFTER Close already evicted it
 	// — violating the "Close frees this Client's caches" guarantee.
 	// Each entry point Add(1)s under RLock (so Close's Wait can see
 	// the increment) and Done()s on return; Close marks the Client
 	// closed under write-lock, releases, then Wait()s.
 	inflight sync.WaitGroup
+
+	// closeOnce serializes teardown and publishes closeErr to every concurrent
+	// or repeated caller only after teardown has completed. Reading closeErr
+	// after sync.Once.Do returns is synchronized by Once's completion edge.
+	closeOnce sync.Once
+	closeErr  error
 }
 
-// NewClient constructs a Client with the supplied functional options.
+type clientDependencies struct {
+	newOCIProvider func(
+		context.Context,
+		*recipe.EmbeddedDataProvider,
+		ocisource.Config,
+	) (recipe.DataProvider, error)
+}
+
+func defaultClientDependencies() clientDependencies {
+	return clientDependencies{
+		newOCIProvider: func(
+			ctx context.Context,
+			embedded *recipe.EmbeddedDataProvider,
+			config ocisource.Config,
+		) (recipe.DataProvider, error) {
+
+			return ocisource.New(ctx, embedded, config)
+		},
+	}
+}
+
+// NewClient constructs a Client with the supplied functional options. OCI
+// source construction uses a bounded compatibility context; callers that need
+// cancellation or a tighter deadline should use NewClientContext.
 // Callers must provide a recipe source via WithRecipeSource.
 //
 // For FilesystemSource, the external directory is layered OVER the
 // embedded recipe data — files in the directory override embedded
 // equivalents, and recipes must include a registry.yaml at the root.
 //
-// OCI sources are not yet wired through to the loader and return an
-// ErrCodeUnavailable error from NewClient until that gap is closed.
+// OCI sources require an immutable sha256 manifest digest. One
+// defaults.OCIRecipeConstructionTimeout deadline bounds the complete OCI
+// source construction; nested per-phase pull deadlines can only shorten that
+// shared budget.
 func NewClient(opts ...Option) (*Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), defaults.OCIRecipeConstructionTimeout)
+	defer cancel()
+	return newClientWithContextAndDependencies(ctx, defaultClientDependencies(), opts...)
+}
+
+// NewClientContext constructs a Client with the supplied functional options
+// and derives all OCI source I/O from ctx. The complete operation remains
+// bounded by defaults.OCIRecipeConstructionTimeout when the caller provides a
+// longer deadline or no deadline.
+func NewClientContext(ctx context.Context, opts ...Option) (*Client, error) {
+	if ctx == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"context is required for client construction")
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaults.OCIRecipeConstructionTimeout)
+	defer cancel()
+	return newClientWithContextAndDependencies(ctx, defaultClientDependencies(), opts...)
+}
+
+func newClientWithContextAndDependencies(
+	ctx context.Context,
+	deps clientDependencies,
+	opts ...Option,
+) (*Client, error) {
+
+	if ctx == nil {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"context is required for client construction")
+	}
+	if err := clientConstructionContextError(ctx); err != nil {
+		return nil, err
+	}
 	c := &Client{}
 
 	for _, opt := range opts {
@@ -191,10 +313,16 @@ func NewClient(opts ...Option) (*Client, error) {
 		return nil, errors.New(errors.ErrCodeInvalidRequest,
 			"recipe source is required — pass WithRecipeSource")
 	}
+	if err := validateSourceConfiguration(c); err != nil {
+		return nil, err
+	}
 
-	dp, err := buildDataProvider(c.source)
+	dp, err := buildDataProvider(ctx, c.source, c.ociSource, deps)
 	if err != nil {
 		return nil, err
+	}
+	if err = clientConstructionContextError(ctx); err != nil {
+		return nil, joinDataProviderCleanup(err, dp)
 	}
 
 	// Bind the Builder to this Client's own DataProvider via
@@ -227,31 +355,98 @@ func NewClient(opts ...Option) (*Client, error) {
 	return c, nil
 }
 
-// Close releases this Client's cached metadata store and component
-// registry from the recipe package's internal caches. Call when a
-// Client is no longer needed (cache eviction in a higher-level
+// validateSourceConfiguration validates the order-independent combination of
+// recipe-source and source-only options before any provider or registry I/O.
+func validateSourceConfiguration(c *Client) error {
+	hasOCIOptions := c.ociSource.tempDir != nil
+	if c.source.kind != sourceKindOCI {
+		if hasOCIOptions {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"OCI source options require WithRecipeSource(OCISource(...))")
+		}
+		return nil
+	}
+
+	pullOptions := oci.RecipePullOptions{
+		Repository: c.source.registry,
+		Selector:   c.source.selector,
+	}
+	if c.ociSource.tempDir != nil {
+		if *c.ociSource.tempDir == "" {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				"OCI source temporary-directory parent must be non-empty")
+		}
+		pullOptions.TempDir = *c.ociSource.tempDir
+	}
+	digestSelector, err := oci.ValidateRecipePullOptions(pullOptions)
+	if err != nil {
+		return err
+	}
+	if !digestSelector {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"OCI recipe source requires a sha256 manifest digest selector")
+	}
+	if c.ociSource.tempDir != nil {
+		if err := validateOCITempDir(*c.ociSource.tempDir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateOCITempDir(parent string) error {
+	abs, err := filepath.Abs(parent)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"resolve OCI source temporary-directory parent", err)
+	}
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeInvalidRequest,
+			"inspect OCI source temporary-directory parent", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"OCI source temporary-directory parent must be an existing real directory")
+	}
+	if info.Mode().Perm()&0o222 == 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"OCI source temporary-directory parent must be writable")
+	}
+	return nil
+}
+
+// Close releases this Client's cached metadata store, component registry,
+// and criteria registry from the recipe package's internal caches. Call when
+// a Client is no longer needed (cache eviction in a higher-level
 // memoiser, controller shutdown) to prevent unbounded memory
 // growth — the recipe package keys its caches on DataProvider
 // identity and does not auto-evict, so a process that observes many
 // distinct recipe sources over time would otherwise grow memory
 // monotonically.
 //
-// Safe to call on a nil receiver and safe to call multiple times
-// (subsequent calls are no-ops). Always returns nil; the signature
-// matches io.Closer so this can stand in for io.Closer in
-// composite cleanup chains.
+// Safe to call on a nil receiver and safe to call concurrently or multiple
+// times. Every non-nil caller waits for the same teardown and receives the
+// same cached cleanup result. OCI-backed Clients remove only the private child
+// workspace they own; a removal failure is returned with its structured code.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
+	c.closeOnce.Do(func() {
+		c.closeErr = c.close()
+	})
+	return c.closeErr
+}
+
+func (c *Client) close() error {
 	c.mu.Lock()
 	dp := c.dp
 	c.dp = nil
 	c.builder = nil
 	c.mu.Unlock()
 
-	// Drain in-flight ResolveRecipe / BundleComponents /
-	// CollectSnapshot / ValidateState calls before evicting. Each
+	// Drain in-flight cache-using calls before evicting. Each
 	// entry point Add(1)s under the read lock; because Close
 	// acquires the write lock, any in-flight increment is visible
 	// here. New callers arriving after the write-lock release see
@@ -261,15 +456,20 @@ func (c *Client) Close() error {
 	// calls below — silently leaking cache entries after Close.
 	c.inflight.Wait()
 
-	// Evict outside the lock — these touch the recipe package's
-	// own caches and don't need our mu held. dp may be nil if
-	// Close was already called or the Client was never fully
-	// constructed; the recipe Evict helpers no-op on nil.
+	// Evict every cache before closing the provider: an OCI provider removes
+	// its private workspace during Close, so no cache may retain materialized
+	// catalog state past that ownership boundary.
 	if dp != nil {
 		recipe.EvictCachedStore(dp)
 		recipe.EvictCachedRegistry(dp)
+		recipe.EvictCachedCriteriaRegistry(dp)
 	}
-	return nil
+	closer, ok := dp.(io.Closer)
+	if !ok {
+		return nil
+	}
+	return errors.PropagateOrWrap(closer.Close(), errors.ErrCodeInternal,
+		"failed to close recipe data provider")
 }
 
 // LoadCatalog eagerly loads (and caches) this Client's metadata store,
@@ -407,17 +607,39 @@ func (c *Client) ListCatalog(ctx context.Context, filter *Criteria) ([]CatalogEn
 // is seeded from the provider's overlays before parsing.
 //
 // Returns the registry for this Client's provider via
-// recipe.GetCriteriaRegistryFor. On a nil Client this returns a fresh
-// ephemeral registry so callers can defensively call without nil-checking,
-// matching the lenient nil behavior of the other accessors.
+// recipe.GetCriteriaRegistryFor. On a nil or closed Client this returns a
+// fresh ephemeral registry so callers can defensively call without
+// nil-checking, matching the existing lenient accessor behavior.
 func (c *Client) CriteriaRegistry() *CriteriaRegistry {
+	return c.criteriaRegistry(recipe.GetCriteriaRegistryFor)
+}
+
+// criteriaRegistry isolates the cache getter so the Close lifecycle can be
+// tested with a deterministically blocked cache access.
+func (c *Client) criteriaRegistry(
+	getRegistry func(recipe.DataProvider) *recipe.CriteriaRegistry,
+) *CriteriaRegistry {
+
 	if c == nil {
 		return recipe.NewCriteriaRegistry()
 	}
+
+	// Join the same operation-vs-Close protocol as every other cache-using
+	// entry point. The increment must happen under the read lock so Close
+	// either observes this operation and drains it before eviction, or marks
+	// the Client closed before this operation can begin. Call the cache getter
+	// after releasing the lock so callbacks cannot deadlock with Close.
 	c.mu.RLock()
+	if c.builder == nil {
+		c.mu.RUnlock()
+		return recipe.NewCriteriaRegistry()
+	}
 	dp := c.dp
+	c.inflight.Add(1)
 	c.mu.RUnlock()
-	return recipe.GetCriteriaRegistryFor(dp)
+	defer c.inflight.Done()
+
+	return getRegistry(dp)
 }
 
 // assertOwns rejects RecipeResults that were not produced by this Client.
@@ -575,6 +797,9 @@ func (c *Client) resolveCriteria(
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectSnapshotOnlyOptions(cfg); err != nil {
+		return nil, err
+	}
 	return builder.BuildFromCriteriaWithProfile(ctx, criteria, cfg.profile, buildOpts...)
 }
 
@@ -583,10 +808,14 @@ func recipeBuildOptions(opts ...RecipeResolveOption) (*recipeResolveConfig, []re
 	if err != nil {
 		return nil, nil, err
 	}
-	if cfg.accountingMode == nil {
-		return cfg, nil, nil
+	var buildOpts []recipe.BuildOption
+	if cfg.accountingMode != nil {
+		buildOpts = append(buildOpts, recipe.WithAccountingMode(*cfg.accountingMode))
 	}
-	return cfg, []recipe.BuildOption{recipe.WithAccountingMode(*cfg.accountingMode)}, nil
+	if cfg.runtimeInventoryMode != nil {
+		buildOpts = append(buildOpts, recipe.WithRuntimeInventoryMode(*cfg.runtimeInventoryMode))
+	}
+	return cfg, buildOpts, nil
 }
 
 func resolveRecipeConfig(opts ...RecipeResolveOption) (*recipeResolveConfig, error) {
@@ -596,10 +825,27 @@ func resolveRecipeConfig(opts ...RecipeResolveOption) (*recipeResolveConfig, err
 			opt(cfg)
 		}
 	}
-	if cfg.accountingModeErr != nil {
-		return nil, cfg.accountingModeErr
+	if cfg.optErr != nil {
+		return nil, cfg.optErr
 	}
 	return cfg, nil
+}
+
+// rejectSnapshotOnlyOptions fails a criteria-only resolve that was handed an
+// option meaningful only on the snapshot path.
+//
+// WithSnapshotCriteriaRelaxation is rejected rather than ignored: with no
+// fingerprint every dimension is caller-supplied, so relaxing one would clear
+// a value the caller explicitly stated — and silently dropping the option
+// would leave the caller believing they had `--snapshot` semantics.
+func rejectSnapshotOnlyOptions(cfg *recipeResolveConfig) error {
+	if cfg.relaxDerived {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"WithSnapshotCriteriaRelaxation is valid only on the snapshot resolve path "+
+				"(ResolveRecipeFromSnapshot); a criteria-only resolve derives no dimensions, "+
+				"so every dimension is caller-stated and none may be relaxed")
+	}
+	return nil
 }
 
 // ResolveRecipeFromCriteria resolves a facade Criteria into a facade
@@ -698,16 +944,22 @@ func (c *Client) ResolveRecipeFromCriteriaWithOptions(
 // shared resolve path: criteria outside the configured allowlist are rejected
 // before the recipe is built.
 //
-// The criteria-coverage post-condition (issue #1542) is STRICT here: every
-// stated criteria dimension must be honored by an applied overlay or
-// resolution fails with ErrCodeInvalidRequest carrying details.uncovered.
-// The CLI's `aicr recipe --snapshot` additionally relaxes dimensions that
-// were derived from the snapshot fingerprint (never user-stated ones) and
-// retries once — that relaxation is CLI-layer policy, implemented in pkg/cli
-// on top of this facade, because only the CLI knows which dimensions the
-// user explicitly stated. Callers replicating `--snapshot` behavior must
-// implement the same policy themselves (clear the uncovered dimensions they
-// derived rather than received, then retry).
+// The criteria-coverage post-condition (issue #1542) is STRICT by default
+// here: every stated criteria dimension must be honored by an applied overlay
+// or resolution fails with ErrCodeInvalidRequest carrying details.uncovered.
+//
+// To reproduce `aicr recipe --snapshot`, which additionally relaxes
+// dimensions derived from the snapshot fingerprint and retries once, pass
+// WithSnapshotCriteriaRelaxation and name the dimensions you received
+// explicitly:
+//
+//	result, err := client.ResolveRecipeFromSnapshotWithOptions(ctx, criteria, snap,
+//	    aicr.WithSnapshotCriteriaRelaxation(aicr.DimensionIntent))
+//
+// Only the caller knows which dimensions a user stated versus which it
+// derived, so the facade cannot infer that — but it does accept it as a
+// parameter and applies the policy itself. Dimensions actually cleared are
+// reported in RecipeResult.RelaxedDimensions.
 //
 // The same guards and synchronization as ResolveRecipeFromCriteria apply: nil
 // receiver, nil context, nil criteria, and nil snapshot are rejected with
@@ -808,8 +1060,41 @@ func (c *Client) ResolveRecipeFromSnapshotWithOptions(
 	}
 	internal, err := builder.BuildFromCriteriaWithEvaluatorAndProfile(
 		ctx, internalCriteria, evaluator, resolveCfg.profile, buildOpts...)
+
+	// Relax-and-retry: when the caller opted in via
+	// WithSnapshotCriteriaRelaxation and the build failed the criteria-coverage
+	// post-condition on dimensions it DERIVED rather than stated, clear those
+	// and build once more. Both attempts share this call's timeout budget, so
+	// relaxation cannot extend the bound a caller set.
+	var relaxedDims []CriteriaDimension
 	if err != nil {
-		return nil, err
+		if !resolveCfg.relaxDerived {
+			return nil, err
+		}
+		relaxedCriteria, cleared, ok := relaxDerivedCoverage(err, internalCriteria, resolveCfg.stated)
+		if !ok {
+			// Not a coverage failure, or an uncovered dimension was
+			// caller-stated. Either way the original error stands.
+			return nil, err
+		}
+		// Re-fence the relaxed criteria. Relaxation only ever clears a
+		// dimension to "any", which ValidateCriteria always permits, so this
+		// cannot fail today — it is here so "every criteria the builder sees
+		// was allowlist-checked" holds locally, rather than depending on that
+		// property of pkg/recipe/allowlist.go staying true.
+		if allowErr := c.enforceAllowLists(relaxedCriteria); allowErr != nil {
+			return nil, allowErr
+		}
+		slog.Info("retrying recipe resolution with snapshot-derived criteria relaxed",
+			"criteria", relaxedCriteria.String())
+		internal, err = builder.BuildFromCriteriaWithEvaluatorAndProfile(
+			ctx, relaxedCriteria, evaluator, resolveCfg.profile, buildOpts...)
+		if err != nil {
+			// One retry only. The relaxed attempt's error is the useful one:
+			// it describes the resolve the caller actually ended up asking for.
+			return nil, err
+		}
+		relaxedDims = cleared
 	}
 	// Snapshot-driven post-processing: when the sampled GPU node already
 	// has the NVIDIA kernel driver loaded AND the resolved overlay
@@ -834,6 +1119,7 @@ func (c *Client) ResolveRecipeFromSnapshotWithOptions(
 	if err != nil {
 		return nil, err
 	}
+	result.RelaxedDimensions = relaxedDims
 	result.owner = c
 	return result, nil
 }
@@ -848,8 +1134,15 @@ func (c *Client) ResolveRecipeFromSnapshotWithOptions(
 // FilesystemSource: layered provider over the embedded data and the
 // external directory.
 //
-// OCISource: not yet supported. Returns ErrCodeUnavailable.
-func buildDataProvider(s recipeSource) (recipe.DataProvider, error) {
+// OCISource: digest-authorized and materialized into an owned private
+// workspace before the provider is returned.
+func buildDataProvider(
+	ctx context.Context,
+	s recipeSource,
+	sourceConfig ociSourceConfig,
+	deps clientDependencies,
+) (recipe.DataProvider, error) {
+
 	switch s.kind {
 	case sourceKindUnset:
 		// Unreachable: NewClient rejects sourceKindUnset before calling
@@ -868,17 +1161,67 @@ func buildDataProvider(s recipeSource) (recipe.DataProvider, error) {
 	case sourceKindEmbedded:
 		return recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), "."), nil
 	case sourceKindOCI:
-		return nil, errors.NewWithContext(
-			errors.ErrCodeUnavailable,
-			"OCI recipe sources are not yet supported by the facade — use FilesystemSource for now",
-			map[string]any{
-				"registry": s.registry,
-				"tag":      s.tag,
-			},
-		)
+		return buildOCIDataProvider(ctx, s, sourceConfig, deps)
 	default:
 		return nil, errors.New(errors.ErrCodeInvalidRequest, "unknown recipe source kind")
 	}
+}
+
+func buildOCIDataProvider(
+	ctx context.Context,
+	s recipeSource,
+	sourceConfig ociSourceConfig,
+	deps clientDependencies,
+) (recipe.DataProvider, error) {
+
+	if deps.newOCIProvider == nil {
+		return nil, errors.New(errors.ErrCodeInternal,
+			"OCI recipe provider constructor is unavailable")
+	}
+	config := ocisource.Config{
+		PullOptions: oci.RecipePullOptions{
+			Repository: s.registry,
+			Selector:   s.selector,
+		},
+	}
+	if sourceConfig.tempDir != nil {
+		config.PullOptions.TempDir = *sourceConfig.tempDir
+	}
+
+	embedded := recipe.NewEmbeddedDataProvider(recipe.GetEmbeddedFS(), ".")
+	provider, err := deps.newOCIProvider(ctx, embedded, config)
+	if err != nil {
+		return nil, joinDataProviderCleanup(err, provider)
+	}
+	if provider == nil {
+		return nil, errors.New(errors.ErrCodeInternal,
+			"OCI recipe provider constructor returned an incomplete provider")
+	}
+	return provider, nil
+}
+
+func clientConstructionContextError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		if stderrors.Is(err, context.Canceled) {
+			return errors.Wrap(errors.ErrCodeCanceled, "client construction canceled", err)
+		}
+		return errors.Wrap(errors.ErrCodeTimeout, "client construction timed out", err)
+	}
+	return nil
+}
+
+func joinDataProviderCleanup(primary error, provider recipe.DataProvider) error {
+	closer, ok := provider.(io.Closer)
+	if !ok {
+		return primary
+	}
+	cleanupErr := closer.Close()
+	if cleanupErr == nil {
+		return primary
+	}
+	return stderrors.Join(primary, errors.PropagateOrWrap(
+		cleanupErr, errors.ErrCodeInternal,
+		"failed to clean up OCI recipe data provider after construction failure"))
 }
 
 // criteriaFromRequest translates a facade RecipeRequest into AICR's
@@ -1119,6 +1462,18 @@ func (c *Client) LoadRecipe(ctx context.Context, path, kubeconfig string) (*Reci
 // and component registry were already per-Client at the time and
 // stayed correct throughout, so ResolveRecipe results never drifted.
 //
+// # Read-once value coherence
+//
+// Each component's effective Helm values are resolved exactly once per
+// call, and that same snapshot feeds the accounting check, the
+// registry-declared component validations (including the gpu-operator
+// driver-ownership coherence gate), and the returned ComponentBundle. A
+// DataProvider need not be stable — LayeredDataProvider re-reads external
+// --data files on every call — so a gate that resolved values
+// independently could validate one set of values while a different set was
+// returned. Pinning the snapshot removes that window: what the gates
+// examined is what you get back (issue #1873 item A).
+//
 // # Synchronization
 //
 // Read-locks Client.mu so a concurrent Close can't race the values
@@ -1177,23 +1532,6 @@ func (c *Client) BundleComponents(ctx context.Context, r *RecipeResult) ([]Compo
 		return nil, errors.Wrap(errors.ErrCodeTimeout, "context cancelled before bundling", err)
 	}
 
-	// Component preflight: run the registry-declared component validations
-	// before handing back component values. DefaultBundler.Make runs the
-	// same gate (runComponentValidations) before writing a bundle; without
-	// it here the SDK path would return values the bundle path refuses to
-	// render — e.g. the gpu-operator driver-ownership coherence check
-	// (severity: error) on a recipe resolved from a snapshot that observed
-	// no NVIDIA kernel driver. This path has no bundle-time --set
-	// overrides, so the bundler config is nil; validations that act solely
-	// on bundle-time flags no-op on a nil config.
-	preflightWarnings, preflightErr := validations.RunComponentValidations(ctx, r.internal, nil)
-	for _, warning := range preflightWarnings {
-		slog.Warn(warning, "source", "component-validation")
-	}
-	if preflightErr != nil {
-		return nil, preflightErr
-	}
-
 	// Agree with DefaultBundler.Make (bundler.go), which fails closed with
 	// ErrCodeInvalidRequest whenever there is nothing to deploy — whether
 	// that's every component disabled or a zero-componentRef recipe. An
@@ -1204,15 +1542,46 @@ func (c *Client) BundleComponents(ctx context.Context, r *RecipeResult) ([]Compo
 			"recipe has no enabled components")
 	}
 
-	// Resolve the complete Helm-value inventory before emitting any component.
-	// Accounting ownership spans multiple charts, so validating one chart at a
-	// time could return a partial SDK bundle that DefaultBundler.Make rejects.
+	// Resolve the complete Helm-value inventory ONCE, before any gate runs and
+	// before emitting any component. Two properties depend on this ordering:
+	//
+	//  1. Accounting ownership spans multiple charts, so validating one chart
+	//     at a time could return a partial SDK bundle that
+	//     DefaultBundler.Make rejects.
+	//  2. Read-once coherence (#1873 item A). A LayeredDataProvider re-reads
+	//     external --data files on every call, so a gate that resolves values
+	//     independently can validate one set and let a different set be
+	//     emitted. Pinning the resolved maps onto the recipe result the gates
+	//     see makes the values they examine, by construction, the values
+	//     returned below.
 	helmValues, err := resolveHelmComponentValues(ctx, r)
 	if err != nil {
 		return nil, err
 	}
-	if err := bundler.ValidateAccountingValues(r.internal, helmValues); err != nil {
+	pinned := r.internal.WithResolvedValues(helmValues)
+	if err := bundler.ValidateAccountingValues(pinned, helmValues); err != nil {
 		return nil, err
+	}
+
+	// Component preflight: run the registry-declared component validations
+	// before handing back component values. DefaultBundler.Make runs the
+	// same gate (runComponentValidations) before writing a bundle; without
+	// it here the SDK path would return values the bundle path refuses to
+	// render — e.g. the gpu-operator driver-ownership coherence check
+	// (severity: error) on a recipe resolved from a snapshot that observed
+	// no NVIDIA kernel driver. This path has no bundle-time --set
+	// overrides, so the bundler config is nil; validations that act solely
+	// on bundle-time flags no-op on a nil config. The two NVSentinel gates
+	// used to be in that category and are no longer: since #2181 the
+	// recipes carry the driver-label and RuntimeClass values for every
+	// supported configuration, so both gates verify resolved values here
+	// with no override channel.
+	preflightWarnings, preflightErr := validations.RunComponentValidations(ctx, pinned, nil)
+	for _, warning := range preflightWarnings {
+		slog.Warn(warning, "source", "component-validation")
+	}
+	if preflightErr != nil {
+		return nil, preflightErr
 	}
 
 	bundles := make([]ComponentBundle, 0, len(r.Components))
@@ -1345,6 +1714,10 @@ func resolveHelmComponentValues(
 // CollectSnapshot deploys the snapshotter Job to the cluster identified
 // by cfg.Kubeconfig and returns the captured Snapshot.
 //
+// This is the single Job-mode collection path in the tree: `aicr snapshot`
+// and `aicr validate` both run it, so the facade AgentConfig mirror is
+// exercised on every snapshot AICR takes.
+//
 // CollectSnapshot does NOT consult the Client's recipe data provider —
 // the Client is required only to keep the facade surface uniform
 // (every public operation goes through a Client) and to leave room
@@ -1355,6 +1728,54 @@ func resolveHelmComponentValues(
 // cfg.Kubeconfig is the path (or empty for in-cluster). cfg.Namespace,
 // cfg.Image, cfg.ServiceAccountName must be set; other fields fall
 // back to package defaults documented on snapshotter.AgentConfig.
+//
+// # Output and delivery
+//
+// The returned Snapshot carries both the parsed form and, in Snapshot.Raw,
+// the exact bytes the agent emitted. CollectSnapshot does not write them
+// anywhere except when cfg.Output names a ConfigMap (cm://namespace/name),
+// which the Job writes directly. Persisting to a file, stdout, or a Go
+// template is the caller's step — pass Snapshot.Raw to
+// snapshotter.DeliverSnapshot, as `aicr snapshot` does. Delivering Raw rather
+// than re-serializing the parsed snapshot is what keeps the output
+// byte-identical to the agent's when a newer agent image emits fields this
+// binary does not model.
+//
+// # Fail-before-mutate
+//
+// Inputs that can be rejected without contacting the cluster are checked
+// before the Kubernetes client is built, so a rejection never leaves RBAC or
+// a Job behind (with cfg.Cleanup false — the zero value — they would
+// persist). That covers a malformed cfg.Output ConfigMap URI and a non-empty
+// cfg.ClusterConfigPath, both ErrCodeInvalidRequest.
+//
+// # Deliberately outside this method
+//
+// Two snapshot capabilities are NOT reachable through CollectSnapshot, by
+// design, because neither deploys a Job:
+//
+//   - Local (in-pod) collection — the mode the agent container itself runs
+//     under AICR_AGENT_MODE=true, and the dev bypass of the same name. It
+//     runs collectors in-process against the local node instead of deploying
+//     an agent, so it needs a collector.Factory and a serializer.Serializer,
+//     types the semver-stable facade deliberately does not expose. Use
+//     snapshotter.NodeSnapshotter directly, as pkg/cli/snapshot.go does. It
+//     takes no AgentConfig, so leaving it out costs no coverage of the field
+//     mirror: every deployed Job still projects through this method.
+//   - cfg.ClusterConfigPath — an l8k cluster-config.yaml ingested by the
+//     in-pod network collector. The path must resolve inside the pod and the
+//     Job does not mount it, so Job mode rejects a non-empty value with
+//     ErrCodeInvalidRequest. Use cfg.DiscoverNetwork for live discovery from
+//     a Job, or the local mode above to read a host file.
+//
+// # Timeout
+//
+// The operation is bounded by cfg.Timeout + defaults.SnapshotOperationGrace
+// (or defaults.SnapshotOperationTimeout + grace when cfg.Timeout is unset),
+// so a caller passing context.Background() still gets a bounded run. The
+// grace exists because cfg.Timeout budgets Job completion only — deployment
+// and result retrieval sit outside it, and a bare cap would silently shrink
+// the completion budget. A tighter caller deadline always wins.
 //
 // Errors:
 //   - ErrCodeInvalidRequest when the Client is nil, cfg is nil, or
@@ -1392,20 +1813,26 @@ func (c *Client) CollectSnapshot(ctx context.Context, cfg *AgentConfig) (*Snapsh
 	// still gets a bounded operation. Preference order:
 	//   1. cfg.Timeout — caller-controlled, wins when set.
 	//   2. SnapshotOperationTimeout — package default (matches CLISnapshotTimeout).
+	// SnapshotOperationGrace is added on top because the chosen value budgets
+	// Job COMPLETION only: deploy, pool projection, and ConfigMap retrieval
+	// happen outside it, so a bare cap would quietly shrink the caller's
+	// completion budget by however long deployment took.
 	// context.WithTimeout honors the smaller of the parent deadline and
 	// the value supplied here, so callers with a tighter context keep it.
-	cap := cfg.Timeout
-	if cap <= 0 {
-		cap = defaults.SnapshotOperationTimeout
+	budget := cfg.Timeout
+	if budget <= 0 {
+		budget = defaults.SnapshotOperationTimeout
 	}
-	ctx, cancel := context.WithTimeout(ctx, cap)
+	ctx, cancel := context.WithTimeout(ctx, budget+defaults.SnapshotOperationGrace)
 	defer cancel()
 
-	snap, err := snapshotter.DeployAndGetSnapshot(ctx, toInternalAgentConfig(cfg))
+	snap, raw, err := snapshotter.DeployAndCollect(ctx, toInternalAgentConfig(cfg))
 	if err != nil {
 		return nil, err
 	}
-	return fromInternalSnapshot(snap), nil
+	out := fromInternalSnapshot(snap)
+	out.Raw = raw
+	return out, nil
 }
 
 // ValidateState evaluates a resolved recipe against an observed cluster

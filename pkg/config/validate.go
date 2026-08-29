@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 )
@@ -37,13 +38,16 @@ func (c *AICRConfig) Validate() error {
 		return errors.New(errors.ErrCodeInvalidRequest,
 			fmt.Sprintf("invalid kind %q: expected %q", c.Kind, Kind))
 	}
-	if c.APIVersion != APIVersion {
+	if !header.IsSupportedAuthoringAPIVersion(c.APIVersion) {
 		return errors.New(errors.ErrCodeInvalidRequest,
-			fmt.Sprintf("invalid apiVersion %q: expected %q", c.APIVersion, APIVersion))
+			fmt.Sprintf("invalid apiVersion %q: expected %q or %q; update the config header to a version accepted by this aicr release",
+				c.APIVersion, APIVersion, header.GroupVersionV1Beta1))
 	}
-	if c.Spec.Snapshot == nil && c.Spec.Recipe == nil && c.Spec.Bundle == nil && c.Spec.Validate == nil {
+	if c.Spec.Snapshot == nil && c.Spec.Recipe == nil && c.Spec.Bundle == nil &&
+		c.Spec.Validate == nil && c.Spec.Verify == nil {
+
 		return errors.New(errors.ErrCodeInvalidRequest,
-			"config has none of spec.snapshot, spec.recipe, spec.bundle, spec.validate; at least one is required")
+			"config has none of spec.snapshot, spec.recipe, spec.bundle, spec.validate, spec.verify; at least one is required")
 	}
 	if err := c.Spec.Snapshot.validate(); err != nil {
 		return err
@@ -55,6 +59,9 @@ func (c *AICRConfig) Validate() error {
 		return err
 	}
 	if err := c.Spec.Validate.validate(); err != nil {
+		return err
+	}
+	if err := c.Spec.Verify.validate(); err != nil {
 		return err
 	}
 	if err := c.Spec.validateRecipeBundleHandoff(); err != nil {
@@ -102,12 +109,32 @@ func (r *RecipeSpec) validate() error {
 		return errors.New(errors.ErrCodeInvalidRequest,
 			"spec.recipe.criteria and spec.recipe.input.snapshot are mutually exclusive")
 	}
-	if _, err := r.ResolveCriteriaWithRegistry(nil); err != nil {
-		return err
+	// Criteria VALUES are deliberately not validated here. Membership is a
+	// property of the CriteriaRegistry, and the authoritative registry is
+	// per-DataProvider: a value contributed by an external catalog
+	// (spec.recipe.data, or --data) only exists once that provider has been
+	// constructed and its overlays loaded. Validating against a nil registry
+	// checks the EMBEDDED catalog, which rejects every external value —
+	// making an external catalog unusable from a config document at all.
+	//
+	// Phase two runs at consumption, where the registry is known:
+	// ResolveCriteriaWithRegistry(reg) below, reached through
+	// pkg/client/v1.(*Config).RecipeCriteria and the CLI's
+	// applyCriteriaFromConfig. Both criteria-consuming paths go through it,
+	// so a bogus value still fails closed — just against the right catalog.
+	//
+	// Nodes is the exception and stays here: a negative count is malformed
+	// regardless of which catalog is in play, so there is nothing to defer.
+	if r.Criteria != nil && r.Criteria.Nodes < 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("spec.recipe.criteria.nodes must be >= 0, got %d", r.Criteria.Nodes))
 	}
 	if _, err := recipe.ParseProfileSelection(r.Profile); err != nil {
 		return errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
 			"invalid spec.recipe.profile")
+	}
+	if _, _, err := r.ResolveRuntimeInventoryMode(); err != nil {
+		return err
 	}
 	if _, _, err := r.ResolveAccountingMode(); err != nil {
 		return err
@@ -132,6 +159,16 @@ func (b *BundleSpec) validate() error {
 }
 
 func (v *ValidateSpec) validate() error {
+	if v == nil {
+		return nil
+	}
+	if _, err := v.Resolve(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (v *VerifySpec) validate() error {
 	if v == nil {
 		return nil
 	}
