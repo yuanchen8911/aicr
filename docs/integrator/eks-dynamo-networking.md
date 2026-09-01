@@ -13,19 +13,24 @@ pods still run on the system nodegroup while workers run on the GPU
 nodegroup, so traffic still crosses the same GPU↔system nodegroup SG
 boundary as before.
 
-> **TODO before merging (tracked in NVIDIA/aicr#1836):** the port(s) below
-> are not yet confirmed against a real Dynamo 1.4+ EKS deployment. What's
-> known from the AICR recipes: the ZMQ KV-event endpoint is set explicitly
-> per worker via `--kv-events-config`, e.g.
-> `{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557"}`
-> (see `tests/manifests/dynamo-vllm-smoke-test.yaml`), offset by `+dp_rank`
-> for dp_rank > 0. The TCP request plane does not have one fixed,
-> documented port the way NATS had `4222` — confirm the actual listening
-> port(s) on a live cluster before finalizing the SG rule below:
-> ```shell
-> kubectl exec -n dynamo-system <frontend-pod> -- ss -tlnp
-> kubectl exec -n dynamo-system <worker-pod> -- ss -tlnp
-> ```
+**Confirmed on a live Dynamo 1.4.1 EKS deployment (`aicr-gb300`, 2026-09-01).**
+The 1.4.2 chart pins the same `grove`/`kai-scheduler` dependency versions as
+1.4.1, so this is not expected to change in 1.4.2, but it has not been
+re-verified live against 1.4.2:
+the frontend does not listen on a request-plane or KV-event port at all — its
+only listener is its own HTTP API (`8000`). The connections that cross the
+GPU↔system nodegroup boundary are the **frontend connecting out to the
+worker**, not the other way around:
+
+- **ZMQ KV-event plane** — fixed per worker via `--kv-events-config`, e.g.
+  `{"enable_kv_cache_events":true,"publisher":"zmq","endpoint":"tcp://*:5557"}`
+  (see `tests/manifests/dynamo-vllm-smoke-test.yaml`), offset by `+dp_rank`
+  for dp_rank > 0. The worker binds this; the frontend connects to it.
+- **TCP request plane** — the worker's runtime logs
+  `Initializing NetworkManager with TCP request plane` (`mode=tcp`,
+  `port=OS-assigned`) on startup: this is an **OS-assigned ephemeral port**,
+  not a fixed one like NATS's `4222`. It varies per pod and cannot be
+  allowlisted as a single port number.
 
 If the GPU and system node groups sit in different security groups, these
 ports may be blocked from GPU nodes to the frontend's node (and vice versa).
@@ -40,15 +45,14 @@ Typical symptoms:
   15 min — while `deployment` and `conformance` pass; the workload never
   reaches a ready state
 
-You can confirm reachability directly from a GPU node before re-running. The
-toleration is required because the GPU node groups on these clusters are
-tainted (`NoSchedule`/`NoExecute`); without it the probe pod stays `Pending`
-and never runs:
+You can confirm reachability directly from a system-nodegroup node before
+re-running — this is the direction that matters, since the frontend (system
+nodegroup) is what initiates the connection to the worker (GPU nodegroup):
 
 ```shell
 kubectl run tcp-probe --rm -i --restart=Never --image=busybox:1.36 \
-  --overrides='{"spec":{"nodeSelector":{"<gpu-node-label-key>":"<value>"},"tolerations":[{"operator":"Exists"}]}}' \
-  -- sh -c 'nc -zv -w 5 <worker-pod-ip-or-svc> <PORT>'
+  --overrides='{"spec":{"nodeSelector":{"<system-node-label-key>":"<value>"}}}' \
+  -- sh -c 'nc -zv -w 5 <worker-pod-ip-or-svc> 5557'
 ```
 
 The conformance validator's `ai-service-metrics` check adds a third requirement:
@@ -78,9 +82,18 @@ SG rule below remains the reliable cluster-side guarantee.
 
 ## Required Security Group Rules
 
-Allow ingress from the GPU node security group to the system node security
-group on:
-- TCP `<PORT>` - Dynamo request plane + KV events (dynamo-platform) — confirm exact port(s) on-cluster, see TODO above
+Allow ingress from the **system node security group to the GPU node security
+group** — the frontend (system nodegroup) initiates both connections; the
+worker (GPU nodegroup) is the listener:
+- TCP `5557` (+`dp_rank` per worker) - ZMQ KV-cache event plane
+- The ephemeral port range (worker's OS-assigned request-plane port) —
+  Dynamo does not expose a way to pin this to a fixed port, so the rule must
+  cover the node's local ephemeral range (Linux default
+  `net.ipv4.ip_local_port_range`, typically `32768-60999`; verify the actual
+  range on the AMI in use) rather than a single port number
+
+Separately, allow ingress from the GPU node security group to the system node
+security group on:
 - TCP `9090` - Prometheus (required for the `ai-service-metrics` conformance check)
 
 The `9090` rule is required as a fallback guarantee: the orchestrator *prefers*
@@ -109,10 +122,15 @@ aws ec2 describe-instances \
   --query "Reservations[0].Instances[0].SecurityGroups[*].GroupId" \
   --output text
 
-# 2) Allow Dynamo request/event-plane + Prometheus from GPU SG -> system SG
-aws ec2 authorize-security-group-ingress --group-id <system-sg-id> \
-  --protocol tcp --port <PORT> --source-group <gpu-sg-id>
+# 2) Allow the frontend (system SG) to reach the worker's ZMQ KV-event port
+#    and OS-assigned request-plane port on the GPU SG
+aws ec2 authorize-security-group-ingress --group-id <gpu-sg-id> \
+  --protocol tcp --port 5557 --source-group <system-sg-id>
 
+aws ec2 authorize-security-group-ingress --group-id <gpu-sg-id> \
+  --protocol tcp --port 32768-60999 --source-group <system-sg-id>
+
+# 3) Allow Prometheus from GPU SG -> system SG (fallback placement guarantee)
 aws ec2 authorize-security-group-ingress --group-id <system-sg-id> \
   --protocol tcp --port 9090 --source-group <gpu-sg-id>
 ```
