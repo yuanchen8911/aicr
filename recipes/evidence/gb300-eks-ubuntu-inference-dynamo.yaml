@@ -1,8 +1,0 @@
-attestations:
-  - attestedAt: 2026-09-17T19:01:00Z
-    bundle:
-      digest: sha256:f89880455101b90b092ccb549dac7bce1112525055245189b94dc9343262619a
-      oci: ghcr.io/yuanchen8911/aicr-evidence:gb300-eks-ubuntu-inference-dynamo-9ec38e10c23f
-      predicateType: https://aicr.run/recipe-evidence/v1
-recipe: gb300-eks-ubuntu-inference-dynamo
-schemaVersion: 1.0.0
