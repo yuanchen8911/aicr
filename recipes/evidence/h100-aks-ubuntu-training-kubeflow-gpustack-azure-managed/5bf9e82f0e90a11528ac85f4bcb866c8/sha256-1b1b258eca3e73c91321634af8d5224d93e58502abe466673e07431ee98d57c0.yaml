@@ -4,6 +4,10 @@ attestations:
       digest: sha256:1b1b258eca3e73c91321634af8d5224d93e58502abe466673e07431ee98d57c0
       oci: ghcr.io/yuanchen8911/aicr-evidence:h100-aks-ubuntu-training-kubeflow-gpustack-azure-managed-139928d8e277
       predicateType: https://aicr.run/recipe-evidence/v3
+    signer:
+      identity: https://github.com/yuanchen8911/aicr/.github/workflows/evidence-publish.yaml@refs/heads/evidence/aks-h100-training-inference
+      issuer: https://token.actions.githubusercontent.com
+      rekorLogIndex: 117175530
 profile: gpuStack=azure-managed
 recipe: h100-aks-ubuntu-training-kubeflow-gpustack-azure-managed
 schemaVersion: 1.0.0
