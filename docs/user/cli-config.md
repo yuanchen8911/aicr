@@ -32,7 +32,7 @@ The schema's source of truth is
 
 ```yaml
 kind: AICRConfig               # required, exactly this value
-apiVersion: aicr.run/v1beta1   # required; v1alpha2 still accepted, see below
+apiVersion: aicr.run/v1beta1   # required; the only accepted value
 metadata:
   name: gke-h100-training      # optional, identifying only
 spec:
@@ -53,11 +53,11 @@ is checked when the file loads, whichever command loaded it — so a malformed
 wrong. Keep that in mind for a single document spanning several sections: an
 error can name a section the running command never reads.
 
-`AICRConfig` is an authored file, so its `apiVersion` is yours to set. From
-v0.22 the documented value is `aicr.run/v1beta1`; the loader still accepts the
-superseded `aicr.run/v1alpha2` and warns, naming your config file, while empty
-and unknown values are rejected. v1.0.0 stops accepting `aicr.run/v1alpha2`
-entirely, so edit your config before upgrading to it. The full release-by-release table
+`AICRConfig` is an authored file, so its `apiVersion` is yours to set. The
+value is `aicr.run/v1beta1`, and as of v1.0.0 it is the only one accepted: the
+superseded `aicr.run/v1alpha2` was read-with-a-warning in v0.22 and is rejected
+now, as are empty and unknown values. A config still carrying it must be edited
+by hand — AICR has no conversion layer. The full release-by-release table
 is in
 [Catalog and binary compatibility](../integrator/data-extension.md#catalog-and-binary-compatibility);
 the policy behind it is
@@ -205,18 +205,19 @@ spec:
       requireGpu: false
     execution:
       phases: [deployment, conformance, performance]
+      skipChecks: []                 # checks this run cannot satisfy; empty = run them all
       failOnError: true              # tri-state; absent = CLI default (true)
       failFast: false
       noCluster: false
       noCleanup: false
-      timeout: 40m
+      timeout: 5m                    # aicr validate: live-capture agent Job only; inert here (input.snapshot is set)
     evidence:
       cncf:                          # CNCF AI Conformance markdown
         dir: ./evidence
         cncfSubmission: false        # requires dir
         features: []                 # empty = all features
       attestation:                   # recipe-evidence bundle (ADR-007)
-        out: evidence-result.json    # setting this enables the path
+        out: ./attestation           # directory; setting this enables the path
         bom: ""
         push: ""                     # OCI ref to push the signed bundle
         plainHTTP: false
@@ -312,15 +313,16 @@ Inputs to `aicr validate`.
 | `agent.jobName` | string | Optional **prefix**, never an exact name — the run ID is always appended (`<prefix>-<run-id>`). Omit it to take the default (`aicr-validate`) |
 | `agent.serviceAccountName` | string | Optional and **exact-if-exists**, with the same two branches as `spec.snapshot.agent.serviceAccountName`: an existing ServiceAccount of exactly this name in `agent.namespace` is used verbatim, the run creates and deletes **no** RBAC, and per-run permission isolation is waived — concurrent runs share that identity's persistent grants; when it does not exist the value is a prefix with the run ID appended (`<prefix>-<run-id>`) and the run owns a full run-scoped RBAC set. Omitting the field is not the same as writing `aicr-validate` into it: an omitted name is never probed, so the run always takes the run-scoped `aicr-validate-<run-id>`. See [Using an existing ServiceAccount](agent-deployment.md#using-an-existing-serviceaccount-irsa-and-workload-identity) |
 | `execution.phases` | []string | e.g. `[deployment, conformance, performance]` |
+| `execution.skipChecks` | []string | Checks to withhold from every phase that runs, one level below `phases`. For a caller that cannot satisfy a check the recipe declares, e.g. a lane deploying a subset of the recipe. Each named check is **reported as skipped**, not dropped, so the CTRF report and the recipe-evidence bundle still account for it. Rejected before any validation resource is created when a name matches no check, when the list would leave a requested phase with nothing to run, or when it is set alongside `evidence.cncf.dir` (that renderer omits skipped checks, so a submission would silently lose the requirement). A `cm://` recipe is read from the cluster first, so that form contacts the API server before the list is judged. Mirrors `--skip-check` |
 | `execution.failOnError` | bool (tri-state) | Absent = CLI default (`true`); explicit `false` opts out |
 | `execution.failFast` | bool (tri-state) | Stop after the first failed phase |
 | `execution.noCluster` | bool | Test mode: no cluster access, constraints evaluated inline |
 | `execution.noCleanup` | bool | Keep validation Jobs after completion |
-| `execution.timeout` | duration string | e.g. `40m` |
+| `execution.timeout` | duration string | `aicr validate`: timeout for the live snapshot-capture agent Job (`--timeout`, default `5m`); inert when `input.snapshot` is set, and validator Jobs keep their per-check timeouts. Go SDK: `Config.ValidateSettings().Timeout` carries the same value for `WithValidationTimeout`, which caps the whole `ValidateState` run (see [Go library](../integrator/go-library.md#what-validatesettings-does-and-does-not-carry)) |
 | `evidence.cncf.dir` | string | CNCF AI Conformance evidence directory (`--evidence-dir`) |
 | `evidence.cncf.cncfSubmission` | bool (tri-state) | Emit submission layout; requires `dir` |
 | `evidence.cncf.features` | []string | Empty = all features; honored only with `cncfSubmission` |
-| `evidence.attestation.out` | string | Recipe-evidence result path (predicateType v3) — setting it **enables** the attestation path |
+| `evidence.attestation.out` | string | Output directory for the recipe-evidence bundle (predicateType v3; same as `--emit-attestation`), which receives `summary-bundle/` and `pointer.yaml` — setting it **enables** the attestation path |
 | `evidence.attestation.bom` / `.push` | string | BOM input; OCI ref for the signed bundle push |
 | `evidence.attestation.plainHTTP` / `.insecureTLS` | bool (tri-state) | Push transport options |
 

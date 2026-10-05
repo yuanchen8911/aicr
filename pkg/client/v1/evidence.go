@@ -38,7 +38,7 @@ type OIDCResolveOptions = bundleattest.ResolveOptions
 // signing-disclosure prompt, which is a UI concern the caller owns.
 type EvidenceOptions struct {
 	// OutDir is the directory to write the recipe-evidence bundle to
-	// (summary-bundle/, optionally logs-bundle/, and pointer.yaml). Required.
+	// (summary-bundle/ and pointer.yaml). Required.
 	OutDir string
 
 	// BOMPath optionally embeds a CycloneDX BOM; when empty a recipe-bound
@@ -63,10 +63,15 @@ type EvidenceOptions struct {
 	// payloads instead of the redacted defaults).
 	Full bool
 
-	// Commit is the build commit used to resolve the validator catalog for
-	// the bundle's BOM. The Client's version is used for the catalog version
-	// and stamped as AICRVersion; commit has no Client-level home, so it is
-	// supplied per call.
+	// AllowMutableValidatorTags emits even when a validator image resolves to
+	// a moving tag (`:edge`, `:latest`, anything not a release, `:sha-<commit>`
+	// or `:uat-<run_id>` ref). Emission otherwise fails closed, because the
+	// predicate identifies validators by tag alone. See #2873.
+	AllowMutableValidatorTags bool
+
+	// Commit is the build commit. It resolves the validator catalog for the
+	// bundle's BOM and is stamped into the predicate as AICRCommit. The
+	// Client has no commit of its own, so it is supplied per call.
 	Commit string
 
 	// OIDCResolve carries keyless-signing token-resolution inputs, consumed
@@ -154,18 +159,22 @@ func (c *Client) EmitRecipeEvidence(
 	}
 
 	_, err = evattest.Emit(ctx, evattest.EmitOptions{
-		OutDir:       opts.OutDir,
-		BOMPath:      opts.BOMPath,
-		Push:         opts.Push,
-		PlainHTTP:    opts.PlainHTTP,
-		InsecureTLS:  opts.InsecureTLS,
-		NoSign:       opts.NoSign,
-		Full:         opts.Full,
-		Recipe:       rec.Resolved(),
+		OutDir:      opts.OutDir,
+		BOMPath:     opts.BOMPath,
+		Push:        opts.Push,
+		PlainHTTP:   opts.PlainHTTP,
+		InsecureTLS: opts.InsecureTLS,
+		NoSign:      opts.NoSign,
+		Full:        opts.Full,
+		Recipe:      rec.Resolved(),
+
+		AllowMutableValidatorTags: opts.AllowMutableValidatorTags,
+
 		Snapshot:     toInternalSnapshot(snap),
 		PhaseResults: toInternalPhaseResults(results),
 		Catalog:      cat,
 		AICRVersion:  clientVersion,
+		AICRCommit:   opts.Commit,
 		OIDCResolve:  opts.OIDCResolve,
 	})
 	return err

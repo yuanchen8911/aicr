@@ -71,7 +71,7 @@
 //   - CriteriaServiceOCP: Red Hat OpenShift Container Platform
 //   - CriteriaServiceMetal3: Metal3 bare-metal provisioning
 //   - CriteriaServiceRKE2: Rancher Kubernetes Engine 2 (bare-metal)
-//   - CriteriaServiceGeneric: generic self-managed Kubernetes (no distinguishing distro or provisioner)
+//   - CriteriaServiceGeneric: generic self-managed Kubernetes (no distinguishing distro or provisioner; opt-in-only, never inferred from a snapshot)
 //   - CriteriaServiceK0s: k0s (self-managed k0s clusters)
 //   - CriteriaServiceAny: Any service (wildcard)
 //
@@ -193,6 +193,7 @@
 //   - gpu: alias for accelerator (backwards compatibility)
 //   - intent: training, inference, any (default: any)
 //   - os: ubuntu, rhel, cos, amazonlinux, ol, talos, any (default: any)
+//   - platform: dynamo, kubeflow, nim, runai, slurm, any (default: any)
 //   - nodes: integer node count (default: 0 = any)
 //
 // # Criteria Files (CLI and HTTP API - POST)
@@ -205,7 +206,7 @@
 //
 //	type RecipeCriteria struct {
 //	    Kind       string    // Must be "RecipeCriteria"
-//	    APIVersion string    // emits "aicr.run/v1"; "aicr.run/v1alpha2" still accepted
+//	    APIVersion string    // "aicr.run/v1"
 //	    Metadata   struct {
 //	        Name string       // Optional descriptive name
 //	    }

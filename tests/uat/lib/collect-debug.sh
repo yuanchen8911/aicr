@@ -51,12 +51,23 @@
 # are hardware identifiers / driver diagnostics — no Secrets, and intentionally
 # captured for RMA (issue #1860) — but treated as sensitive like the rest.
 
+# Platform-to-workload-CRD map (platform_workload_crd,
+# platform_workload_platforms), shared with phase_conformance's coordinate
+# cross-check so the CRs captured here cannot drift from the platforms the gate
+# knows. Sourced explicitly rather than relying on the caller's source order;
+# the map file has no side effects at source time, so sourcing it twice in one
+# shell (phases.sh sources it too) is harmless.
+# shellcheck source=./platform-crd-map.sh
+source "$(dirname "${BASH_SOURCE[0]}")/platform-crd-map.sh"
+
 # Directory the bundle is written into (relative to $PWD, matching serve-logs/
 # and train-logs/); the workflow adds `cluster-debug/**` to the upload artifact.
 CLUSTER_DEBUG_DIR="${CLUSTER_DEBUG_DIR:-cluster-debug}"
 
-# Readiness-gate time-series log. phase_install appends each gate attempt's
-# `validate --phase deployment` output (timestamped) here, so the bundle carries
+# Readiness-gate time-series log. phase_readiness appends each gate attempt's
+# `validate --phase deployment` output (timestamped) here -- plus, for a failed
+# attempt, the failing validators' message and stdout (e.g. expected-resources'
+# "Failed resources:" block) from that attempt's CTRF report -- so the bundle carries
 # the actual status.status progression across the tuning-settling window — the
 # complete→in_progress flips AS THEY HAPPEN — rather than only a single snapshot
 # taken minutes later at teardown. This is the highest-value signal for the
@@ -80,7 +91,14 @@ CLUSTER_DEBUG_LOG_TAIL="${CLUSTER_DEBUG_LOG_TAIL:-2000}"
 # NVIDIA/AICR workloads, not third-party tenants; heed the Privacy note above
 # before adding a namespace that runs token-bearing workloads (e.g. a served
 # model), whose logs can carry app-emitted credentials into the public artifact.
-CLUSTER_DEBUG_LOG_NAMESPACES="${CLUSTER_DEBUG_LOG_NAMESPACES:-skyhook gpu-operator nvidia-dra-driver nvidia-network-operator nvsentinel node-feature-discovery kai-scheduler aicr-validation cert-manager monitoring}"
+#
+# nodewright AND skyhook for the same reason the Skyhook-CR capture below scans
+# both: the registry default is nodewright, but a cluster deployed before that
+# move still runs in skyhook and Helm cannot relocate a release. The package
+# apply Jobs live here, so a tuning Init:Error is only explainable from these
+# logs (incl. --previous) — covering one namespace leaves the other's failures
+# status-only (run 36745844287).
+CLUSTER_DEBUG_LOG_NAMESPACES="${CLUSTER_DEBUG_LOG_NAMESPACES:-nodewright skyhook gpu-operator nvidia-dra-driver nvidia-network-operator nvsentinel node-feature-discovery kai-scheduler aicr-validation cert-manager monitoring}"
 
 # Cluster-scoped custom resources most relevant to a deployment-phase failure.
 # Skyhook is first: its status.status is the non-monotonic signal the readiness
@@ -176,10 +194,16 @@ capture_skyhook_snapshot() {
       echo "----- node reboot fingerprint (bootID / kernel / Ready transition / taints) -----"
       _cd_node_reboot_fingerprint
       echo
-      echo "----- skyhook namespace pods (tuning package pods) -----"
-      _cd_bounded kubectl get pods -n skyhook -o wide 2>&1 || true
-      echo "----- skyhook namespace events (by time) -----"
-      _cd_bounded kubectl get events -n skyhook --sort-by=.lastTimestamp 2>&1 || true
+      # Both namespaces: the registry default is nodewright, but a cluster
+      # deployed before that move still runs in skyhook and Helm cannot
+      # relocate a release. Collecting only one would come back empty on
+      # exactly the cluster whose upgrade is being debugged.
+      for _cd_nw_ns in nodewright skyhook; do
+        echo "----- ${_cd_nw_ns} namespace pods (tuning package pods) -----"
+        _cd_bounded kubectl get pods -n "${_cd_nw_ns}" -o wide 2>&1 || true
+        echo "----- ${_cd_nw_ns} namespace events (by time) -----"
+        _cd_bounded kubectl get events -n "${_cd_nw_ns}" --sort-by=.lastTimestamp 2>&1 || true
+      done
     } | tee "${out}"
     echo "::endgroup::"
     exit 0
@@ -359,7 +383,7 @@ collect_cluster_debug() {
         report.json 2>/dev/null || echo "  (report.json unparseable)"
     fi
     # Point the reader at the two highest-value time-series artifacts if present:
-    # the readiness-gate status.status progression (written during phase_install)
+    # the readiness-gate status.status progression (written during phase_readiness)
     # and any inline skyhook-at-failure snapshot(s).
     [[ -f "${CLUSTER_DEBUG_GATE_LOG}" ]] && echo "readinessGateSeries: $(basename "${CLUSTER_DEBUG_GATE_LOG}")"
     # GPU census is always emitted below; gpu-shortfall.txt appears only when a
@@ -415,8 +439,14 @@ collect_cluster_debug() {
     _cd_section "CR ${res} (yaml)" "cr-${res%%.*}.yaml" \
       kubectl get "${res}" -A -o yaml
   done
-  # Platform workload CRs (Dynamo / Kubeflow) if the CRD exists.
-  for res in dynamographdeployments.nvidia.com trainjobs.trainer.kubeflow.org; do
+  # Platform workload CRs (Dynamo / Kubeflow / Slurm) if the CRD exists. The
+  # platform set and its CRD names come from lib/platform-crd-map.sh, the same
+  # map phase_conformance cross-checks the TestGrid coordinate against: a
+  # platform the gate knows must also have its CRs captured here, or the bundle
+  # for a failing cell of that platform arrives missing its workload state.
+  local platform
+  for platform in $(platform_workload_platforms); do
+    res="$(platform_workload_crd "${platform}")" || continue
     _cd_bounded kubectl get crd "${res}" >/dev/null 2>&1 || continue
     _cd_section "CR ${res} (yaml)" "cr-${res%%.*}.yaml" \
       kubectl get "${res}" -A -o yaml

@@ -384,6 +384,24 @@ func TestResolveBenchmarkRuntimeSource(t *testing.T) {
 			t.Fatalf("plan=%+v err=%v", plan, err)
 		}
 	})
+	t.Run("supplied runtime referencing the IMEX template is validator-managed", func(t *testing.T) {
+		carrier := claimRuntime(`                  resourceClaims:
+                    - name: imex-channel
+                      resourceClaimTemplateName: `+ncclIMEXClaimTemplateName, false)
+		plan, err := resolve(newCtx(nil), carrier)
+		if err != nil || !plan.managesIMEX() {
+			t.Fatalf("plan=%+v err=%v", plan, err)
+		}
+	})
+	t.Run("supplied runtime with an unsatisfiable claim fails before any cluster work", func(t *testing.T) {
+		carrier := claimRuntime(`                  resourceClaims:
+                    - name: imex-channel
+                      resourceClaimName: precreated-imex`, false)
+		_, err := resolve(newCtx(nil), carrier)
+		if err == nil || !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) {
+			t.Fatalf("want ErrCodeInvalidRequest, got %v", err)
+		}
+	})
 	t.Run("supplied runtime + delivered runtime is rejected", func(t *testing.T) {
 		_, err := resolve(newCtx(tcpxoRefs(m)), validBenchmarkRuntime)
 		if err == nil || !stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, "")) || !strings.Contains(err.Error(), "two owners") {
@@ -718,7 +736,7 @@ func TestProvenanceRecordedOnlyAfterRuntimeApplied(t *testing.T) {
 		plan := deliveredPlan(t)
 		ctx := &validators.Context{Ctx: t.Context(), DynamicClient: client, Namespace: ns}
 		err := applyNCCLResources(ctx, client, config, recipe.CriteriaAcceleratorH100, recipe.CriteriaServiceGKE,
-			variantDefault, fabricEFA, plan.carrier, plan)
+			variantDefault, fabricEFA, plan.carrier, "", plan)
 		return plan, err
 	}
 	t.Run("create rejected -> no provenance", func(t *testing.T) {

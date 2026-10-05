@@ -16,6 +16,10 @@ lists, see the [CLI Reference](cli-reference.md).
   local Kind/KWOK cluster for a dry run). `kubectl` configured to reach it.
 - The `helm` binary on your `PATH` (the default `helm` deployer emits Helm
   commands).
+- On EKS, an AWS credential path for the EBS CSI driver. The bundle installs
+  the driver but not its credentials, and without them no volume can be
+  provisioned — see
+  [EBS CSI Driver Credentials](component-catalog.md#ebs-csi-driver-credentials).
 - About 15 minutes. No NVIDIA hardware is required to generate a recipe or a
   bundle — only the deploy and validate stages touch a real cluster.
 
@@ -84,7 +88,8 @@ aicr query \
 ## Step 4 — Render deployment bundles
 
 The **bundler** materializes the recipe into deployment-ready artifacts — one
-folder per component, each with Helm values, checksums, and a README:
+folder per component with its Helm values, plus a root README, `checksums.txt`,
+and `bundle-info.yaml`:
 
 ```bash
 aicr bundle --recipe recipe.yaml --output ./bundles
@@ -108,12 +113,15 @@ components come up with `kubectl get pods -A -w`.
 
 ## Step 6 — Validate the running cluster
 
-The **validator** compares the recipe against the live cluster — first the
+The **validator** compares a recipe against the live cluster — first the
 declarative constraints, then optional in-cluster phases (deployment,
-performance, conformance):
+performance, conformance). Validate against the bundle's own `recipe.yaml`:
+it records the components left after bundling — a component the bundler
+dropped is absent, and a component it enabled at bundle time is marked
+enabled. You are still in `bundles/` from Step 5:
 
 ```bash
-aicr validate --recipe recipe.yaml
+aicr validate --recipe recipe.yaml   # bundles/recipe.yaml
 ```
 
 A clean run exits 0. For the phase model, performance testing, and emitting

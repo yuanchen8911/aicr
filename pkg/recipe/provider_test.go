@@ -29,7 +29,7 @@ import (
 )
 
 // testEmptyRegistryContent is a minimal registry.yaml for testing.
-const testEmptyRegistryContent = `apiVersion: aicr.run/v1alpha2
+const testEmptyRegistryContent = `apiVersion: aicr.run/v1beta1
 kind: ComponentRegistry
 components: []
 `
@@ -52,6 +52,35 @@ func TestEmbeddedDataProvider(t *testing.T) {
 		_, err := provider.ReadFile(context.Background(), "non-existent.yaml")
 		if err == nil {
 			t.Error("expected error for non-existent file")
+		}
+	})
+
+	t.Run("read host-native nested path", func(t *testing.T) {
+		data, err := provider.ReadFile(context.Background(), filepath.Join("overlays", "base.yaml"))
+		if err != nil {
+			t.Fatalf("failed to read nested overlays/base.yaml: %v", err)
+		}
+		if len(data) == 0 {
+			t.Error("overlays/base.yaml is empty")
+		}
+	})
+
+	t.Run("walk embedded directory with host-native root", func(t *testing.T) {
+		foundBase := false
+		err := provider.WalkDir(context.Background(), "overlays", func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if strings.HasSuffix(path, "base.yaml") {
+				foundBase = true
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("WalkDir failed: %v", err)
+		}
+		if !foundBase {
+			t.Error("expected to find base.yaml in overlays")
 		}
 	})
 
@@ -84,7 +113,7 @@ func TestLayeredDataProvider_MergesRegistry(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a registry with a custom component
-	registryContent := `apiVersion: aicr.run/v1alpha2
+	registryContent := `apiVersion: aicr.run/v1beta1
 kind: ComponentRegistry
 components:
   - name: custom-component
@@ -195,7 +224,7 @@ func TestLayeredDataProvider_OverridesFile(t *testing.T) {
 	}
 
 	// Create a custom base.yaml that will override embedded (now in overlays/)
-	baseContent := `apiVersion: aicr.run/v1alpha2
+	baseContent := `apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: custom-base
@@ -248,7 +277,7 @@ func TestLayeredDataProvider_AddsNewFile(t *testing.T) {
 		t.Fatalf("failed to create overlays dir: %v", err)
 	}
 
-	overlayContent := `apiVersion: aicr.run/v1alpha2
+	overlayContent := `apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: custom-overlay
@@ -486,7 +515,7 @@ func TestLayeredDataProvider_IntegrationWithRegistry(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create a registry with an additional custom component
-	registryContent := `apiVersion: aicr.run/v1alpha2
+	registryContent := `apiVersion: aicr.run/v1beta1
 kind: ComponentRegistry
 components:
   - name: custom-operator
@@ -615,7 +644,7 @@ func TestLayeredDataProvider_WalkDir(t *testing.T) {
 		t.Fatalf("failed to create overlays dir: %v", err)
 	}
 
-	customOverlay := `apiVersion: aicr.run/v1alpha2
+	customOverlay := `apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: walk-test-overlay
@@ -706,7 +735,7 @@ func TestLayeredDataProvider_WalkDirWithOverride(t *testing.T) {
 	}
 
 	// Create an overlay file with unique content
-	externalOverlay := `apiVersion: aicr.run/v1alpha2
+	externalOverlay := `apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: external-only-overlay
@@ -788,11 +817,84 @@ func TestLayeredDataProvider_SourceForRegistry(t *testing.T) {
 	}
 }
 
+// TestLayeredDataProvider_SourceHostNativeNestedPath tests that Source resolves nested catalog paths
+// when formatted using the host-native path separator.
+func TestLayeredDataProvider_SourceHostNativeNestedPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "registry.yaml"), []byte(testEmptyRegistryContent), 0600); err != nil {
+		t.Fatalf("failed to write registry.yaml: %v", err)
+	}
+	validatorsDir := filepath.Join(tmpDir, "validators")
+	if err := os.MkdirAll(validatorsDir, 0755); err != nil {
+		t.Fatalf("failed to create validators dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(validatorsDir, "catalog.yaml"), []byte("validators: []\n"), 0600); err != nil {
+		t.Fatalf("failed to write catalog.yaml: %v", err)
+	}
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	// Test host-native nested path
+	source := provider.Source(filepath.Join("validators", "catalog.yaml"))
+	if source != sourceMerged {
+		t.Errorf("expected source %q, got %q", sourceMerged, source)
+	}
+}
+
+// TestLayeredDataProvider_WalkDirDeduplication verifies that external overrides retain root prefix
+// and properly suppress embedded counterparts without emitting duplicate entries.
+func TestLayeredDataProvider_WalkDirDeduplication(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "registry.yaml"), []byte(testEmptyRegistryContent), 0600); err != nil {
+		t.Fatalf("failed to write registry.yaml: %v", err)
+	}
+	overlaysDir := filepath.Join(tmpDir, "overlays")
+	if err := os.MkdirAll(overlaysDir, 0755); err != nil {
+		t.Fatalf("failed to create overlays dir: %v", err)
+	}
+	// Override an embedded overlay file (overlays/base.yaml)
+	if err := os.WriteFile(filepath.Join(overlaysDir, "base.yaml"), []byte("metadata:\n  name: base-override\n"), 0600); err != nil {
+		t.Fatalf("failed to write base.yaml: %v", err)
+	}
+
+	embedded := NewEmbeddedDataProvider(GetEmbeddedFS(), ".")
+	provider, err := NewLayeredDataProvider(embedded, LayeredProviderConfig{
+		ExternalDir: tmpDir,
+	})
+	if err != nil {
+		t.Fatalf("failed to create layered provider: %v", err)
+	}
+
+	var seen []string
+	err = provider.WalkDir(context.Background(), "overlays", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && filepath.Base(path) == "base.yaml" {
+			seen = append(seen, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WalkDir failed: %v", err)
+	}
+
+	if len(seen) != 1 || seen[0] != "overlays/base.yaml" {
+		t.Errorf("expected exactly [overlays/base.yaml], got %v", seen)
+	}
+}
+
 // TestLayeredDataProvider_CachedRegistry tests that merged registry is cached.
 func TestLayeredDataProvider_CachedRegistry(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	registryContent := `apiVersion: aicr.run/v1alpha2
+	registryContent := `apiVersion: aicr.run/v1beta1
 kind: ComponentRegistry
 components:
   - name: cache-test-component
@@ -878,7 +980,7 @@ func TestLayeredDataProvider_InvalidExternalRegistry(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create invalid YAML registry
-	invalidRegistry := `apiVersion: aicr.run/v1alpha2
+	invalidRegistry := `apiVersion: aicr.run/v1beta1
 kind: ComponentRegistry
 components:
   - name: [invalid yaml structure

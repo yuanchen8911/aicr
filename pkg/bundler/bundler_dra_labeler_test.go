@@ -19,6 +19,7 @@ import (
 	stderrors "errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -26,6 +27,13 @@ import (
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
+
+// draLabelerImageRE matches the labeler's image line in rendered output: a
+// literal, digest-pinned alpine/kubectl reference. The registry host stays
+// explicit because short-name-enforcing runtimes reject unqualified references,
+// and the tag is constrained to a version shape so a floating tag such as
+// :latest cannot satisfy it.
+var draLabelerImageRE = regexp.MustCompile(`(?m)^\s*image: docker\.io/alpine/kubectl:[0-9]+(?:\.[0-9]+)*@sha256:[0-9a-f]{64}\s*$`)
 
 // testDRANodeLabelerRecipeResult is testDRAEvictionRecipeResult plus the
 // dra-node-labeler component wired the way recipes/overlays/base.yaml wires
@@ -241,6 +249,19 @@ func TestInjectDRAEvictionLabel_SetsLabelerPair(t *testing.T) {
 	if got := dig(values[draComponentName], "kubeletPlugin", "nodeSelector", label.Key); got != label.Value {
 		t.Errorf("kubelet plugin selector = %v, want %s", got, label.Value)
 	}
+	if got := values[draNodeLabelerComponentName][draNodeLabelerEnabledPath]; got != true {
+		t.Errorf("labeler %s = %v, want true", draNodeLabelerEnabledPath, got)
+	}
+	// The gate must also land on the ref, which is what recipe.yaml serializes.
+	var labelerRef *recipe.ComponentRef
+	for i := range rr.ComponentRefs {
+		if rr.ComponentRefs[i].Name == draNodeLabelerComponentName {
+			labelerRef = &rr.ComponentRefs[i]
+		}
+	}
+	if labelerRef == nil || labelerRef.Overrides[draNodeLabelerEnabledPath] != true {
+		t.Errorf("labeler ref overrides = %v, want %s: true", labelerRef, draNodeLabelerEnabledPath)
+	}
 
 	var derived, provisioned bool
 	for _, w := range b.warnings {
@@ -369,14 +390,18 @@ func TestMake_DRANodeLabelerRendered(t *testing.T) {
 			// Ready only once the node carries the key (#2813 review).
 			`command: ["test", "-f", "/var/run/dra-node-labeler/labeled"]`,
 			`touch "${READY}"`,
-			// Literal, digest-pinned image so tools/bom inventories it.
-			"image: docker.io/alpine/kubectl:1.36.2@sha256:01d138ce994b684abc62d9cfdff44de42a4c8996dcc12626dd0193afc3fb5a95",
 			"cpu: 20m",
 			"cpu: 200m",
 		} {
 			if !strings.Contains(manifest, want) {
 				t.Errorf("rendered labeler lacks %q", want)
 			}
+		}
+		// Shape rather than an exact digest: Renovate rotates the digest as
+		// upstream rebuilds the tag. The reference must stay literal and
+		// digest-pinned; see TestSurveyComponent_DRANodeLabelerImageInventoried.
+		if !draLabelerImageRE.MatchString(manifest) {
+			t.Errorf("rendered labeler lacks a literal digest-pinned image matching %s", draLabelerImageRE)
 		}
 		if strings.Contains(manifest, "hostNetwork") {
 			t.Errorf("labeler must not request hostNetwork")
@@ -413,6 +438,82 @@ func TestMake_DRANodeLabelerRendered(t *testing.T) {
 		// labeler is dropped, and its selector carries no eviction label.
 		if _, err := os.Stat(filepath.Join(outputDir, "002-"+draComponentName)); err != nil {
 			t.Errorf("expected 002-%s in the bundle: %v (entries: %v)", draComponentName, err, entries)
+		}
+	})
+}
+
+// TestMake_DRANodeLabelerRecipePersistsGate pins what the bundle's recipe.yaml
+// says about the labeler, because that file -- not the bundler's in-memory
+// values -- is what post-deployment validation reads (#2848). Opted in, the
+// labeler ref carries enabled: true so the validator renders and checks it;
+// not opted in, the ref is absent. The caller's RecipeResult is never touched.
+func TestMake_DRANodeLabelerRecipePersistsGate(t *testing.T) {
+	label := config.NodeLabel{Key: "example.com/dra-ready", Value: "enabled"}
+
+	labelerRef := func(t *testing.T, outputDir string) *recipe.ComponentRef {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
+		defer cancel()
+		loaded, err := recipe.LoadFromFileWithProvider(ctx, filepath.Join(outputDir, RecipeFileName), "", "test", nil)
+		if err != nil {
+			t.Fatalf("load %s: %v", RecipeFileName, err)
+		}
+		for i := range loaded.ComponentRefs {
+			if loaded.ComponentRefs[i].Name == draNodeLabelerComponentName {
+				return &loaded.ComponentRefs[i]
+			}
+		}
+		return nil
+	}
+
+	t.Run("opted in persists enabled=true on the labeler ref", func(t *testing.T) {
+		b, err := New(WithConfig(config.NewConfig(config.WithDRAEvictionNodeLabel(label))))
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		input := testDRANodeLabelerRecipeResult()
+		input.Kind = recipe.RecipeResultKind
+		input.APIVersion = recipe.RecipeResultAPIVersion
+		outputDir := t.TempDir()
+		ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
+		defer cancel()
+		if _, err := b.Make(ctx, input, outputDir); err != nil {
+			t.Fatalf("Make() error = %v", err)
+		}
+
+		ref := labelerRef(t, outputDir)
+		if ref == nil {
+			t.Fatalf("%s lacks the %s ref after opting in", RecipeFileName, draNodeLabelerComponentName)
+		}
+		if got := ref.Overrides[draNodeLabelerEnabledPath]; got != true {
+			t.Errorf("%s ref overrides.%s = %v, want true", draNodeLabelerComponentName, draNodeLabelerEnabledPath, got)
+		}
+		if !ref.IsEnabled() {
+			t.Errorf("persisted gate must keep the ref enabled")
+		}
+		for _, in := range input.ComponentRefs {
+			if in.Name == draNodeLabelerComponentName && in.Overrides != nil {
+				t.Errorf("caller's labeler ref overrides mutated: %v", in.Overrides)
+			}
+		}
+	})
+
+	t.Run("not opted in leaves the labeler out of the recipe", func(t *testing.T) {
+		b, err := New()
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		input := testDRANodeLabelerRecipeResult()
+		input.Kind = recipe.RecipeResultKind
+		input.APIVersion = recipe.RecipeResultAPIVersion
+		outputDir := t.TempDir()
+		ctx, cancel := context.WithTimeout(context.Background(), draBundleMakeTimeout)
+		defer cancel()
+		if _, err := b.Make(ctx, input, outputDir); err != nil {
+			t.Fatalf("Make() error = %v", err)
+		}
+		if ref := labelerRef(t, outputDir); ref != nil {
+			t.Errorf("%s carries %s without the eviction flag: %+v", RecipeFileName, draNodeLabelerComponentName, ref)
 		}
 	})
 }
