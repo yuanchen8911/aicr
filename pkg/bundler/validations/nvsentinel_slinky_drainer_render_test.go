@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
+	"github.com/NVIDIA/aicr/pkg/helm/helmtest"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
 
@@ -45,13 +47,19 @@ func TestNVSentinelSlinkyDrainerChartRender(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live chart-render integration test in short mode")
 	}
-	requireHelmForObservabilityRender(t)
+	helmtest.RequireBinary(t)
 
 	store, err := recipe.LoadMetadataStoreFor(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("LoadMetadataStoreFor: %v", err)
 	}
-	out := renderNVSentinel(t, nvsentinelRenderedValues(t, store, "nvsentinel-quarantine", slinkyDrainerMixinName))
+	values := nvsentinelRenderedValues(t, store, "nvsentinel-quarantine", slinkyDrainerMixinName)
+	// The bundler's drain scope step runs on these values too; it must not
+	// bring back a userNamespaces entry.
+	if err := drainscope.Apply(t.Context(), values, drainScopeRenderNamespaces); err != nil {
+		t.Fatalf("drainscope.Apply: %v", err)
+	}
+	out := renderNVSentinel(t, values)
 
 	cm, ok := renderedDocument(out, "ConfigMap", "node-drainer")
 	if !ok {

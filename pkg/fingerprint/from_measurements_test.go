@@ -359,6 +359,10 @@ func TestFromMeasurements_ServiceDetection(t *testing.T) {
 		{"lke", "lke"},
 		{"linode", "lke"},
 		{"linode://58291", "lke"},
+		{"nvke", "nvke"},
+		{"nico", "nvke"},
+		{"nico://0c6f2a4e-6d0e-4a1b-9f3c-2b7d8e9f0a11", "nvke"},
+		{"nke", "nke"},
 		{"kind", "kind"},
 		{"", ""},
 	}
@@ -390,6 +394,7 @@ func TestFromMeasurements_OSDetection(t *testing.T) {
 		{"oracle linux", "ol", "8.10", "ol", "8.10"},
 		{"sles 16", "sles", "16.0", "sles", "16.0"},
 		{"sles 15", "sles", "15.7", "sles", "15.7"},
+		{"rocky 9", "rocky", "9.6", "rocky", "9.6"},
 		{"unknown ID drops both value and version", "freebsd", "13", "", ""},
 		{"both empty", "", "", "", ""},
 	}

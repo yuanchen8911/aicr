@@ -33,8 +33,17 @@ flag    aicr  --log-json  type=bool default=false required=false hidden=false en
 flag    aicr bundle  --accelerated-node-selector  type=string default= required=false hidden=false env=
 flag    aicr bundle  --accelerated-node-toleration  type=string default= required=false hidden=false env=
 flag    aicr bundle  --app-name  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-cascade-delete  type=bool default=false required=false hidden=false env=
+flag    aicr bundle  --argocd-destination-server  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-name-prefix  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-project  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-sync-retry-backoff-duration  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-sync-retry-backoff-factor  type=int default=0 required=false hidden=false env=
+flag    aicr bundle  --argocd-sync-retry-backoff-max-duration  type=string default= required=false hidden=false env=
+flag    aicr bundle  --argocd-sync-retry-limit  type=int default=0 required=false hidden=false env=
 flag    aicr bundle  --attest  type=bool default=false required=false hidden=false env=
 flag    aicr bundle  --certificate-identity-regexp  type=string default= required=false hidden=false env=
+flag    aicr bundle  --chart-name  type=string default= required=false hidden=false env=
 flag    aicr bundle  --config  type=string default= required=false hidden=false env=
 flag    aicr bundle  --data  type=string default= required=false hidden=false env=
 flag    aicr bundle  --deployer,-d  type=string default= required=false hidden=false env=
@@ -64,6 +73,7 @@ flag    aicr bundle  --set-json  type=string default= required=false hidden=fals
 flag    aicr bundle  --shared-storage-class  type=string default= required=false hidden=false env=
 flag    aicr bundle  --signing-config  type=string default= required=false hidden=false env=AICR_SIGNING_CONFIG
 flag    aicr bundle  --signing-key  type=string default= required=false hidden=false env=
+flag    aicr bundle  --split  type=bool default=false required=false hidden=false env=
 flag    aicr bundle  --storage-class  type=string default= required=false hidden=false env=
 flag    aicr bundle  --system-node-selector  type=string default= required=false hidden=false env=
 flag    aicr bundle  --system-node-toleration  type=string default= required=false hidden=false env=
@@ -152,6 +162,7 @@ flag    aicr query  --nodes  type=int default=0 required=false hidden=false env=
 flag    aicr query  --os  type=string default= required=false hidden=false env=
 flag    aicr query  --platform  type=string default= required=false hidden=false env=
 flag    aicr query  --profile  type=string default= required=false hidden=false env=
+flag    aicr query  --require-evidence  type=bool default=false required=false hidden=false env=
 flag    aicr query  --runtime-inventory  type=string default= required=false hidden=false env=
 flag    aicr query  --selector  type=string default= required=true hidden=false env=
 flag    aicr query  --service  type=string default= required=false hidden=false env=
@@ -172,6 +183,7 @@ flag    aicr recipe  --os  type=string default= required=false hidden=false env=
 flag    aicr recipe  --output,-o  type=string default= required=false hidden=false env=
 flag    aicr recipe  --platform  type=string default= required=false hidden=false env=
 flag    aicr recipe  --profile  type=string default= required=false hidden=false env=
+flag    aicr recipe  --require-evidence  type=bool default=false required=false hidden=false env=
 flag    aicr recipe  --runtime-inventory  type=string default= required=false hidden=false env=
 flag    aicr recipe  --service  type=string default= required=false hidden=false env=
 flag    aicr recipe  --slurm-accounting-mode  type=string default= required=false hidden=false env=
@@ -225,6 +237,7 @@ flag    aicr upgrade-check  --fail-on-error  type=bool default=true required=fal
 flag    aicr upgrade-check  --format,-t  type=string default="table" required=false hidden=false env=
 flag    aicr upgrade-check  --from,-f  type=string default= required=false hidden=false env=
 flag    aicr upgrade-check  --kubeconfig,-k  type=string default= required=false hidden=false env=
+flag    aicr upgrade-check  --operator-namespace  type=string default="aicr-system" required=false hidden=false env=
 flag    aicr upgrade-check  --output,-o  type=string default= required=false hidden=false env=
 flag    aicr upgrade-check  --scan-cluster  type=bool default=false required=false hidden=false env=
 flag    aicr upgrade-check  --to  type=string default= required=false hidden=false env=

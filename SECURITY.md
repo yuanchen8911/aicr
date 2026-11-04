@@ -73,9 +73,9 @@ minors are end-of-life and should be upgraded.
 
 | Version | Supported |
 |---------|-----------|
-| `1.0.x` (latest released minor) | ✅ Receives security fixes |
-| `0.22.x` (previous minor) | ✅ Receives security fixes |
-| `< 0.22` | ❌ End-of-life — upgrade to a supported release |
+| `1.2.x` (latest released minor) | ✅ Receives security fixes |
+| `1.1.x` (previous minor) | ✅ Receives security fixes |
+| `< 1.1` | ❌ End-of-life — upgrade to a supported release |
 
 Security fixes ship in a new patch or minor release cut from `main`, and reach
 the previous supported minor as a manually tagged hotfix. They are never
@@ -87,7 +87,7 @@ For all security-related concerns: [NVIDIA Product Security](https://www.nvidia.
 
 ## Supply Chain Security
 
-AICR (AI Cluster Runtime) provides supply chain security artifacts for all container images:
+AICR (AI Cluster Runtime) provides supply chain security artifacts for its release container images (the AICR Operator preview carries less; see [Trust Guarantees](#trust-guarantees)):
 
 - **SBOM Attestation**: Complete inventory of packages, libraries, and components in CycloneDX format, one per platform manifest
 - **VEX Attestation**: OpenVEX triage recording which CVEs do not affect the image and why, published alongside each platform SBOM
@@ -156,6 +156,18 @@ and how it is signed:
 | Binary SBOM | CLI binaries | SPDX v2.3 JSON (via GoReleaser) | Separate release asset (`*.sbom.json`), not embedded |
 | Bundle attestation | `aicr bundle` output | SLSA Build Provenance v1 | Sigstore keyless OIDC (opt-in `--attest`) |
 | Recipe / bundle validity | `aicr verify` trust levels | `verified` / `attested` / `unverified` / `unknown` | Checksums + Sigstore trusted root |
+
+**The AICR Operator preview.** Its images (`ghcr.io/nvidia/aicr-operator`
+and the in-cluster registry, `ghcr.io/nvidia/aicr-registry`) carry the same
+evidence as AICR's images, from the reusable `attest-operator.yaml`: SLSA Build
+Level 3 provenance, and a CycloneDX SBOM and OpenVEX per platform. Its chart
+(`oci://ghcr.io/nvidia/charts/aicr-operator`) and `kubectl-aicr` binaries carry
+Level 3 provenance. Verify them with
+`--signer-workflow NVIDIA/aicr/.github/workflows/attest-operator.yaml` and the
+release tag. v1.2.0 and its release candidates carry Level 2 provenance from
+`on-tag.yaml`, SPDX SBOMs and no OpenVEX; verify those with
+`--signer-workflow NVIDIA/aicr/.github/workflows/on-tag.yaml`
+([RELEASE.md](RELEASE.md#aicr-operator-preview)).
 
 **Why image provenance is Build Level 3.** Image attestations are generated
 from a dedicated *reusable* workflow

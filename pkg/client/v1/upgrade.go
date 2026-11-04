@@ -69,6 +69,11 @@ type UpgradeCheckRequest struct {
 	// and a report assembled from two clusters is a confident wrong answer.
 	Kubeconfig string
 
+	// OperatorNamespace is where a FromCluster read finds the AICR Operator's
+	// plans, which version the Argo CD Applications the operator writes.
+	// Empty is the namespace the operator's chart installs into.
+	OperatorNamespace string
+
 	// ScanAtRisk additionally reports the objects the crossed transition
 	// records name that carry no deployer ownership marker.
 	//
@@ -306,9 +311,10 @@ func (c *Client) clusterVersions(ctx context.Context, dp recipe.DataProvider, re
 		return clusterRead{}, err
 	}
 	result, err := c.deps.readInventory(ctx, inventory.Options{
-		Kubeconfig: req.Kubeconfig,
-		Deployer:   inventory.Deployer(deployer),
-		Components: withRecipeNamespaces(recipe.InventoryComponents(registry), to),
+		Kubeconfig:        req.Kubeconfig,
+		Deployer:          inventory.Deployer(deployer),
+		Components:        withRecipeNamespaces(recipe.InventoryComponents(registry), to),
+		OperatorNamespace: req.OperatorNamespace,
 	})
 	if err != nil {
 		return clusterRead{}, err
@@ -647,10 +653,20 @@ func internalObjectNames(
 	ctx context.Context, internal *recipe.RecipeResult,
 ) (map[string]map[string]string, error) {
 
-	if internal == nil {
-		return map[string]map[string]string{}, nil
+	values, err := internalMergedValues(ctx, internal)
+	if err != nil {
+		return nil, err
 	}
-	names := make(map[string]map[string]string, len(internal.ComponentRefs))
+	return projectObjectNames(values)
+}
+
+// internalMergedValues returns the merged values of each of internal's
+// components, keyed by component name.
+func internalMergedValues(ctx context.Context, internal *recipe.RecipeResult) (map[string]map[string]any, error) {
+	if internal == nil {
+		return map[string]map[string]any{}, nil
+	}
+	values := make(map[string]map[string]any, len(internal.ComponentRefs))
 	for i := range internal.ComponentRefs {
 		component := internal.ComponentRefs[i].Name
 		merged, err := internal.GetValuesForComponentWithContext(ctx, component)
@@ -658,13 +674,9 @@ func internalObjectNames(
 			// The adapter already returns structured errors with the right code.
 			return nil, err
 		}
-		pinned, err := recipe.ObjectNameValues(merged)
-		if err != nil {
-			return nil, err
-		}
-		names[component] = pinned
+		values[component] = merged
 	}
-	return names, nil
+	return values, nil
 }
 
 // projectObjectNames narrows merged values to the keys that name objects.

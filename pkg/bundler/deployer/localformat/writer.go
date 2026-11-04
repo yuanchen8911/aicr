@@ -161,6 +161,59 @@ func renderInputFor(c Component) manifest.RenderInput {
 	}
 }
 
+// FilterEmptyPreManifests returns the pre-manifests Write would inject a
+// <name>-pre folder for: those that render at least one object for their
+// component. Callers that must know the emitted release set before writing
+// (the ADR-018 whole-set identity check) use it so they count the same
+// -pre releases the writer emits.
+func FilterEmptyPreManifests(
+	ctx context.Context,
+	components []Component,
+	preManifests map[string]map[string][]byte,
+) (map[string]map[string][]byte, error) {
+
+	return filterEmptyPreManifests(ctx, components, preManifests)
+}
+
+// ReleaseNames returns the release names Write emits for opts, in folder
+// order, without touching the filesystem. Deployers that derive names from
+// them (Argo CD child Applications) validate before writing, so a rejected
+// bundle leaves no partial output. It renders pre-manifests to drop the ones
+// that inject no folder, so it takes a context.
+func ReleaseNames(ctx context.Context, opts Options) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WrapCtxErr(err, errors.ErrCodeTimeout, "release name planning canceled")
+	}
+	pre, err := filterEmptyPreManifests(ctx, opts.Components, opts.ComponentPreManifests)
+	if err != nil {
+		return nil, err
+	}
+	opts.ComponentPreManifests = pre
+	return opts.releaseNames(), nil
+}
+
+// releaseNames applies Write's folder emission rules. ComponentPreManifests
+// must already be filtered by filterEmptyPreManifests. A -post folder is
+// injected only for mixed components (helm repository + raw manifests);
+// manifest-only and kustomize primaries wrap their manifests in the primary.
+// The readiness gate applies to every component kind.
+func (opts *Options) releaseNames() []string {
+	names := make([]string, 0, len(opts.Components))
+	for _, c := range opts.Components {
+		if len(opts.ComponentPreManifests[c.Name]) > 0 {
+			names = append(names, c.Name+"-"+string(phasePre))
+		}
+		names = append(names, c.Name)
+		if c.Repository != "" && len(opts.ComponentPostManifests[c.Name]) > 0 {
+			names = append(names, c.Name+"-"+string(phasePost))
+		}
+		if len(opts.ComponentReadiness[c.Name]) > 0 {
+			names = append(names, c.Name+"-"+string(phaseReadiness))
+		}
+	}
+	return names
+}
+
 func filterEmptyPreManifests(
 	ctx context.Context,
 	components []Component,
@@ -226,7 +279,10 @@ const (
 // Both pre- and post-phase share this path so naming, render input,
 // error handling, and writeLocalHelmFolder invocation stay in one
 // place.
-func (opts *Options) injectAuxiliaryFolder(idx int, c Component, phase injectionPhase) (*Folder, error) {
+//
+// parentDir is the component's primary folder, whose cluster-values.yaml
+// a readiness folder layers. It must be non-empty for phaseReadiness.
+func (opts *Options) injectAuxiliaryFolder(idx int, c Component, phase injectionPhase, parentDir string) (*Folder, error) {
 	var manifests map[string][]byte
 	switch phase {
 	case phasePre:
@@ -262,11 +318,19 @@ func (opts *Options) injectAuxiliaryFolder(idx int, c Component, phase injection
 	//
 	// This is keyed on the PHASE, not on the deployer: localformat still
 	// knows nothing about which deployer is consuming it.
+	clusterValuesFrom := ""
+	if phase == phaseReadiness {
+		if parentDir == "" {
+			return nil, errors.New(errors.ErrCodeInternal,
+				fmt.Sprintf("readiness folder for %q has no parent folder", c.Name))
+		}
+		clusterValuesFrom = "../" + parentDir + "/cluster-values.yaml"
+	}
 	f, err := writeLocalHelmFolder(
 		opts.OutputDir, auxDir, idx, c,
 		manifests, renderInputFor(c),
 		auxName, c.Name, true, stampFor(c, opts.AICRVersion),
-		phase == phaseReadiness,
+		phase == phaseReadiness, clusterValuesFrom,
 	)
 	if err != nil {
 		return nil, err
@@ -304,34 +368,12 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 	opts.ComponentPreManifests = filteredPreManifests
 
 	// Fail fast if the layout's three-digit prefix can't accommodate the
-	// number of NNN-* folders this bundle will actually emit. Compute
-	// the count using the same pre/primary/post emission rules the main
-	// loop below applies — a worst-case 3x bound would reject valid
-	// 500-component bundles whose components emit only their primary
-	// folder. The deploy.sh template globs [0-9][0-9][0-9]-*/, so a
-	// 4-digit prefix would be silently skipped at install time.
-	folderCount := 0
-	for _, c := range opts.Components {
-		if len(opts.ComponentPreManifests[c.Name]) > 0 {
-			folderCount++ // <name>-pre
-		}
-		folderCount++ // primary
-		// Post-injection conditions mirror the per-component branch
-		// below: only meaningful for mixed components (helm repository +
-		// raw manifests), in both vendored and non-vendored mode (#1835).
-		// Manifest-only and kustomize primaries never inject a -post
-		// folder.
-		if c.Repository != "" && len(opts.ComponentPostManifests[c.Name]) > 0 {
-			folderCount++ // <name>-post
-		}
-		// Readiness gate folder applies to every component kind (it runs
-		// after the primary regardless of upstream/local/vendored), so it
-		// is not gated on Repository like the -post folder.
-		if len(opts.ComponentReadiness[c.Name]) > 0 {
-			folderCount++ // <name>-readiness
-		}
-	}
-	if folderCount > 999 {
+	// number of NNN-* folders this bundle will actually emit; a worst-case
+	// 3x bound would reject valid 500-component bundles whose components
+	// emit only their primary folder. The deploy.sh template globs
+	// [0-9][0-9][0-9]-*/, so a 4-digit prefix would be silently skipped at
+	// install time.
+	if folderCount := len(opts.releaseNames()); folderCount > 999 {
 		return WriteResult{}, errors.New(errors.ErrCodeInvalidRequest,
 			fmt.Sprintf("too many emitted folders (%d) from %d components: NNN- folder prefix supports at most 999 entries",
 				folderCount, len(opts.Components)))
@@ -449,7 +491,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 		// pods schedule. Runs regardless of vendored/non-vendored mode
 		// and regardless of primary kind (upstream-helm, local-helm, or
 		// kustomize).
-		if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePre); err != nil {
+		if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePre, ""); err != nil {
 			return WriteResult{}, err
 		} else if pf != nil {
 			folders = append(folders, *pf)
@@ -486,7 +528,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 			// Post-injection: recipe-side manifests as a tracked -post
 			// release installed after the vendored subchart, so manifests
 			// referencing the chart's CRDs apply once those CRDs exist.
-			if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePost); err != nil {
+			if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePost, dir); err != nil {
 				return WriteResult{}, err
 			} else if pf != nil {
 				folders = append(folders, *pf)
@@ -499,7 +541,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 			// Readiness gate applies to vendored components too — emit it
 			// after the wrapped chart (and any -post release) so the gate
 			// Job runs once the vendored release has installed.
-			if rf, err := opts.injectAuxiliaryFolder(idx, c, phaseReadiness); err != nil {
+			if rf, err := opts.injectAuxiliaryFolder(idx, c, phaseReadiness, dir); err != nil {
 				return WriteResult{}, err
 			} else if rf != nil {
 				folders = append(folders, *rf)
@@ -529,7 +571,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 			// apply post-install (after helm has registered the chart's CRDs).
 			// The "mixed" concept lives only here at the bundle layer — no recipe
 			// metadata involved.
-			if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePost); err != nil {
+			if pf, err := opts.injectAuxiliaryFolder(idx, c, phasePost, dir); err != nil {
 				return WriteResult{}, err
 			} else if pf != nil {
 				folders = append(folders, *pf)
@@ -582,7 +624,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 			f, err := writeLocalHelmFolder(opts.OutputDir, dir, idx, c,
 				manifests, renderInputFor(c),
 				c.Name, c.Name, true, stampFor(c, opts.AICRVersion),
-				false)
+				false, "")
 			if err != nil {
 				return WriteResult{}, err
 			}
@@ -594,7 +636,7 @@ func Write(ctx context.Context, opts Options) (WriteResult, error) {
 		// Readiness gate (non-vendored path): emit after the primary (and
 		// any -post folder) so the gate Job runs once the component's
 		// release has installed. Applies to every component kind.
-		if rf, err := opts.injectAuxiliaryFolder(idx, c, phaseReadiness); err != nil {
+		if rf, err := opts.injectAuxiliaryFolder(idx, c, phaseReadiness, dir); err != nil {
 			return WriteResult{}, err
 		} else if rf != nil {
 			folders = append(folders, *rf)
@@ -654,13 +696,20 @@ func classify(c Component, manifests map[string][]byte) FolderKind {
 // both per-folder writers (upstream-helm and local-helm) perform this
 // identical dance; keeping it in one place preserves the single-source-of-
 // truth guarantee around dynamic-values semantics.
-func writeValueFiles(folderDir string, c Component) error {
+//
+// If ownDynamic is false, cluster-values.yaml is written empty and values.yaml
+// still omits the dynamic paths.
+func writeValueFiles(folderDir string, c Component, ownDynamic bool) error {
 	split := splitDynamicPaths(c.Values, c.DynamicPaths)
 	if _, _, err := deployer.WriteValuesFile(split.static, folderDir, "values.yaml"); err != nil {
 		return errors.Wrap(errors.ErrCodeInternal,
 			fmt.Sprintf("write values.yaml for %s", c.Name), err)
 	}
-	if _, _, err := deployer.WriteValuesFile(split.dynamic, folderDir, "cluster-values.yaml"); err != nil {
+	dynamic := split.dynamic
+	if !ownDynamic {
+		dynamic = nil
+	}
+	if _, _, err := deployer.WriteValuesFile(dynamic, folderDir, "cluster-values.yaml"); err != nil {
 		return errors.Wrap(errors.ErrCodeInternal,
 			fmt.Sprintf("write cluster-values.yaml for %s", c.Name), err)
 	}

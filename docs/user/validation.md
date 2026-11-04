@@ -62,6 +62,7 @@ a component the bundler enabled at bundle time is not checked.
 - Effectively cluster-admin for the identity running `aicr validate`. Each run creates a ServiceAccount for its validator Jobs and binds it to the built-in `cluster-admin` ClusterRole through a per-run `aicr-validator-<run-id>` ClusterRoleBinding, and Kubernetes RBAC only lets you bind a role whose permissions you already hold. The run deletes the binding at cleanup; `--no-cleanup` leaves it active until you delete it yourself. AICR creates its own `aicr-validation` namespace on first run. To run without that grant, have an administrator provision the ServiceAccount instead; see [Running under a pre-provisioned ServiceAccount](#running-under-a-pre-provisioned-serviceaccount).
 - **AKS profiled recipes**: the readiness pre-flight re-evaluates the recipe's profile constraint (`K8s.aks-gpu-pools.gpu-driver`), so the snapshot must carry that reading — capture it with `aicr snapshot --aks-gpu-pools <az dump>`, or pass the same flag to `aicr validate` when it captures live. A snapshot without the reading fails readiness closed (exit 2).
 - **GKE recipes**: the readiness pre-flight re-evaluates the recipe's `gpuStack` profile constraint over the GPU-node set (nodes carrying `cloud.google.com/gke-accelerator`): the default `gke-default` value requires that **no** GPU node carries the opt-out label `gke-no-default-nvidia-gpu-device-plugin` (GKE's managed plugin stays the `nvidia.com/gpu` advertiser), while `bundle-installer` requires every GPU node to carry `gke-no-default-nvidia-gpu-device-plugin=true` (so the GPU Operator's plugin is the sole advertiser). The check fails closed (exit 2) on labels contradicting the selected value, mixed labels, malformed or ambiguous label readings, a snapshot with no identifiable GPU nodes, and when `--max-nodes-per-entry` actually truncated a participating label reading (a truncated node list cannot prove set membership — regenerate with no cap set, from the flag, `AICR_MAX_NODES_PER_ENTRY`, or `spec.snapshot.execution.maxNodesPerEntry`; a cap larger than the node count truncates nothing and validates normally). `gke-default` needs no provider projection flag. Its constraint reads node labels the standard snapshot already carries. `bundle-installer` additionally re-evaluates `K8s.gke-gpu-pools.gpu-driver-installation`, corroborating that every GPU pool was actually created with `gpu-driver-version=disabled`. That reading requires a snapshot captured with `--gke-gpu-pools <gcloud dump>` (or passed to `aicr validate --gke-gpu-pools`), and without it is unavailable, so the value fails closed. See [GKE GPU Setup](../integrator/gke-gpu-setup.md#gpu-device-plugin-ownership) for the full setup and the qualification matrix.
+- **`NodeTopology.gpu-nodes.label` readiness constraints outside GKE** (including bare metal and `--data` services): GPU nodes are those the GPU Operator labels `nvidia.com/gpu.present=true`, so capture the snapshot after it is running. A snapshot with no such node fails readiness closed (exit 2), and GPU nodes it has not labeled are not checked.
 
 ## Training performance validation
 
@@ -83,7 +84,7 @@ is installed on the cluster.
 | Check | Transport | Default applicability (from recipe criteria) |
 |---|---|---|
 | `nccl-all-reduce-bw` | Auto-detect (whatever NCCL picks) | H100/H200 on EKS, H100 on GKE (GPUDirect TCPXO), H100 on AKS (ND-series InfiniBand — NCCL's built-in IB/verbs transport over the `rdma/hca_shared_devices_a` shared device pool), and B200/GB200 on self-managed clusters (`service=any`). Preserves the pre-variant behavior. |
-| `nccl-all-reduce-bw-net` | NET (EFA on EKS by default; ConnectX RoCE via `AICR_NCCL_FABRIC=roce`; built-in IB/verbs on OKE) | GB200 + EKS, GB200 + OKE, and GB300 + EKS. Asserts the intended NET fabric actually carried traffic — EFA on EKS, the NVL72 InfiniBand east-west fabric (`nvidia.com/mlnxnics` shared HCAs) on OKE — catching silent fallback to Socket when GPUDirect RDMA is unavailable. A driver preflight gates the benchmark on the default fabric — see [Grace Blackwell NET preflight](#grace-blackwell-net-preflight-gpudirect-rdma-prerequisites). |
+| `nccl-all-reduce-bw-net` | NET (EFA on EKS; built-in IB/verbs on OKE) | GB200 + EKS, GB200 + OKE, and GB300 + EKS. Asserts the intended NET fabric actually carried traffic — EFA on EKS, the NVL72 InfiniBand east-west fabric (`nvidia.com/mlnxnics` shared HCAs) on OKE — catching silent fallback to Socket when GPUDirect RDMA is unavailable. A driver preflight gates the benchmark — see [Grace Blackwell NET preflight](#grace-blackwell-net-preflight-gpudirect-rdma-prerequisites). |
 | `nccl-all-reduce-bw-nvls` | NVLS (MNNVL across an NVL72 IMEX domain) | GB200 + EKS, GB200 + OKE, GB200 + GKE (A4X GPUDirect-RDMA/gIB carries the IMEX/NVLink fabric traffic; gIB is the transport driver, not the NCCL algorithm), GB300 (EKS, generic), and VR200 + RKE2. Asserts the NVLS communicator actually initialized. Catches silent fallback to the NET fabric (EFA on EKS, InfiniBand on OKE), or gIB/RDMA initialization failure (GKE), when the IMEX domain is misconfigured. |
 
 The applicability column is the *default*, derived from the recipe's
@@ -93,18 +94,6 @@ benchmarks explicitly — either by
 whose fabric matches its hardware, or, for a private service whose fabric
 matches no embedded template, by
 [supplying its own benchmark runtime](#supplying-a-benchmark-runtime-for-a-private-service).
-
-On EKS, the `-net` check defaults to the AWS EFA fabric. On a ConnectX **RoCE** cluster
-(e.g. DGXC GB300 `p6e-gb300r`), set `AICR_NCCL_FABRIC=roce` in the `aicr
-validate` environment to run the NET test over NCCL's built-in IB/verbs
-transport across `roce.networking.k8s.aws` DRA devices instead. The value is
-scoped to the `-net` check only; unset (or `efa`) leaves every existing recipe
-on the EFA path unchanged, and any other value is rejected. The RoCE runtime
-image installs `openssh-server` at startup, so the GPU nodes need apt egress;
-on an air-gapped cluster the RoCE NET test cannot bootstrap. This env override is
-interim — snapshot-based fabric auto-detection (and removing the runtime
-package install once a CUDA-13 image ships sshd) is tracked in
-[NVIDIA/aicr#1413](https://github.com/NVIDIA/aicr/issues/1413).
 
 **Overriding the NCCL workload image with `AICR_NCCL_RUNTIME_IMAGE`.** Each
 embedded `nccl-all-reduce-bw` / `-net` / `-nvls` template pins a specific
@@ -164,7 +153,7 @@ GB200/OKE training recipes follow the same pattern and enable `-net` and
 On OKE, `-net` exercises the NVL72 rack's InfiniBand east-west fabric
 (`rdma0-3`, advertised as `nvidia.com/mlnxnics` by the recipe's
 `rdmaSharedDevicePlugin` NicClusterPolicy) over NCCL's built-in IB/verbs
-transport — no EFA or RoCE plumbing is involved. Both variants were validated
+transport — no EFA plumbing is involved. Both variants were validated
 end to end on a `BM.GPU.GB200.4` NVL72 rack.
 
 ```bash
@@ -244,11 +233,7 @@ catches that on its own — it fails on a `Using network Socket` banner rather
 than reporting a figure — so the preflight exists to fail fast, naming the
 driver, instead of after a full benchmark run.
 
-The preflight runs on the default fabric only: EFA on EKS, built-in IB/verbs on
-OKE. `AICR_NCCL_FABRIC=roce` is EKS-only: there it selects a different template
-and skips the preflight, so the benchmark runs ungated. On OKE the RoCE
-combination is unsupported, so carrying the variable over makes the declared
-`-net` check skip entirely rather than run.
+The preflight covers both NET fabrics: EFA on EKS and built-in IB/verbs on OKE.
 
 **Before R595** — which includes `580.173.02`, the version AICR pins — the
 driver must be loaded with `NVreg_GrdmaPciTopoCheckOverride=1`. Without it the
@@ -298,9 +283,12 @@ whether it is unreadable or carries an unrecognised banner.
 
 **Driver not loaded** is a fourth outcome, reached before any file is read: when
 `/proc/driver/nvidia` does not exist on a target node, the kubelet refuses the
-probe pod's hostPath mount and the preflight names that node as driver-absent
-instead of reporting a bare timeout or sending you to set the flag. There is no
-parameter to set until a driver is loaded. Finish the driver rollout (GPU
+probe pod's hostPath mount. If the preflight reads the kubelet's
+`hostPath type check failed` event and it is still the probe pod's latest
+event, it names that node as driver-absent instead of sending you to set the
+flag. Otherwise (the events cannot be read, none matches, or a later event
+for the pod has superseded it) it returns the original wait timeout. There
+is no parameter to set until a driver is loaded. Finish the driver rollout (GPU
 Operator `nvidia-driver` DaemonSet Ready, or a node image that ships the driver
 on OKE `oci-managed`) and re-run. The kubelet leaves the pod in
 `ContainerCreating`, so this surfaces after the probe's wait (up to two
@@ -531,22 +519,54 @@ validation:
 
 Both constraints are floors. The checks compare the measured value with `>=`
 and refuse any other operator rather than evaluating it as a floor anyway, so a
-constraint they cannot honor fails before any GPU work starts. Note the goodput
-units: the measurement is a ratio between 0 and 1, so a constraint written as a
+constraint they cannot honor fails before any GPU work starts. The bandwidth
+check applies the constraint the way `nccl-all-reduce-bw` does: it passes at 90%
+of the value, so the same `>= 300` means the same under either backend. The
+goodput check passes at the value itself. Note the goodput units: the measurement is a ratio between 0 and 1, so a constraint written as a
 percentage (`>= 50`) can never be satisfied.
 
 | Check | What it measures | Qualified combinations |
 |---|---|---|
 | `nccl-cre-all-reduce-bw` | Bus bandwidth from a CRE `Certification` `BandwidthMeasurement`; AICR still asserts the transport from launcher logs | `eks` x `h100` |
-| `cre-training-goodput` | Runtime goodput from a CRE `Certification` `GoodputMeasurement` | none at present |
+| `cre-training-goodput` | Runtime goodput from a CRE `Certification` `GoodputMeasurement` | `eks` x `h100` |
 
 The catalog entry each check drives, and the node footprint it runs on, come
 from the qualification record rather than the check: for
 `nccl-cre-all-reduce-bw` on `eks` x `h100`, `communication/nccl-all-reduce` on
-two nodes. A combination with no entry skips, because it has no calibrated
-threshold to judge against. `cre-training-goodput` skips everywhere today — the
-`training/nemotron5-8b` entry it drives does not run on the CRE version the
-registry pins, so declaring the check reports a skip rather than a verdict.
+two nodes, and for `cre-training-goodput` on `eks` x `h100`,
+`training/nemotron5-8b` on two nodes. A combination that no entry records as
+qualified skips with an unsupported-target reason.
+
+#### Relation to the TrainJob check
+
+On `eks` x `h100`, `nccl-cre-all-reduce-bw`
+reads 1.65 GB/s (0.34%) higher than `nccl-all-reduce-bw` on the same two nodes:
+six back-to-back pairs on NVCRE v0.8.2 gave 486.76 to 489.01 GB/s for the
+TrainJob check and 489.63 to 490.03 GB/s for the CRE check, with a per-pair
+offset of 0.92 to 3.14 GB/s. Both ran over `Using network Libfabric`; the CRE
+check asserts that from its launcher log, and the TrainJob check's default
+template logs at `NCCL_DEBUG=WARN` so it cannot show it. That is the one
+difference in what the two checks demand: the CRE check fails a run that fell
+back to Socket, and the TrainJob check does not look. Both pass at 90% of the
+constraint value, so a recipe can carry the same `>= 300` for either backend
+and both use the same floor. The two measured bandwidths differ by 0.92 to
+3.14 GB/s per pair (1.65 GB/s on average), so a cluster that lands near the
+floor can still pass one check and fail the other. The CRE check applied the
+value without the 10% allowance before this was aligned; a CRE constraint that
+had been written as 0.9 times the TrainJob value to compensate should be reset
+to the TrainJob value. The offset was measured on one cluster, and no run
+landed near the boundary, so it does not show that the two verdicts agree at
+it.
+
+The goodput figure depends on the step count, because startup time counts
+against it. The step count comes from the NVCRE catalog entry, so a figure
+belongs to the CRE version that produced it: 0.5723 on two nodes with the
+pinned v0.8.2 (462.05 TFLOPS per GPU), and 0.5835 on v0.6.0, both measured on a
+NodeWright-tuned cluster. Both are single measurements, so set the constraint
+as a floor below the value your cluster reaches, not at it. Run it on nodes
+that completed NodeWright tuning: on a cluster that had not, with the distro
+EFA driver, no hugepages, and an 8 MB memlock limit, a two-node run hung in NCCL
+initialization. Which of those differences causes it was not isolated.
 
 **Reclaiming an interrupted run.** Both checks delete their `Certification` and
 confirm its `TrainJob`s and workload pods are gone, but a validator pod killed
@@ -953,17 +973,22 @@ Three properties make it a scoping tool rather than a way to hide a failure:
 
 The CNCF conformance evidence path is different, and the two flags are refused
 together for that reason. `pkg/evidence/cncf` renders one markdown file per
-*requirement* and drops every skipped entry before grouping, so a requirement
-whose checks were all skipped would produce no file and no index entry, with
-nothing recording the omission. A submission that silently omits a requirement
-reads as complete when it is not, so `--skip-check` with `--evidence-dir` (and
-therefore with `--cncf-submission`, which requires it) is rejected up front:
+*requirement* of the upstream checklist version selected from the cluster's
+Kubernetes minor (see [Checklist Versions](https://github.com/NVIDIA/aicr/blob/main/docs/conformance/cncf/index.md#checklist-versions))
+and drops every skipped entry before grouping, so a requirement whose checks
+were all withheld gets no page and, when another submission-required check
+produced an entry so an index is written at all, appears there only as
+`NOT TESTED (not run)`, with nothing recording that it was withheld on purpose
+rather than never reached. A submission that misstates why a requirement is
+missing is the defect the guards exist to prevent, so `--skip-check` with
+`--evidence-dir` (and therefore with `--cncf-submission`, which requires it)
+is rejected up front:
 
 ```
 [INVALID_REQUEST] --skip-check cannot be combined with --evidence-dir: the CNCF
-evidence renderer omits skipped checks entirely, so a withheld requirement would
-leave no file and no index entry and the rendered evidence would read as a
-complete submission
+evidence renderer gives a withheld requirement no page and, when it writes an
+index at all, lists it only as NOT TESTED (not run) with no reason recorded, so
+the rendered evidence would misstate why the requirement is missing
 ```
 
 Lifting that restriction means deciding how a withheld requirement should be
@@ -1084,11 +1109,12 @@ The bundle is **minimized by default**. `snapshot.yaml` keeps only an
 allowlisted set of fields (dropping node names, provider instance IDs, the
 node label/taint set, OS tuning, loaded modules, and systemd config) and the
 CTRF reports omit per-test stdout/message. Each test's CTRF `extra` keeps only
-allowlisted counts, measurements, thresholds, versions, allocation modes, and
-skip-reason codes, never node names or IPs, and is omitted when none remain.
-The signed predicate records the applied policy in a `redaction` block, and the
-bundle self-verifies exactly like a full one. Pass `--full` to publish the raw
-payloads instead.
+allowlisted counts, measurements, thresholds, versions, allocation modes,
+transport, fabric, and runtime-source codes, the `nodeLocal` and
+`versionSatisfied` booleans, and skip-reason codes, never node names or IPs, and
+is omitted when none remain. The signed predicate records the applied policy in
+a `redaction` block, and the bundle self-verifies exactly like a full one. Pass
+`--full` to publish the raw payloads instead.
 
 Commit `pointer.yaml` to its per-source path
 `recipes/evidence/<recipe>/<src>/<digest>.yaml` — the emit output prints

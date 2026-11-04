@@ -60,7 +60,7 @@ type BundleArtifact = *result.Output
 //
 // # Two ways to supply the bundler configuration
 //
-// The 18 flat fields below (Deployer through AppName) are what
+// The 19 flat fields below (Deployer through ArgoCD) are what
 // Config.BundleOptions derives from spec.bundle, field by field, so a
 // config-driven caller (the CLI in particular) can read and override
 // individual settings with its own flag precedence instead of reaching into
@@ -74,14 +74,14 @@ type BundleArtifact = *result.Output
 // spec.bundle counterpart) and the aicrd /v1/bundle handler (built from HTTP
 // query parameters via bundler.ParseBundleConfig, then mutated in place with
 // bundlercfg.WithAttest once the request's signing decision is known). When
-// Config is non-nil, it WINS outright over the 18 flat fields it supersedes
-// (Deployer through AppName — bundlerConfig's own inputs) — the same
+// Config is non-nil, it WINS outright over the 19 flat fields it supersedes
+// (Deployer through ArgoCD — bundlerConfig's own inputs) — the same
 // derive-don't-apply precedence Attester already documents against
 // OIDCResolve. Config.BundleOptions never sets Config, so a config-driven
 // derivation always routes through the flat fields.
 //
 // Config does NOT reach Attester, OIDCResolve, BinaryAttestation, OutputDir
-// or Timeout: bundlerConfig() only ever reads Config in place of the 18
+// or Timeout: bundlerConfig() only ever reads Config in place of the 19
 // bundler-config fields, so these five stay caller-supplied regardless of
 // Config. The REST /v1/bundle handler depends on this split — it sets Config
 // and OutputDir/Timeout in the same BundleOptions literal and requires both
@@ -103,7 +103,10 @@ type BundleArtifact = *result.Output
 // Attest and Attester together.
 type BundleOptions struct {
 	// Config carries an already-built bundler configuration and, when
-	// non-nil, wins over the 18 flat fields below (Deployer through AppName).
+	// non-nil, wins over the 19 flat fields below (Deployer through ArgoCD)
+	// and over Split: a split set then needs config.WithSplit on the Config,
+	// and MakeBundle rejects Split=true with a Config that lacks it rather
+	// than silently producing an ordinary bundle.
 	// It does NOT override Attester, OIDCResolve, BinaryAttestation,
 	// OutputDir or Timeout — see "Two ways to supply the bundler
 	// configuration" above. When both Config and every flat field are unset,
@@ -184,6 +187,26 @@ type BundleOptions struct {
 	// every bundle and HelmOp for fleet, where it must be a DNS-1123 label.
 	// Empty means each deployer applies its own default. See #1011.
 	AppName string
+
+	// ArgoCD carries the Argo CD bundle settings for the argocd and
+	// argocd-helm deployers: child Application name prefix, destination,
+	// project, cascade delete, and sync retry. A nil field is unset. They
+	// replace the deprecated `deployer:<key>` entries in ValueOverrides;
+	// giving the same setting both ways fails MakeBundle with
+	// ErrCodeInvalidRequest. See #3264.
+	ArgoCD config.ArgoCDSettings
+
+	// Split renders a class-partitioned bundle set (ADR-018): one directory
+	// per registry class with enabled components, under a set root holding
+	// recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and, with
+	// Attest, the attestation. Requires an absent OutputDir whose parent
+	// exists; the set is published there with one atomic move. Supported only
+	// with the helm deployer. Off by default. Unlike the flat fields above, no
+	// config file setting derives it: SDK callers set it here, while the CLI
+	// and REST surfaces carry it through config.WithSplit on Config. A non-nil
+	// Config supersedes this field; MakeBundle rejects Split=true when that
+	// Config does not carry it.
+	Split bool
 
 	// Attester signs bundle content. When nil, MakeBundle derives one from
 	// OIDCResolve; when both are unset, the no-op attester applies (matching
@@ -266,7 +289,9 @@ func (o BundleOptions) bundlerConfig() *BundleConfig {
 		config.WithStorageClass(o.StorageClass),
 		config.WithSharedStorageClass(o.SharedStorageClass),
 		config.WithVendorCharts(o.VendorCharts),
+		config.WithSplit(o.Split),
 		config.WithAppName(o.AppName),
+		config.WithArgoCDSettings(o.ArgoCD),
 		config.WithAttest(o.Attest),
 		config.WithCertificateIdentityRegexp(o.CertIDRegexp),
 	}
@@ -506,6 +531,14 @@ func (c *Client) MakeBundle(ctx context.Context, recipe *RecipeResult, opts Bund
 	}
 
 	cfg := opts.bundlerConfig()
+	// Config supersedes the flat fields, Split included. A caller who sets
+	// both and disagrees would otherwise get an ordinary bundle with none
+	// of the split checks and no error.
+	if opts.Config != nil && opts.Split && !cfg.Split() {
+		return nil, errors.New(errors.ErrCodeInvalidRequest,
+			"BundleOptions.Split=true is superseded by BundleOptions.Config, which does not enable split; "+
+				"build the Config with config.WithSplit(true) or leave Config unset")
+	}
 
 	bundlerOpts := []bundler.Option{bundler.WithConfig(cfg)}
 	// Attester wins when supplied; otherwise derive one from OIDCResolve. The

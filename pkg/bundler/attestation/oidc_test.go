@@ -16,16 +16,20 @@ package attestation
 
 import (
 	"context"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/errors"
+	"github.com/NVIDIA/aicr/pkg/errors/errorstest"
 )
 
 func TestFetchAmbientOIDCToken(t *testing.T) {
@@ -188,8 +192,9 @@ func TestFetchAmbientOIDCToken_CancelledContext(t *testing.T) {
 
 	_, err := FetchAmbientOIDCToken(ctx, "http://localhost:1", "token")
 	if err == nil {
-		t.Error("FetchAmbientOIDCToken() with cancelled context should return error")
+		t.Fatal("FetchAmbientOIDCToken() with cancelled context should return error")
 	}
+	errorstest.WantReportedCode(t, err, errors.ErrCodeCanceled)
 }
 
 func TestFetchAmbientOIDCToken_InvalidResponseJSON(t *testing.T) {
@@ -219,5 +224,36 @@ func TestFetchDeviceCodeOIDCToken_CancelledContext(t *testing.T) {
 	}
 	if !stderrors.Is(err, context.Canceled) {
 		t.Fatalf("FetchDeviceCodeOIDCToken() error = %v, want wrapped context.Canceled", err)
+	}
+	errorstest.WantReportedCode(t, err, errors.ErrCodeCanceled)
+}
+
+// TestFetchAmbientOIDCTokenAttempt_ClosesIdleConnections is a regression
+// test for #3298: each attempt used to build a fresh *http.Transport and
+// never close it, leaking idle-connection goroutines for up to
+// HTTPIdleConnTimeout. Asserts goroutine count stays flat across repeated
+// attempts.
+func TestFetchAmbientOIDCTokenAttempt_ClosesIdleConnections(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"value": "test-token"}) //nolint:errcheck // test server
+	}))
+	defer server.Close()
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for i := 0; i < 20; i++ {
+		if _, _, err := fetchAmbientOIDCTokenAttempt(context.Background(), server.URL, "dummy-token"); err != nil {
+			t.Fatalf("attempt %d: %v", i, err)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+	after := runtime.NumGoroutine()
+
+	if delta := after - before; delta > 5 {
+		t.Errorf("goroutine leak: before=%d after=%d delta=%d (want <=5)", before, after, delta)
 	}
 }

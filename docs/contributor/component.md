@@ -53,6 +53,7 @@ Kustomize limitations to know up front:
 ```yaml
 - name: my-operator
   displayName: My Operator
+  class: ops  # core or ops (ADR-018); required for every embedded entry
   valueOverrideKeys:
     - myoperator
   helm:
@@ -66,7 +67,17 @@ Kustomize limitations to know up front:
       tolerationPaths:   [operator.tolerations]
 ```
 
-**2. Create `recipes/components/my-operator/values.yaml`** with the
+**2. Add the component's row** to the Components table in
+[`docs/user/component-catalog.md`](../user/component-catalog.md#components),
+with its `class` in the Class column. `TestComponentCatalogClassColumnMatchesRegistry`
+fails `make qualify` when a registry entry has no row or the two disagree,
+and `TestEmbeddedRegistryDeclaresClass` fails when an embedded entry omits
+`class`. Pick the class by the rule in
+[recipe.md](recipe.md#registry-recipesregistryyaml): `core` is what a plain GPU pod
+needs to run, with its fabric and install prerequisites; `ops` is
+everything else, workload platforms included.
+
+**3. Create `recipes/components/my-operator/values.yaml`** with the
 chart defaults you want every recipe to start from. Keep this file
 minimal and widely applicable — cluster-specific tweaks belong in
 `values-<context>.yaml` siblings referenced from an overlay.
@@ -79,7 +90,7 @@ operator:
   replicas: 1
 ```
 
-**3. Optional blocks** on the registry entry:
+**4. Optional blocks** on the registry entry:
 
 - `validations:` — bundle-time misconfiguration warnings ([validator.md](validator.md#component-validations-bundle-time))
 - `healthCheck.assertFile:` — chainsaw conformance assertions ([validator.md](validator.md))
@@ -93,12 +104,12 @@ operator:
 - `podScheduling.workload.workloadSelectorPaths` — for workload-pod placement
 - `gkeCriticalPriority`, `hasSelfRefCRDs`, `manifestsUseChartCRDs` — narrow service-specific quirks (see godoc on `ComponentConfig` for when these apply)
 
-**4. Run `make bom-docs`** and commit the regenerated
+**5. Run `make bom-docs`** and commit the regenerated
 `docs/user/container-images.md` in the same PR. CLAUDE.md treats this
 as a hard rule whenever you change `registry.yaml`, a component's
 `values.yaml`, or any chart version pin. See [BOM regeneration](#bom-regeneration).
 
-**5. Run `make qualify`** — covers tests, lint, and the recipe-resolution
+**6. Run `make qualify`** — covers tests, lint, and the recipe-resolution
 suite that parses every registry entry.
 
 ## Adding a Kustomize Component
@@ -106,6 +117,7 @@ suite that parses every registry entry.
 ```yaml
 - name: my-kustomize-app
   displayName: My Kustomize App
+  class: ops  # core or ops (ADR-018); required for every embedded entry
   valueOverrideKeys:
     - mykustomize
   kustomize:
@@ -114,7 +126,8 @@ suite that parses every registry entry.
     defaultTag: v1.0.0
 ```
 
-No `recipes/components/<name>/values.yaml` is required — Kustomize
+The catalog row (step 2 above) is required here too. No
+`recipes/components/<name>/values.yaml` is required — Kustomize
 reads its inputs from the upstream source. Reminder: no `--set`
 overrides, and `nodeScheduling` paths do not apply.
 
@@ -128,6 +141,7 @@ One-liner per field:
 |---|---|
 | `name` | Component identifier; must match `componentRefs[].name` in overlays |
 | `displayName` | Human-readable label used in CLI output and bundle templates |
+| `class` | Bundle class, `core` or `ops` ([ADR-018](https://github.com/NVIDIA/aicr/blob/main/docs/design/018-class-partitioned-bundles.md)); required on every embedded entry, defaults to `core` in an external `--data` registry. Must match the component's row in `docs/user/component-catalog.md` |
 | `valueOverrideKeys` | Alt prefixes for `--set <key>:path=value` matching |
 | `helm.defaultRepository` | Helm repo URL injected when an overlay leaves it empty |
 | `helm.defaultChart` | Chart name (e.g. `nvidia/gpu-operator`) |
@@ -148,10 +162,12 @@ One-liner per field:
 | `validations` | Bundle-time component check list ([validator.md](validator.md#component-validations-bundle-time)) |
 | `healthCheck.assertFile` | Chainsaw assert YAML path (relative to data dir) |
 | `upgrades.file` | Path to a `ComponentUpgrades` transition record (relative to data dir); empty means no transition records ([recipe.md](recipe.md#transition-records)) |
-| `ownsCRDs` | Audited assertion that the component solely owns every CRD its chart ships and none uses webhook conversion, so deployers may replace its CRDs on upgrade instead of leaving them at their first-install schema. Audited chart versions are pinned in `pkg/recipe/ownscrds_audit_test.go`; per-deployer behavior is in the [component catalog](../user/component-catalog.md#upgrade-uninstall-and-troubleshooting) |
-| `ownsCRDsExcludeSubcharts` | Bare subchart names whose CRDs an `ownsCRDs` component does not own. The bundle's `apply-crds.sh` otherwise collects every `crds/` directory in the chart, disabled subcharts included, and would re-apply a CRD another component owns at this chart's schema. `nvsentinel` lists `mongodb-store`, whose Percona CRDs belong to `psmdb-operator`. Valid only with `ownsCRDs` |
+| `ownsCRDs` | Audited assertion that the component solely owns every CRD its chart ships and none uses webhook conversion, so deployers may replace its CRDs on upgrade instead of leaving them at their first-install schema. Audited chart versions are pinned in `pkg/recipe/ownscrds_audit_test.go`. Per-deployer behavior is in the [component catalog](../user/component-catalog.md#upgrading-components-that-own-crds) |
+| `ownsCRDsExcludeSubcharts` | Bare subchart names whose CRDs an `ownsCRDs` component does not own. The bundle's `apply-crds.sh` otherwise collects every `crds/` directory in the chart, disabled subcharts included, and would re-apply a CRD another component owns at this chart's schema. `nvsentinel` lists `mongodb-store`, whose Percona CRDs belong to `psmdb-operator`; `nktp` lists `prometheus-crds`, whose CRDs belong to `prometheus-operator-crds`, and `opentelemetry-operator`, whose `conf/crds/` holds Helm templates the collection would otherwise pick up. `TestCRDExclusionsMatchChart` checks each entry against the pinned chart. Valid only with `ownsCRDs` |
 | `manifestFiles` | Default manifest YAML paths bundled when the componentRef declares none (ref-declared lists take precedence). No opt-out: an empty ref-declared list is indistinguishable from absent (len == 0 → defaults filled) — to suppress the defaults, declare a replacement list. Helm components only; the loader rejects the combination with `kustomize:` |
 | `mixinSafeOverridePaths` | Exact dotted value paths (e.g. `global.tracing.enabled`) a `RecipeMixin` may set on this component via `Overrides`. Empty (the default) means the component hasn't opted into mixin overrides — a mixin introducing it fresh still has unrestricted `valuesFile`/`overrides`, but once the component is already in the chain (or has a non-empty allowlist), every mixin Overrides path is validated against this list ([recipe.md](recipe.md#mixin-composition)) |
+| `telemetry.promql` | `monitorsFrom` (components whose monitors expose the data) and `series` (RE2 patterns on the scraped metric name) a component queries from the runtime Prometheus server ([recipe-development.md](../integrator/recipe-development.md#runtime-metrics-declarations)) |
+| `telemetry.promqlServer` | `namespaceSelectorPaths`, `monitorSelectorPaths`, `scrapeClassesPath`: value paths the bundler owns on the runtime Prometheus server and fills from the enabled consumers' declarations |
 | `gkeCriticalPriority`, `hasSelfRefCRDs`, `manifestsUseChartCRDs` | Narrow service-specific flags (see godoc) |
 
 ## `nodeScheduling.system` vs `accelerated`
@@ -381,7 +397,7 @@ pods depend on).
 
 ## Deployers
 
-AICR ships six output adapters in
+AICR ships seven output adapters in
 [`pkg/bundler/deployer/`](https://github.com/NVIDIA/aicr/tree/main/pkg/bundler/deployer):
 `helm`, `helmfile`, `argocd`, `argocd-helm`, `flux`, `terraform`, `fleet`. Each calls
 `localformat.Write()` and then layers its own orchestration files

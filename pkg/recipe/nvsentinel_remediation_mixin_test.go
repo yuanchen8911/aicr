@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -79,6 +80,38 @@ func remediationLeaf(mixins ...string) RecipeMetadataSpec {
 	}
 }
 
+// assertPostRebootValidation pins post-remediation validation (#3089) to
+// reboots: one rule set requesting dcgm-diag-test for a fatal GPU event whose
+// action was RESTART_VM (15) or RESTART_BM (24), and none for a GPU reset.
+func assertPostRebootValidation(t *testing.T, mixin string, overrides map[string]any) {
+	t.Helper()
+	fq, _ := overrides["fault-quarantine"].(map[string]any)
+	validation, _ := fq["validation"].(map[string]any)
+	if validation["enabled"] != true {
+		t.Errorf("%s: fault-quarantine.validation.enabled = %v, want true", mixin, validation["enabled"])
+	}
+	ruleSets, _ := validation["ruleSets"].([]any)
+	if len(ruleSets) != 1 {
+		t.Fatalf("%s: fault-quarantine.validation.ruleSets = %v, want one post-reboot rule set", mixin, validation["ruleSets"])
+	}
+	ruleSet, _ := ruleSets[0].(map[string]any)
+	if tests, _ := ruleSet["tests"].([]any); !slices.Equal(tests, []any{"dcgm-diag-test"}) {
+		t.Errorf("%s: rule set tests = %v, want [dcgm-diag-test]", mixin, ruleSet["tests"])
+	}
+	match, _ := ruleSet["match"].(map[string]any)
+	all, _ := match["all"].([]any)
+	if len(all) != 1 {
+		t.Fatalf("%s: rule set match.all = %v, want one HealthEvent expression", mixin, match["all"])
+	}
+	rule, _ := all[0].(map[string]any)
+	expression, _ := rule["expression"].(string)
+	const want = "event.componentClass == 'GPU' && event.isFatal == true && event.recommendedAction in [15, 24]"
+	if got := strings.Join(strings.Fields(expression), " "); got != want {
+		t.Errorf("%s: rule set expression %q, want %q: only fatal GPU faults repaired by RESTART_VM (15) or "+
+			"RESTART_BM (24)", mixin, got, want)
+	}
+}
+
 // TestMixinNVSentinelRemediationSteps_Compose pins what each step turns on.
 // The quarantine step leaves fault-remediation off on purpose: without janitor
 // nothing acts on the repair requests it creates, yet it labels each node
@@ -131,10 +164,25 @@ func TestMixinNVSentinelRemediationSteps_Compose(t *testing.T) {
 					t.Errorf("%s overrides = %v, want only processingStrategy", monitor, section)
 				}
 			}
-			wantKeys := []string{"global", "gpu-health-monitor", "syslog-health-monitor"}
+			// Drain timing is the same in every step, so the dry run
+			// rehearses the live drain; the bundler adds the drain scope.
+			wantDrainer := map[string]any{
+				"deleteAfterTimeoutMinutes": 300,
+				"evictionTimeoutInSeconds":  "60",
+				"drainGPUPods":              false,
+				"partialDrainEnabled":       false,
+			}
+			if got := nvsentinel.Overrides["node-drainer"]; !reflect.DeepEqual(got, wantDrainer) {
+				t.Errorf("node-drainer overrides = %v, want %v", got, wantDrainer)
+			}
+			wantKeys := []string{"global", "gpu-health-monitor", "node-drainer", "syslog-health-monitor"}
 			if slices.Contains(step.enables, "faultRemediation") {
 				wantKeys = append(wantKeys, "fault-remediation")
 				assertComponentResetIsGPUReset(t, step.mixin, nvsentinel.Overrides)
+			}
+			if step.mixin == "nvsentinel-remediation" {
+				wantKeys = append(wantKeys, "fault-quarantine")
+				assertPostRebootValidation(t, step.mixin, nvsentinel.Overrides)
 			}
 			if slices.Contains(step.enables, "janitorProvider") {
 				wantKeys = append(wantKeys, "janitor-provider")
@@ -221,11 +269,12 @@ func TestMixinNVSentinelRemediation_ComposesOntoEveryLeaf(t *testing.T) {
 	}
 }
 
-// TestNoShippedRecipeAdoptsRemediationMixins keeps every step opt-in: existing
-// recipes stay monitoring-only unless an operator selects a capability.
-// Checked by declaration (the base included, since mixins accumulate down the
-// chain), by resolved overrides, and by resolved values, since a values file
-// can turn a toggle on without any override.
+// TestNoShippedRecipeAdoptsRemediationMixins keeps every step, and the
+// external-remediation routing that rides on them, opt-in: existing recipes
+// stay monitoring-only unless an operator selects a capability. Checked by
+// declaration (the base included, since mixins accumulate down the chain), by
+// resolved overrides, and by resolved values, since a values file can turn a
+// toggle on without any override.
 func TestNoShippedRecipeAdoptsRemediationMixins(t *testing.T) {
 	ctx, store := remediationStore(t)
 
@@ -234,6 +283,9 @@ func TestNoShippedRecipeAdoptsRemediationMixins(t *testing.T) {
 			if slices.Contains(mixins, step.mixin) {
 				t.Errorf("%s adopts %s; the remediation steps stay opt-in", where, step.mixin)
 			}
+		}
+		if slices.Contains(mixins, externalRemediationMixin) {
+			t.Errorf("%s adopts %s; external remediation stays opt-in", where, externalRemediationMixin)
 		}
 	}
 	adopts("recipes/overlays/base.yaml", store.Base.Spec.Mixins)
@@ -579,4 +631,85 @@ func TestRemediationRebootImageIsInitContainerImage(t *testing.T) {
 	if !strings.Contains(string(body), row) {
 		t.Errorf("%s has no remediation table row for %s -- the reboot image must stay documented", docs, image)
 	}
+}
+
+// TestMixinNVSentinelDatastoreEKS pins the storage edge ADR-018 declares for
+// the datastore on EKS: composed after a datastore step, the mixin adds
+// nvsentinel-mongodb -> aws-ebs-csi-driver on every EKS leaf, so the driver
+// deploys first. Composed before the step it fails loudly, because it would
+// introduce nvsentinel-mongodb and the step's own type for that component
+// then conflicts; on a service that declares no aws-ebs-csi-driver the edge
+// dangles and resolution rejects it.
+func TestMixinNVSentinelDatastoreEKS(t *testing.T) {
+	const storageMixin = "nvsentinel-datastore-eks"
+	ctx := context.Background()
+	store, err := buildMetadataStore(ctx, defaultEmbeddedProvider)
+	if err != nil {
+		t.Fatalf("buildMetadataStore: %v", err)
+	}
+	if _, ok := store.Mixins[storageMixin]; !ok {
+		t.Fatalf("%s mixin not present; check recipes/mixins/%s.yaml", storageMixin, storageMixin)
+	}
+
+	eksLeaves, otherLeaf := 0, ""
+	for name, overlay := range store.Overlays {
+		if overlay.Spec.Criteria == nil {
+			continue
+		}
+		if overlay.Spec.Criteria.Service != CriteriaServiceEKS {
+			if otherLeaf == "" {
+				otherLeaf = name
+			}
+			continue
+		}
+		eksLeaves++
+		overlay.Spec.Mixins = append(overlay.Spec.Mixins, observeMixin, storageMixin)
+		t.Run(name, func(t *testing.T) {
+			result, err := store.BuildRecipeResult(ctx, overlay.Spec.Criteria)
+			if err != nil {
+				t.Fatalf("resolving %s with %s and %s composed: %v", name, observeMixin, storageMixin, err)
+			}
+			mongodb := result.GetComponentRef("nvsentinel-mongodb")
+			if mongodb == nil {
+				t.Fatalf("%s: nvsentinel-mongodb missing from the resolved recipe", name)
+			}
+			if !slices.Contains(mongodb.DependencyRefs, "aws-ebs-csi-driver") {
+				t.Fatalf("%s: nvsentinel-mongodb dependencyRefs = %v, want aws-ebs-csi-driver", name, mongodb.DependencyRefs)
+			}
+			driver := slices.Index(result.DeploymentOrder, "aws-ebs-csi-driver")
+			datastore := slices.Index(result.DeploymentOrder, "nvsentinel-mongodb")
+			if driver < 0 || datastore < 0 || driver > datastore {
+				t.Errorf("%s: deploymentOrder = %v, want aws-ebs-csi-driver before nvsentinel-mongodb", name, result.DeploymentOrder)
+			}
+		})
+	}
+	if eksLeaves == 0 {
+		t.Fatal("no EKS leaf overlays found; the mixin was never composed")
+	}
+
+	t.Run("before the datastore step", func(t *testing.T) {
+		spec := remediationLeaf(storageMixin, observeMixin)
+		_, err := store.mergeMixins(ctx, &spec)
+		if err == nil {
+			t.Fatal("composing the storage mixin before the datastore step succeeded; it must be listed after")
+		}
+		if !strings.Contains(err.Error(), "identity/sourcing field") {
+			t.Fatalf("error = %v, want an identity-field conflict on nvsentinel-mongodb", err)
+		}
+	})
+
+	t.Run("without aws-ebs-csi-driver", func(t *testing.T) {
+		if otherLeaf == "" {
+			t.Skip("no non-EKS leaf in the catalog")
+		}
+		overlay := store.Overlays[otherLeaf]
+		overlay.Spec.Mixins = append(overlay.Spec.Mixins, observeMixin, storageMixin)
+		_, err := store.BuildRecipeResult(ctx, overlay.Spec.Criteria)
+		if err == nil {
+			t.Fatalf("resolving %s with %s composed succeeded; the aws-ebs-csi-driver edge dangles there", otherLeaf, storageMixin)
+		}
+		if !strings.Contains(err.Error(), "aws-ebs-csi-driver") {
+			t.Fatalf("error = %v, want the dangling aws-ebs-csi-driver dependency named", err)
+		}
+	})
 }

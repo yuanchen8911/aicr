@@ -35,6 +35,15 @@ const (
 	// PCI enumeration and kernel module listing are fast local operations
 	// reading from sysfs/procfs, so a short timeout is sufficient.
 	NFDDetectionTimeout = 5 * time.Second
+
+	// HostReadTimeout is how long the OS collector waits on one procfs read
+	// before skipping the file. A healthy read returns in microseconds.
+	HostReadTimeout = 1 * time.Second
+
+	// MaxStalledHostReads is how many procfs reads the sysctl sweep abandons
+	// before skipping the rest of the subtype. Each abandoned read holds an OS
+	// thread until the kernel returns.
+	MaxStalledHostReads = 3
 )
 
 // Node topology collector constants.
@@ -251,8 +260,26 @@ const (
 	// K8sJobCompletionTimeout is the default timeout for job completion.
 	K8sJobCompletionTimeout = 5 * time.Minute
 
+	// AgentExitGracePeriod is how long the snapshot CLI waits for the agent
+	// Job to complete after the agent writes this run's snapshot. Past it, the
+	// CLI returns the snapshot with a warning. A healthy Job completes within
+	// seconds of the write.
+	AgentExitGracePeriod = 30 * time.Second
+
 	// K8sCleanupTimeout is the timeout for cleanup operations.
 	K8sCleanupTimeout = 30 * time.Second
+
+	// ClusterCleanupHelmUninstallTimeout bounds one helm uninstall --wait
+	// issued by tools/cleanup.
+	ClusterCleanupHelmUninstallTimeout = 2 * time.Minute
+
+	// ClusterCleanupNamespaceDeleteWait is how long tools/cleanup waits for
+	// deleted namespaces before clearing finalizers in any still Terminating.
+	ClusterCleanupNamespaceDeleteWait = 10 * time.Second
+
+	// ClusterCleanupHelmOutputLimit caps the stdout tools/cleanup reads from
+	// one helm list or helm get values call.
+	ClusterCleanupHelmOutputLimit int64 = 16 << 20
 
 	// K8sServiceAccountVerifyTimeout bounds the read-only ServiceAccount Get
 	// and SubjectAccessReview that vet an administrator-provisioned validator
@@ -1398,6 +1425,10 @@ const (
 
 	// KubeSystemNamespace is the standard kube-system namespace.
 	KubeSystemNamespace = "kube-system"
+
+	// AICROperatorNamespace is where the AICR Operator's chart installs it
+	// and keeps its plans, and kubectl aicr's --operator-namespace default.
+	AICROperatorNamespace = "aicr-system"
 )
 
 // Attestation file size limits.
@@ -1486,6 +1517,10 @@ var MirrorExtraAPIVersions = []string{
 	// v1beta1 shipped in K8s 1.32, v1 went GA in K8s 1.34.
 	"resource.k8s.io/v1",
 	"resource.k8s.io/v1beta1",
+	// Prometheus Operator monitors. Charts gate them on the full
+	// group/version/kind string, so the group/version alone is not enough.
+	"monitoring.coreos.com/v1/ServiceMonitor",
+	"monitoring.coreos.com/v1/PodMonitor",
 }
 
 // Shared Helm template rendering timeout. Used as the default deadline
@@ -1496,6 +1531,13 @@ var MirrorExtraAPIVersions = []string{
 // serves as a safety net so the subprocess is never unbounded.
 const HelmTemplateTimeout = 90 * time.Second
 
+// HelmRenderAttempts and HelmRenderRetryBackoff configure helm.WithRetry. The
+// wait before retry n is n times HelmRenderRetryBackoff.
+const (
+	HelmRenderAttempts     = 3
+	HelmRenderRetryBackoff = 2 * time.Second
+)
+
 // HelmTemplateOutputLimit caps the bytes written to the stdout buffer of
 // a helm-template subprocess. --recipe accepts user-provided chart sources
 // with no allowlist, so the subprocess is not a trusted source. The 90s
@@ -1503,6 +1545,14 @@ const HelmTemplateTimeout = 90 * time.Second
 // 100 MiB is generous — real charts are single-digit MB — while still
 // preventing a malicious or buggy chart from exhausting memory.
 const HelmTemplateOutputLimit int64 = 100 * 1024 * 1024 // 100 MiB
+
+// HelmStderrLimit caps the stderr pkg/helm.Run keeps from one helm command.
+const HelmStderrLimit = 64 * 1024 // 64 KiB
+
+// HelmWaitDelay bounds how long a helm command's output pipes stay open
+// after the command exits or is killed. A descendant that inherits a pipe
+// would otherwise hold it open, and the caller with it, indefinitely.
+const HelmWaitDelay = 2 * time.Second
 
 // HelmReleaseDecodeLimit caps the decompressed size of a single Helm release
 // record. The encoded record embeds the release's full rendered manifest and
@@ -1563,8 +1613,22 @@ const HelmInventoryTimeout = 2 * time.Minute
 // retained, so paging bounds the response rather than the peak.
 const ArgoApplicationListPageSize int64 = 200
 
+// OperatorPlanListPageSize caps how many AICR Operator plan ConfigMaps one
+// List pulls while versioning the Applications the operator writes. A plan is
+// bounded by the ~1 MiB a ConfigMap can hold, the ceiling that sizes
+// HelmReleaseListPageSize, and only each plan's release digests and versions
+// are kept past its page.
+const OperatorPlanListPageSize int64 = 100
+
+// OperatorPlanVersionLimit is the longest chart version an AICR Operator plan
+// may record before the plan is set aside as unreadable. Chart versions are
+// semantic versions; the bound keeps a corrupt plan from carrying an
+// arbitrarily long string into an error message.
+const OperatorPlanVersionLimit = 128
+
 // ArgoInventoryTimeout bounds the whole read of the Applications Argo CD
-// deploys: one paged cluster-wide List, plus the projection of each item.
+// deploys: one paged cluster-wide List, plus the projection of each item and,
+// when the AICR Operator wrote some, one paged List of its plans.
 // Shorter than HelmInventoryTimeout, which makes two such walks over objects
 // carrying rendered manifests and decompresses one record per release.
 //

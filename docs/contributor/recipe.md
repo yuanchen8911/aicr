@@ -90,6 +90,7 @@ components:
 |---|---|---|---|
 | `name` | string | yes | Component identifier (matches `componentRefs[].name` in overlays) |
 | `displayName` | string | yes | Human label used in CLI output and bundle templates |
+| `class` | `ComponentClass` | embedded: yes | Bundle class (ADR-018): `core` or `ops`, ordered `core` < `ops`. A component may depend only on its own class or an earlier one; `pkg/recipe.TestClassDependencyDirectionGuard` resolves every catalog leaf and fails on an edge to a later class. Every embedded entry declares it (`TestEmbeddedRegistryDeclaresClass`), and the Class column of `docs/user/component-catalog.md` must match (`TestComponentCatalogClassColumnMatchesRegistry`), so reclassifying a component is a registry edit plus its catalog row. An external `--data` entry that omits it is `core`. Ordinary bundling does not read it; `aicr bundle --split` partitions the bundle by it into one directory per class (see [Split a bundle by class](../user/bundling.md#split-a-bundle-by-class)). |
 | `valueOverrideKeys` | []string | no | Alt keys for `--set <key>:path=value` (e.g., `gpuoperator`) |
 | `helm` | `HelmConfig` | one of helm/kustomize | Chart defaults (see below) |
 | `kustomize` | `KustomizeConfig` | one of helm/kustomize | Kustomization defaults (see below) |
@@ -101,9 +102,22 @@ components:
 | `healthCheck.assertFile` | string | **yes** | Chainsaw assert YAML (relative to data dir) consumed by `aicr validate --phase deployment` (runtime — #1220) and by `make check-health` locally. Content is restricted to the read-only `assert` / `error` operation allowlist. Enforced at PR time by `pkg/recipe.TestComponentRegistry_RequiresHealthCheck` (every component must declare a path) and `pkg/chainsaw.TestValidateTestReadOnly_RegistryContent` (every declared path must pass the allowlist) — see #1223. |
 | `upgrades.file` | string | no | Path to a `ComponentUpgrades` transition record (relative to data dir, e.g. `components/nodewright-operator/upgrades.yaml`), ADR-021. Empty means the component has no transition records. See [Transition records](#transition-records) below. |
 | `mixinSafeOverridePaths` | []string | no | Exact dotted value paths a `RecipeMixin` may set on this component via `Overrides` (see [Mixin Composition](#mixin-composition)). Empty (the default) means the component hasn't opted in: a mixin introducing it fresh keeps unrestricted `valuesFile`/`overrides`, but once it's already in the chain every mixin `Overrides` path is rejected. Entries must be exact leaf paths — an ancestor/descendant pair is rejected at registry load |
+| `telemetry` | `TelemetryConfig` | no | Runtime metrics contract (ADR-026): a consumer declares `promql.monitorsFrom` and `promql.series`; the runtime Prometheus server declares `promqlServer` value paths the bundler fills. See [Runtime metrics declarations](../integrator/recipe-development.md#runtime-metrics-declarations) |
 | `gkeCriticalPriority` | bool | no | Synthesize ResourceQuota on GKE so `system-*-critical` pods admit |
 | `hasSelfRefCRDs` | bool | no | Tells helmfile to emit `disableValidation: true` (chart ships CRD + CR in same release) |
 | `manifestsUseChartCRDs` | bool | no | Tells helmfile to emit `disableValidation: true` on the release carrying the attached manifests — the injected `-post` wrapper under both vendored and non-vendored layouts (manifests create CRs of CRDs the chart installs) |
+
+**Class direction and prerequisites.** Because `kube-prometheus-stack` is
+`ops` and installs no CRDs (`crds.enabled: false`), a `core` component that
+only needs the `monitoring.coreos.com` CRDs for its
+ServiceMonitor or PodMonitor declares `dependencyRefs` on
+`prometheus-operator-crds`, not on `kube-prometheus-stack`. A component that
+reads Prometheus at runtime (Dynamo's planner, for example) needs no install
+edge. Prerequisites a component has beyond its chart, such as the storage
+driver its persistent volumes need, are declared as `dependencyRefs` too,
+through a service-specific mixin when the dependency exists on one service
+only (see `nvsentinel-datastore-eks` under
+[Mixin Composition](#mixin-composition)).
 
 `HelmConfig`: `defaultRepository`, `defaultChart`, `defaultVersion`,
 `defaultDigest`, `defaultNamespace`. `KustomizeConfig`: `defaultSource`, `defaultPath`,
@@ -183,10 +197,10 @@ Criteria fields (see `pkg/recipe/criteria.go` `type Criteria`):
 
 | Field | Type | Wildcard | Static OSS values |
 |---|---|---|---|
-| `service` | `CriteriaServiceType` | `any` or empty | `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm`, `metal3`, `rke2`, `generic`, `k0s`, `mk8s` |
+| `service` | `CriteriaServiceType` | `any` or empty | `eks`, `gke`, `aks`, `oke`, `ocp`, `kind`, `lke`, `bcm`, `metal3`, `rke2`, `generic`, `k0s`, `mk8s`, `nvke`, `cks` |
 | `accelerator` | `CriteriaAcceleratorType` | `any` or empty | `h100`, `h200`, `gb200`, `gb300`, `b200`, `b300`, `a100`, `l40`, `l40s`, `rtx-pro-6000`, `vr200` |
 | `intent` | `CriteriaIntentType` | `any` or empty | `training`, `inference` |
-| `os` | `CriteriaOSType` | `any` or empty | `ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`, `sles` |
+| `os` | `CriteriaOSType` | `any` or empty | `ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`, `sles`, `rocky` |
 | `platform` | `CriteriaPlatformType` | `any` or empty | `dynamo`, `kubeflow`, `kueue`, `nim`, `runai`, `slurm` |
 | `nodes` | int | `0` | any positive int |
 
@@ -347,7 +361,8 @@ Mixin files currently in the tree: `os-ubuntu`, `os-talos`, `os-amazonlinux`, `o
 `nvsentinel-object-monitor`, `nvsentinel-nic-health-monitor`,
 `nvsentinel-preflight`, `nvsentinel-slurm-drain-monitor`, `nvsentinel-observe`,
 `nvsentinel-quarantine`, `nvsentinel-remediation`, `nvsentinel-slinky-drainer`,
-`nvsentinel-health-events-analyzer`, `npd`.
+`nvsentinel-health-events-analyzer`, `nvsentinel-event-exporter`, `nvsentinel-datastore-eks`, `nvsentinel-log-collector`,
+`nvsentinel-node-validation`, `nvsentinel-external-remediation`, `npd`.
 
 The OS-scoped mixins (`os-ubuntu`, `os-talos`, `os-amazonlinux`, `os-sles`) are
 mutually exclusive:
@@ -454,8 +469,9 @@ verified node; when the constraint is absent the check keeps its
 banner-presence behavior and does not invent a floor (#1995).
 When the constraint is set but the host driver cannot be measured —
 unreadable nvidia-smi banner, no GPU nodes, all GPU nodes cordoned, or
-GPU nodes busy with workloads — the check fails closed rather than
-Skip. Skip on those paths is preserved only when no floor is
+all schedulable GPU nodes busy with workloads — the check fails closed
+rather than Skip. Busy nodes skipped beside a verified node do not fail
+the floor; they are disclosed as skipped, like cordoned nodes. Skip on those paths is preserved only when no floor is
 configured. The value must carry a comparison operator (`>=`, `>`,
 `<=`, `<`) to behave as a floor; a bare version is exact string match,
 so a newer driver would fail. The constraint name is an exact match;
@@ -778,7 +794,10 @@ externally-visible product. Fields beyond `ComponentRefs` and
    [chainsaw health check section in validator.md](validator.md#chainsaw-health-checks)
    for the assertion patterns currently in use (DaemonSet
    `numberReady == desiredNumberScheduled`, Deployment
-   `Available=True`, CRD `Established=True`).
+   `Available=True`, CRD `Established=True`). A check that asserts a
+   CRD also needs `make crd-inventory`, and the generated
+   `recipes/components/<name>/crds.yaml` committed alongside it (see
+   [CRD assertions](validator.md#chainsaw-health-checks)).
 4. **Run `make bom-docs` and commit `docs/user/container-images.md`**
    if your change touches `registry.yaml`, a component's `values.yaml`,
    or a chart version pin (see [BOM regeneration](#bom-regeneration)).

@@ -93,6 +93,8 @@ func TestStability_RecipeResolution(t *testing.T) {
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromCriteria)
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria, string) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromCriteriaWithProfile)
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria, ...aicr.RecipeResolveOption) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromCriteriaWithOptions)
+	requireSignature[func(string, bool) (bool, error)](aicr.PublishedEvidenceRequired)
+	requireSignature[func(*aicr.Client, context.Context, *aicr.RecipeResult) error]((*aicr.Client).RequirePublishedEvidence)
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria, *aicr.Snapshot) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromSnapshot)
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria, *aicr.Snapshot, string) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromSnapshotWithProfile)
 	requireSignature[func(*aicr.Client, context.Context, *aicr.Criteria, *aicr.Snapshot, ...aicr.RecipeResolveOption) (*aicr.RecipeResult, error)]((*aicr.Client).ResolveRecipeFromSnapshotWithOptions)
@@ -285,7 +287,7 @@ func TestStability_Bundle(t *testing.T) {
 	// configuration" godoc); the CLI's own bundle-generation call and the
 	// aicrd /v1/bundle handler both rely on it.
 	requireType[*aicr.BundleConfig](aicr.BundleOptions{}.Config)
-	// The 18 flat fields Config.BundleOptions derives from spec.bundle.
+	// The 19 flat fields Config.BundleOptions derives from spec.bundle.
 	// Pinned by name and type together: a bare zero-value literal above
 	// would still compile through a rename or retype of any one of them.
 	_ = aicr.BundleOptions{
@@ -307,6 +309,7 @@ func TestStability_Bundle(t *testing.T) {
 		CertIDRegexp:               "",
 		VendorCharts:               false,
 		AppName:                    "",
+		ArgoCD:                     bundlerconfig.ArgoCDSettings{},
 	}
 	requireType[bundlerconfig.DeployerType](aicr.BundleOptions{}.Deployer)
 	requireType[[]bundlerconfig.ComponentPath](aicr.BundleOptions{}.ValueOverrides)
@@ -324,6 +327,7 @@ func TestStability_Bundle(t *testing.T) {
 	requireType[int](aicr.BundleOptions{}.Nodes)
 	requireType[bool](aicr.BundleOptions{}.Attest)
 	requireType[bool](aicr.BundleOptions{}.VendorCharts)
+	requireType[bundlerconfig.ArgoCDSettings](aicr.BundleOptions{}.ArgoCD)
 
 	var bi aicr.BundleInputOptions
 	_ = bi.RecipePath
@@ -692,6 +696,7 @@ func TestStability_Config(t *testing.T) {
 	requireSignature[func(*aicr.Config) ([]aicr.RecipeResolveOption, error)]((*aicr.Config).RecipeResolveOptions)
 	requireSignature[func(*aicr.Config) string]((*aicr.Config).SnapshotPath)
 	requireSignature[func(*aicr.Config) bool]((*aicr.Config).IsCriteriaStrict)
+	requireSignature[func(*aicr.Config) bool]((*aicr.Config).IsRequireEvidence)
 }
 
 // TestStability_Query pins the package-level query selector, in both its

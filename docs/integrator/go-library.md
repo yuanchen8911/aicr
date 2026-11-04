@@ -516,14 +516,29 @@ with the Client's version, the same combined document `aicr validate` writes.
 
 ### CNCF AI Conformance evidence
 
-Two methods produce CNCF AI Conformance evidence, matching
+Three methods produce CNCF AI Conformance evidence, matching
 `aicr validate --evidence-dir` and `aicr validate --cncf-submission`:
 
 - `RenderCNCFEvidence(ctx, report, dir)` writes one markdown file per
   submission requirement, plus `index.md`, from a CTRF report such as the one
-  `MergeReports` returns. Skipped checks are omitted, so a report from a run
-  that used `WithValidationSkipChecks` is refused with
+  `MergeReports` returns, against the latest checklist version the build
+  carries (`cncf.LatestVersion`). Skipped checks are omitted, so a report
+  from a run that used `WithValidationSkipChecks` is refused with
   `ErrCodeInvalidRequest`.
+- `RenderCNCFEvidenceWithOptions(ctx, report, dir, opts)` is the same render
+  with the checklist version selected by `RenderCNCFEvidenceOptions`:
+  `ConformanceVersion` names it explicitly (`"v1.36"`; an unsupported version
+  is refused with `ErrCodeInvalidRequest`), else `KubernetesVersion` (the
+  value `Snapshot.KubernetesVersion()` returns) selects the checklist for the
+  cluster's minor, or the nearest carried one with a warning when this build
+  has none for it (below v1.35 renders v1.35, above v1.37 renders v1.37).
+  **Matching `aicr validate --evidence-dir` means this method**, with
+  `KubernetesVersion: snap.KubernetesVersion()` from the snapshot
+  `ValidateState` ran against; `RenderCNCFEvidence` alone renders the latest
+  checklist whatever the cluster runs. The requirement set, levels and descriptions come from
+  `pkg/evidence/cncf` (`SupportedVersions`, `ChecklistFor`); a check whose
+  requirement the selected version no longer lists (`dra_support` from v1.36
+  on) renders as supporting evidence rather than a requirement row.
 - `CollectCNCFEvidence(ctx, recipe, opts)` deploys GPU test workloads and
   captures behavioral evidence under `opts.Dir`. It needs `bash` and
   `kubectl` on `PATH` and runs for up to 20 minutes. `recipe` is optional.
@@ -541,7 +556,9 @@ err := client.CollectCNCFEvidence(ctx, rec, aicr.CNCFCollectOptions{
 })
 ```
 
-Neither method is in v0.22.0 or earlier.
+None of these methods is in v0.22.0 or earlier. `RenderCNCFEvidenceWithOptions`,
+`RenderCNCFEvidenceOptions` and `Snapshot.KubernetesVersion` are not in v1.0.0
+or earlier either.
 
 ## Recipe sources
 
@@ -577,6 +594,18 @@ fail closed before the provider is activated.
 OCI sources use credentials from the standard Docker configuration
 (`~/.docker/config.json` or `$DOCKER_CONFIG`) and may invoke the configured
 credential helper for the selected registry host.
+
+A registry that issues bearer tokens names its token endpoint in the `realm`
+of its `WWW-Authenticate` challenge. Every realm must use `https`, or `http`
+only when the registry itself was contacted over `http`. A realm on the
+registry's own host skips the address check that follows. A realm on a
+different host is refused when that host is an IP literal, or resolves through
+DNS to any address, that is loopback, link-local, private, unspecified, or
+carrier-grade NAT (`100.64.0.0/10`); a failed DNS lookup is allowed. A refused realm fails authentication with an error naming
+the host and the address class: `is a ... address` for an IP literal and
+`resolves to ...` for a DNS result. The same check applies to the ORAS clients
+behind OCI recipe sources, OCI bundle pushes, and evidence fetches; chart
+vendoring pulls through Helm and does not use it.
 
 Use `NewClientContext` so caller cancellation and tighter deadlines
 propagate through registry authentication, download, extraction, and catalog
@@ -797,9 +826,13 @@ if report.FailsRun() {
   records name that carry no deployer ownership marker. Nil scans only on a
   cluster read, a pointer to `true` scans for any source, and a pointer to
   `false` suppresses it even on a cluster read.
+- `OperatorNamespace` is where a cluster read finds the AICR Operator's plans,
+  which version the Argo CD `Application`s the operator wrote. Empty selects
+  `aicr-system`, where the operator's chart installs.
 
 `aicr.FromCluster`, `ScanAtRisk`, and `ObjectNamesCompared`/`ObjectNamesSkipped`
 are not in v0.22.0 or earlier; pin a later release to use them.
+`OperatorNamespace` is not in v1.2.0 or earlier.
 
 `*UpgradeReport` is a transparent alias of `pkg/upgrade.Report`. Verdicts are
 data, not errors: `WriteUpgradeReportTable` renders the table the CLI prints,
@@ -989,9 +1022,9 @@ byte-identical YAML.
 `WrapResolved` turns a `*pkg/recipe.RecipeResult` — typically one taken from
 `RecipeResult.Resolved()` and then projected by the caller — back into a
 facade `*RecipeResult` that `SelectFromRecipeWithContext` accepts. The result
-is queryable only: it carries no owning `Client`, so `MakeBundle`,
-`BundleComponents`, and `ValidateState` reject it. Use `Client.AdoptRecipe`
-when you need a bundle-able result.
+is not owned by any `Client`: the bundle, validate, preflight, and evidence
+methods reject it, and `Client.MirrorInventory` accepts it by design. Use
+`Client.AdoptRecipe` when you need a bundle-able result.
 
 `AdoptRecipe` canonicalizes the artifact `Kind` on the copy it returns: an
 absent, empty, or legacy `Recipe` kind is stamped as `RecipeResult`, and any
@@ -1107,6 +1140,20 @@ derive step rather than the load step.
 | `RecipeOutputOptions()` | `spec.recipe.output` |
 | `SnapshotPath()` | `spec.recipe.input.snapshot` |
 | `IsCriteriaStrict()` | `spec.recipe.criteriaStrict` |
+| `IsRequireEvidence()` | `spec.recipe.requireEvidence` |
+
+`IsRequireEvidence()` is a read, like `IsCriteriaStrict()`. It does not change
+resolution. After `ResolveRecipe`, call `PublishedEvidenceRequired` to combine
+that field with a flag and `AICR_REQUIRE_EVIDENCE`, then
+`Client.RequirePublishedEvidence` when it reports true. That call rejects a
+Client whose recipe source is not `EmbeddedSource()`, including
+`FilesystemSource` from `--data` or `spec.recipe.data`, before it checks the
+leaf. A committed pointer attests the embedded catalog only. It also rejects
+a result the Client does not own, such as one from another Client or from
+`WrapResolved`; a result from `LoadRecipe` or `AdoptRecipe` is owned and is
+checked as-is. `ResolveRecipe`
+itself does not apply the check, so bundle, mirror, and upgrade stay
+unaffected.
 
 All five spec sections have a derivation, and every one of them has a
 destination. `SnapshotOutputOptions()` projects `spec.snapshot.output` even
@@ -1117,7 +1164,7 @@ guarantee.
 
 ### What `BundleOptions()` does and does not carry
 
-`BundleOptions()` returns 18 bundler settings (those `spec.bundle.deployment`
+`BundleOptions()` returns 19 bundler settings (those `spec.bundle.deployment`
 and `spec.bundle.scheduling` configure, plus the two attestation flags the
 bundler itself reads) as plain fields — not a built `Config` — so you read and
 override individual settings directly, the same as `ValidateSettings()`. It
@@ -1135,13 +1182,34 @@ opts.Nodes = 32 // caller wins, visibly
 `Config` is still on the struct, as an escape hatch: when you already have a
 fully built `*BundleConfig` from something the flat fields cannot express (a
 CLI-flag-only setting such as `Version` or `Serial`, or a config object you
-mutate in place), set it and it wins outright over the 18 bundler-config flat
-fields (`Deployer` through `AppName`) — `BundleOptions()` itself never
-populates it. `Config` does NOT override `Attester`, `OIDCResolve`,
+mutate in place), set it and it wins outright over the 19 bundler-config flat
+fields (`Deployer` through `ArgoCD`) and over `Split`, which follows them
+and is caller-set only: no config file setting derives it. `BundleOptions()`
+leaves `Config` and `Split` unset. `Config` does NOT override `Attester`, `OIDCResolve`,
 `BinaryAttestation`, `OutputDir` or `Timeout`: those five stay
 caller-supplied regardless of `Config`, which is why the REST `/v1/bundle`
 handler can set `Config` and `OutputDir`/`Timeout` in the same struct
 literal and have all three take effect.
+
+To generate a class-partitioned bundle set ([ADR-018](https://github.com/NVIDIA/aicr/blob/main/docs/design/018-class-partitioned-bundles.md)),
+set `Split` and give `OutputDir` a path that does not exist yet; the set is
+published there atomically, and the helm deployer is the only one supported:
+
+```go
+opts, err := cfg.BundleOptions()
+if err != nil {
+    return err
+}
+opts.Split = true
+opts.OutputDir = filepath.Join(workDir, "bundles") // must not exist yet
+out, err := client.MakeBundle(ctx, rec, opts)
+```
+
+`out.OutputDir` is the set root with `recipe.yaml`, `split.yaml`,
+`bundle-info.yaml` and `checksums.txt`; `out.Deployment.Steps` holds three
+commands per class in `classOrder` (`cd <set>/<class>`, `chmod +x deploy.sh`,
+`./deploy.sh`). See [Split a bundle by class](../user/bundling.md#split-a-bundle-by-class)
+for the layout, ordering contract and rejections.
 
 The six caller-side fields have their own type, `BundleInputOptions()`, not
 because they are declined but because `MakeBundle` never reads them — see the
@@ -1442,7 +1510,9 @@ options. The caller applies its own flag-over-config precedence, the same way
 `SnapshotOutputOptions()` and `ValidateInputOptions()` do, then branches on
 `CNCFSubmission`. When true, it passes `Dir` and `Features` to
 `CollectCNCFEvidence` in `CNCFCollectOptions` and skips `ValidateState`. When
-false, a non-empty `Dir` goes to `RenderCNCFEvidence` after `ValidateState`.
+false, a non-empty `Dir` goes to `RenderCNCFEvidenceWithOptions` after
+`ValidateState`, with `KubernetesVersion` from the snapshot, which is what the
+CLI does; `RenderCNCFEvidence` renders the latest carried checklist instead.
 `CNCFEvidenceOptions()` returns the zero value (never an error) for an absent
 section, and an error only when `spec.validate` is present but malformed.
 

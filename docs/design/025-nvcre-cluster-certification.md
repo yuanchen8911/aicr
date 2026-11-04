@@ -2,7 +2,10 @@
 
 ## Status
 
-**Proposed** — 2026-09-02.
+**Proposed** — 2026-09-02. Amended 2026-10-26: AICR's own run limits satisfy
+the node-cap, run-deadline, and cleanup bullets of the execution-safety gate, so
+upstream bounds no longer gate stock adoption;
+see [Amendment: AICR's limits](#amendment-aicrs-limits).
 
 Reviews upstream
 [`NVIDIA/cluster-readiness-engine`](https://github.com/NVIDIA/cluster-readiness-engine)
@@ -181,6 +184,20 @@ are not.
 An AICR check that omits any of these can strand GPU capacity indefinitely,
 which is why they are stated here rather than left to each caller.
 
+### 7. One threshold means the same under either backend
+
+A recipe constraint is a statement about the cluster, not about the tool that
+measured it. `nccl-cre-all-reduce-bw` therefore judges bandwidth with the same
+verdict as `nccl-all-reduce-bw`: it passes at the same fraction of the constraint
+value (`ncclBandwidthFloorFraction`, 0.9) and publishes `achievedGbps`,
+`thresholdGbps`, `tolerancePct`, and `passMargin`, even when the transport
+assertion then fails the run.
+The one demand that differs is the transport assertion, which only the CRE check
+can make, because the default TrainJob template logs at `NCCL_DEBUG=WARN`. A
+constraint is still calibrated per service and accelerator; this decision makes
+the number portable between backends, not between hardware. The goodput check
+has no TrainJob counterpart and passes at the value itself.
+
 ## Adoption Gates
 
 These gates bound **stock-overlay adoption**, not registry-only admission.
@@ -191,7 +208,8 @@ recipe. Gates not yet met on the reviewed pin are recorded in
 [Status](#status-against-v010) and tracked in
 [Follow-Up Decisions](#follow-up-decisions); none of them blocks the
 registry-only implementation. The full set must pass before the stock-adoption
-amendment.
+amendment, except the node-cap, run-deadline, and cleanup bullets that AICR's own
+limits meet; see [Amendment: AICR's limits](#amendment-aicrs-limits).
 
 The category structure follows
 [ADR-019](019-k8s-aibom-runtime-inventory.md), which set the
@@ -226,8 +244,16 @@ ADR-019 analogue — k8s-aibom observes workloads, while NVCRE creates them.
 
 **Benchmark execution safety**
 
-- A stated maximum node count and run deadline per certification.
-- Documented `TrainJob` cleanup on completion, failure, and cancellation.
+- A stated maximum node count and run deadline per certification. Met by AICR's
+  own limits, not by an upstream bound; see
+  [Amendment: AICR's limits](#amendment-aicrs-limits). The deadline is the
+  validator's in-process wait, so it holds while the validator pod lives: a
+  killed pod is bounded only by CRE's `spec.timeoutPerJob`, whose clock restarts
+  when a workload is replaced (gap 4), and by the orphan reclaim below.
+- Documented `TrainJob` cleanup on completion, failure, and cancellation. Met
+  the same way while the validator pod lives: the caller confirms the workloads
+  stopped. A killed pod is covered only by the orphan reclaim, which needs a
+  later CRE check in the same namespace and an orphan at least 45 minutes old.
 - A bounded termination condition for adaptive fault isolation's bisection,
   in both total runs and wall-clock.
 - The controller creates no workload without an explicit `Certification`,
@@ -236,7 +262,7 @@ ADR-019 analogue — k8s-aibom observes workloads, while NVCRE creates them.
   relocatable.** The catalog is `go:embed`-compiled into the manager, so its
   contents never appear in rendered chart output and AICR's mirror discovery —
   which extracts images from rendered YAML — cannot see them. Catalog entries
-  carry tag-only images, including a `:latest` pin in the AWS GB300 RoCE
+  carry tag-only images, including a `:latest` pin in one platform-specific
   runtime patch, and the training entry clones Megatron-LM at pod start. Every
   image, fetched source, and runtime download reachable from a supported
   `Certification` category and platform path must be discoverable, pinned by
@@ -278,8 +304,10 @@ setting `manager.image.tag` to `v0.1.0@sha256:ed1e5928…`; and anonymous public
 pull for both chart and image.
 
 Four gates are unmet on this pin. None blocks registry-only admission; all are
-tracked in [Follow-Up Decisions](#follow-up-decisions) and must close before
-the stock-adoption amendment.
+tracked in [Follow-Up Decisions](#follow-up-decisions). Gaps 1 and 2 must close
+before the stock-adoption amendment. Gaps 3 and 4 are met by AICR's own limits
+(see [Amendment: AICR's limits](#amendment-aicrs-limits)) and do not block
+stock adoption.
 
 Supply chain — upstream release-workflow changes, not AICR work:
 
@@ -296,12 +324,12 @@ The findings above are v0.1.0. Rechecked at the pin AICR ships:
 
 | Artifact | Digest |
 |---|---|
-| Chart `v0.6.0` | `sha256:af20cf1d7827a35e60a539ef9f7fc8445e0def61f345e8bdb030afc76f01f6cf` |
-| Image index `manager:v0.6.0` | `sha256:8008c6f9f7e19b317caf0f91afab06b88027c14d7dd03e4173bd49cd1f3cd27a` |
+| Chart `v0.8.2` | `sha256:75458557b0ff2610c7eea01e0b315ae0355cc6b2baa816756a2dba0c0c2387a4` |
+| Image index `manager:v0.8.2` | `sha256:c5de16ddb95bd923c6b04d04d7ff9754a7d7b83d18fa400baa33e7ae72fc593d` |
 
 Both carry a cosign signature and a SLSA v1.0 provenance attestation, and both
 verify against certificate identity
-`https://github.com/NVIDIA/cluster-readiness-engine/.github/workflows/attest.yml@refs/tags/v0.6.0`
+`https://github.com/NVIDIA/cluster-readiness-engine/.github/workflows/attest.yml@refs/tags/v0.8.2`
 at the GitHub Actions OIDC issuer. The chart attestations bind the chart digest
 — confirmed by running `cosign tree` against the digest rather than the tag.
 Anonymous `helm pull` succeeds with an empty registry config, so no pull secret
@@ -339,7 +367,9 @@ Execution safety — these live in the `Certification` API, so driving
 
 AICR bounds items 3 and 4 from the caller side per
 [Decision 6](#6-aicr-bounds-certification-execution), which is what makes them
-non-blocking here rather than merely deferred.
+non-blocking here rather than merely deferred. The
+[amendment below](#amendment-aicrs-limits) makes that permanent for the gate:
+they stay upstream asks, and neither holds up stock adoption.
 
 This list is not a full adjudication. The remaining gate categories —
 Security, and the parts of Chart and CRD lifecycle and AICR qualification not
@@ -347,6 +377,38 @@ named above — are neither verified nor listed as gaps; they are adjudicated at
 amendment time. Unassessed is not the same as passed. Nothing turns on this
 for registry-only admission, since the entry stays inert until an overlay
 references it.
+
+## Amendment: AICR's limits
+
+Gaps 3 and 4 above ask NVCRE for a run-level node cap, a
+total run deadline, and a cleanup guarantee. AICR does not wait for them. Every
+opt-in check that drives a `Certification` carries the limits below, each
+enforced in the validator and none depending on a future NVCRE release:
+
+| Limit | Value | Where |
+|---|---|---|
+| Node footprint | An explicit `target.nodeNames` list, capped at the node count each combination was qualified at (two on `eks` × `h100`); an empty list is refused | `creQualifiedEntries`, `buildCRECertification` |
+| Wait for a terminal state | 30 minutes from creation, expiry reported as a failure; the same value is written to `spec.timeoutPerJob` as a backstop | `defaults.CRECertificationTimeout` |
+| Measurement finalization | 5 minutes after the `Certification`'s terminal state is observed; expiry fails the check rather than falling back to provisional results | `defaults.CREMeasurementFinalizeTimeout` |
+| Teardown | 10 minutes to delete the `Certification` and confirm its `TrainJob`s and GPU pods are gone; an unconfirmed teardown fails the check | `defaults.CRECertificationTeardownTimeout` |
+| Orphans | A `Certification` labeled `app.kubernetes.io/managed-by=aicr-validator` and older than the sum of the three bounds above (45 minutes) is reclaimed by the next CRE check in the same namespace that reaches the reclaim step: one with a constraint, a qualified combination, and enough nodes | `defaults.CREOrphanReclaimAge` |
+
+These satisfy the first two *Benchmark execution safety* bullets for a check
+that observes them, while its validator pod lives. A pod that is killed never
+runs its wait or its teardown, so for that case the run deadline falls back to
+CRE's `spec.timeoutPerJob` (whose clock restarts when a workload is replaced)
+and the cleanup bullet rests on the orphan reclaim alone, which needs a later
+CRE check in the same namespace that gets as far as the reclaim step.
+
+The gate attaches to the check, not to the pin: a new opt-in validator that
+omits a limit does not meet it. Upstream bounds remain
+welcome and stay tracked as follow-ups 3 and 4, but they are no longer
+conditions for the stock-adoption amendment.
+
+This amendment does not touch the other gate categories. The bisection
+termination bullet is neither asserted nor claimed here, the chart SBOM (follow-up
+2) is still absent, and *Security* and the unlisted parts of *Chart and CRD
+lifecycle* and *AICR qualification* are still adjudicated at amendment time.
 
 ## Non-Goals
 
@@ -371,26 +433,33 @@ open gaps are named concretely with verifiable close conditions.
 **Negative.** AICR carries a component whose pin does not yet pass every gate.
 Two of the four gaps are mitigated only by caller discipline (Decision 6), so
 an opt-in validator that ignores it can strand GPU capacity — a risk that
-exists until upstream bounds `nodesPerJob` and adds a run deadline. Stock
-adoption stays blocked until all four close, so the PoC's measured value is
-not available to stock recipes yet.
+exists until upstream adds a run-level node-footprint cap, a run deadline, and a
+deletion that confirms child workloads stopped. A validator that observes
+Decision 6 can still strand it when its pod is killed, until a later CRE check
+in the same namespace reclaims the orphan. Since the amendment, the node cap,
+run deadline, and cleanup bullets no longer block stock adoption for a
+validator that observes them, because AICR's own limits satisfy the gate; the
+chart SBOM, the runtime closure (follow-up 5), and the gates still unassessed
+do, so the PoC's measured value is not yet available to stock recipes.
 
 ## Follow-Up Decisions
 
 1. ~~Upstream: add build provenance to the controller image, attributable to
    the release workflow and meeting a stated SLSA build level.~~ Closed at
-   v0.2.0 and still verifying at the current v0.6.0 pin — SLSA v1.0 provenance
+   v0.2.0 and still verifying at the current v0.8.2 pin — SLSA v1.0 provenance
    verifies against the release workflow identity.
 2. Upstream: publish a chart SBOM. ~~Sign the Helm chart and publish chart
    provenance.~~ Signature and SLSA v1.0 provenance have been present since
-   v0.2.0 and bind the chart digest; the **SBOM** is still absent at v0.6.0,
+   v0.2.0 and bind the chart digest; the **SBOM** is still absent at v0.8.2,
    because the CycloneDX attestation covers the image's per-platform children
    only. Open, so item 6 is not yet reached.
 3. Upstream: add a run-level cap on the node footprint, so a `Certification`
-   cannot span every matched node without an explicit `target.nodeNames`.
+   cannot span every matched node without an explicit `target.nodeNames`. Not
+   a stock-adoption gate; AICR's own cap applies.
 4. Upstream: add a total run deadline to `CertificationSpec`, and make
    deletion establish that child workloads stopped — foreground propagation,
-   a finalizer held until children are gone, or an equivalent guarantee.
+   a finalizer held until children are gone, or an equivalent guarantee. Not
+   a stock-adoption gate; AICR's own teardown confirmation applies.
 5. Upstream: publish the workload runtime closure as digest-pinned,
    discoverable artifacts, so the catalog's images and fetched source can be
    inventoried and mirrored. AICR now derives the closure for the supported
@@ -398,7 +467,8 @@ not available to stock recipes yet.
    the images mirrorable but does not remove the upstream ask: the inventory
    has to be re-derived on every chart bump because the catalog ships inside
    the manager image.
-6. AICR: record the qualified artifact set in this ADR's Status once items 1–5
-   close, and re-run the gates against that pin.
+6. AICR: record the qualified artifact set in this ADR's Status once items 1, 2,
+   and 5 close, and re-run the gates against that pin. Items 3 and 4 are not
+   conditions.
 7. AICR: a separate amendment for any stock-recipe adoption, which requires
    the full gate set to pass.

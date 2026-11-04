@@ -25,10 +25,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/NVIDIA/aicr/pkg/bundler/config"
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
 	"github.com/NVIDIA/aicr/pkg/component"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/recipe"
@@ -67,8 +67,16 @@ func init() {
 	registerCheck("CheckNVSentinelSlurmDrainMonitorRequiresSlinky", CheckNVSentinelSlurmDrainMonitorRequiresSlinky)
 	registerCheck("CheckNVSentinelRemediationPipelineCoherent", CheckNVSentinelRemediationPipelineCoherent)
 	registerCheck("CheckNVSentinelSlurmCustomDrainCoherent", CheckNVSentinelSlurmCustomDrainCoherent)
+	registerCheck("CheckNVSentinelEventExporterCoherent", CheckNVSentinelEventExporterCoherent)
+	registerCheck("CheckNVSentinelLogCollectorCoherent", CheckNVSentinelLogCollectorCoherent)
+	registerCheck("CheckNVSentinelExternalRemediationCoherent", CheckNVSentinelExternalRemediationCoherent)
+	registerCheck("CheckNVSentinelFileServerStorageClass", CheckNVSentinelFileServerStorageClass)
+	registerCheck("CheckNVSentinelDrainScopeCoherent", CheckNVSentinelDrainScopeCoherent)
+	registerCheck("CheckNVSentinelNodeValidationCoherent", CheckNVSentinelNodeValidationCoherent)
+	registerCheck("CheckNVSentinelPostRemediationValidationCoherent", CheckNVSentinelPostRemediationValidationCoherent)
 	registerCheck("CheckNVSentinelMongoDBCoherent", CheckNVSentinelMongoDBCoherent)
 	registerCheck("CheckNVSentinelDatastorePrerequisites", CheckNVSentinelDatastorePrerequisites)
+	registerCheck("CheckNKTPExportersHaveBackend", CheckNKTPExportersHaveBackend)
 }
 
 // registerCheck is a helper to register validation functions from checks.go.
@@ -333,7 +341,7 @@ var npdProviderRunsItsOwn = map[recipe.CriteriaServiceType]bool{
 //   - os talos: recipes/mixins/os-talos.yaml relocates privileged components
 //     into privileged-* namespaces for Pod Security Admission. NPD is not in
 //     that list, so it would land in a restricted namespace and be denied.
-//   - anything else (lke, bcm, metal3, generic, k0s, ...): unverified.
+//   - anything else (lke, bcm, metal3, generic, k0s, mk8s, nvke, ...): unverified.
 //   - no criteria at all: the platform is unknown, and checkConditions' "nil
 //     Criteria means condition not met" would skip the gate entirely. A
 //     hand-authored or already-hydrated RecipeResult legitimately carries no
@@ -1545,8 +1553,7 @@ func declaredUnionView(recipeResult *recipe.RecipeResult) *recipe.RecipeResult {
 // value. The !ok case (no meaningful truth value) is fail-closed to
 // not-the-remedy.
 func helmTruthy(value any) bool {
-	truth, ok := template.IsTrue(value)
-	return ok && truth
+	return drainscope.HelmTruthy(value)
 }
 
 // nvsentinelAssumesDriverInstalled reports whether the effective
@@ -2346,29 +2353,7 @@ func nicInclusionOverrideUsable(override string) bool {
 // carry it. An absent key reports false: every subchart this reads defaults
 // to off.
 func nvsentinelSubchartRenders(values map[string]any, key string) bool {
-	global, ok := values["global"].(map[string]any)
-	if !ok {
-		return false
-	}
-	sectionRaw, present := global[key]
-	if !present {
-		return false
-	}
-	section, isMap := sectionRaw.(map[string]any)
-	if !isMap {
-		// A non-table section (--set-json global.<key>=true, =null, a
-		// string) leaves the condition path unresolvable, so Helm warns
-		// and falls back to rendering the dependency. Reading it as
-		// "absent, therefore off" would let exactly that through.
-		return true
-	}
-	raw, ok := section["enabled"]
-	if !ok {
-		return false
-	}
-	enabled, isBool := raw.(bool)
-
-	return !isBool || enabled
+	return drainscope.SubchartRenders(values, key)
 }
 
 // CheckNVSentinelNicHealthMonitorRequiresMetadataCollector blocks a bundle
@@ -2648,8 +2633,8 @@ func nvsentinelDryRun(values map[string]any) (dryRun, wellFormed bool) {
 // on. Each subchart renders on its own condition and none checks the
 // others, so every broken combination below deploys cleanly:
 //
-//   - fault-quarantine, node-drainer, fault-remediation and
-//     health-events-analyzer read health events from a datastore: a
+//   - fault-quarantine, node-drainer, fault-remediation,
+//     health-events-analyzer and event-exporter read a datastore: a
 //     global.datastore.provider of mongodb or postgresql, and, when it is
 //     nvsentinel-mongodb's, that component and psmdb-operator deployed
 //     alongside (see nvsentinelDatastoreViolations).
@@ -2700,6 +2685,7 @@ func CheckNVSentinelRemediationPipelineCoherent(ctx context.Context, componentNa
 	janitor := nvsentinelSubchartRenders(values, "janitor")
 	janitorProvider := nvsentinelSubchartRenders(values, "janitorProvider")
 	analyzer := nvsentinelSubchartRenders(values, "healthEventsAnalyzer")
+	exporter := nvsentinelSubchartRenders(values, "eventExporter")
 
 	// Dynamic guard: a dynamic path matters only when a rule reading it can
 	// still fire, i.e. when that rule's stage renders or its toggle is
@@ -2710,10 +2696,12 @@ func CheckNVSentinelRemediationPipelineCoherent(ctx context.Context, componentNa
 	guarded := []string{
 		nvsentinelFaultQuarantineEnabledPath, nvsentinelNodeDrainerEnabledPath,
 		nvsentinelFaultRemediationEnabledPath, nvsentinelJanitorEnabledPath, nvsentinelAnalyzerEnabledPath,
+		eventExporterEnabledPath,
 	}
 	remediationCanRun := remediation || dynamic(nvsentinelFaultRemediationEnabledPath)
 	readerCanRun := remediationCanRun || quarantine || dynamic(nvsentinelFaultQuarantineEnabledPath) ||
-		drainer || dynamic(nvsentinelNodeDrainerEnabledPath) || analyzer || dynamic(nvsentinelAnalyzerEnabledPath)
+		drainer || dynamic(nvsentinelNodeDrainerEnabledPath) || analyzer || dynamic(nvsentinelAnalyzerEnabledPath) ||
+		exporter || dynamic(eventExporterEnabledPath)
 	if readerCanRun {
 		guarded = append(guarded, nvsentinelMongodbStoreEnabledPath, nvsentinelDatastoreProviderPath,
 			nvsentinelDatastoreSecretPath, nvsentinelDatastoreAuthMechPath, nvsentinelDatastoreClientCertKey)
@@ -2761,7 +2749,7 @@ func CheckNVSentinelRemediationPipelineCoherent(ctx context.Context, componentNa
 	}
 
 	var errs []error
-	if quarantine || drainer || remediation || analyzer {
+	if quarantine || drainer || remediation || analyzer || exporter {
 		errs = append(errs, nvsentinelDatastoreViolations(recipeResult, bundlerConfig, componentName, values)...)
 	}
 	// NVSentinel v1.28.0's PostgreSQL client has no $lookup or $replaceRoot,
@@ -3162,7 +3150,7 @@ func nvsentinelDatastoreViolations(recipeResult *recipe.RecipeResult, bundlerCon
 	embedded := nvsentinelSubchartRenders(values, "mongodbStore")
 	if embedded {
 		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-			fmt.Sprintf("component %q: %s is on with a remediation stage or health-events-analyzer -- "+
+			fmt.Sprintf("component %q: %s is on with a remediation stage, health-events-analyzer or event-exporter -- "+
 				"the embedded MongoDB is not supported here. Use a remediation step mixin, which bundles "+
 				"Percona separately, or set it to false and configure %s", componentName,
 				nvsentinelMongodbStoreEnabledPath, nvsentinelDatastoreProviderPath)))
@@ -3177,7 +3165,7 @@ func nvsentinelDatastoreViolations(recipeResult *recipe.RecipeResult, bundlerCon
 		return errs
 	case !providerSet && providerIsString:
 		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
-			fmt.Sprintf("component %q: a remediation stage or health-events-analyzer is enabled with no "+
+			fmt.Sprintf("component %q: a remediation stage, health-events-analyzer or event-exporter is enabled with no "+
 				"datastore -- they read health events from it and crash-loop without one. Use a remediation "+
 				"step mixin or set %s to mongodb or postgresql", componentName, nvsentinelDatastoreProviderPath)))
 		return errs
@@ -3188,7 +3176,7 @@ func nvsentinelDatastoreViolations(recipeResult *recipe.RecipeResult, bundlerCon
 		}
 		errs = append(errs, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
 			fmt.Sprintf("component %q: %s is %s -- NVSentinel supports only \"mongodb\" and \"postgresql\", "+
-				"and the remediation stages and health-events-analyzer crash-loop on any other provider",
+				"and the remediation stages, health-events-analyzer and event-exporter crash-loop on any other provider",
 				componentName, nvsentinelDatastoreProviderPath, got)))
 		return errs
 	}
@@ -3756,6 +3744,10 @@ func preflightDCGMServingGPUOperator(
 // anything AICR sets, so a different port on that Service name reaches nothing.
 const gpuOperatorDCGMPort = "5555"
 
+// gpuOperatorDCGMGuardPaths are the GPU Operator values that decide whether
+// its DCGM hostengine Service exists.
+var gpuOperatorDCGMGuardPaths = []string{"enabled", "dcgm.enabled"}
+
 // clusterLocalServiceRef splits a cluster-local Service address
 // (service.namespace.svc[.cluster.local][:port]) into its Service, namespace
 // and port. ok=false means the address is not of that form -- an external host
@@ -3918,7 +3910,7 @@ func CheckNVSentinelPreflightDCGMReachable(ctx context.Context, componentName st
 	// recipes where the DCGM check is absent or targets an external hostengine,
 	// neither of which depends on gpu-operator at all.
 	if msgs := nvsentinelDynamicGuardViolations(bundlerConfig, gpuName, gpuKeys,
-		[]string{"enabled", "dcgm.enabled"},
+		gpuOperatorDCGMGuardPaths,
 		"decides whether the DCGM hostengine this check depends on is deployed at all",
 	); len(msgs) > 0 {
 		for _, msg := range msgs {

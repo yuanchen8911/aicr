@@ -49,11 +49,15 @@
 #                       on the runner (no actuator) instead of a cloud cluster.
 #                       Its lease is the single self-hosted GPU runner. Scope is
 #                       honestly H100 x1, single-GPU — whatever the runner has.
-#   reservation-id      the cloud capacity-reservation identifier; GCP uses
-#                       the fully-qualified resource path (matches the value
-#                       embedded in cluster-config-path verbatim); OPTIONAL —
+#   reservation-id      the cloud capacity-reservation identifier. GCP uses
+#                       the fully-qualified resource path. OPTIONAL, and
 #                       omitted for quota-backed capacity (azure), where
-#                       subscription quota, not a reservation, backs the nodes
+#                       subscription quota, not a reservation, backs the nodes.
+#                       It must equal every reservation target in
+#                       cluster-config-path, and a row without one must point
+#                       at a config with no target. The actuator places nodes
+#                       from the cluster-config, so change both together.
+#                       TestCommittedClusterConfigsMatchRegistry enforces it.
 #   accelerator         GPU accelerator family on the reservation
 #   gpu-count           GPUs per reserved node (forward-looking metadata)
 #   cluster-config-path the github.com/mchmarny/cluster Cluster config the
@@ -180,7 +184,7 @@ reservations:
   # so the cluster config pins the backend region with stateLocation and the
   # actuator is pinned to a release that reads it (#3162, see the note there).
   #
-  # gpu-count is 4 because a p6e-gb300r.36xlarge carries 4 B300
+  # gpu-count is 4 because each GB300 EKS GPU node carries 4 B300
   # (describe-instance-types: GpuInfo B300 x 4, arm64, EFA-capable). The
   # reservation holds 18 of them, so it is exactly one NVL72 rack
   # (18 x 4 = 72 GPUs). The capacity ordering doc lists 16; that is the stale

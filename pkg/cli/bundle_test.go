@@ -104,6 +104,38 @@ func TestBundleCmd(t *testing.T) {
 	}
 }
 
+// urfave/cli keeps the last value of a repeated single-value flag silently,
+// so every --argocd-* flag must be in the bundle command's
+// validateSingleValueFlags list.
+func TestBundleCmdRejectsRepeatedArgoCDFlags(t *testing.T) {
+	values := map[string][2]string{
+		flagArgoCDNamePrefix:                  {"a-", "b-"},
+		flagArgoCDDestinationServer:           {"https://a:6443", "https://b:6443"},
+		flagArgoCDProject:                     {"a", "b"},
+		flagArgoCDCascadeDelete:               {"true", "false"},
+		flagArgoCDSyncRetryLimit:              {"5", "50"},
+		flagArgoCDSyncRetryBackoffDuration:    {"5s", "30s"},
+		flagArgoCDSyncRetryBackoffFactor:      {"2", "3"},
+		flagArgoCDSyncRetryBackoffMaxDuration: {"1m", "5m"},
+	}
+	for _, name := range argoCDFlags {
+		t.Run(name, func(t *testing.T) {
+			v, ok := values[name]
+			if !ok {
+				t.Fatalf("no test values for --%s", name)
+			}
+			err := bundleCmd().Run(t.Context(), []string{
+				"bundle", "--deployer", "argocd",
+				"--" + name + "=" + v[0],
+				"--" + name + "=" + v[1],
+			})
+			if err == nil || !strings.Contains(err.Error(), "flag --"+name+" can only be specified once") {
+				t.Fatalf("bundle command error = %v, want repeated --%s rejection", err, name)
+			}
+		})
+	}
+}
+
 func TestBundleCmdRejectsRepeatedSharedStorageClass(t *testing.T) {
 	err := bundleCmd().Run(t.Context(), []string{
 		"bundle",
@@ -1953,6 +1985,52 @@ func TestParseBundleCmdOptions_Fleet(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "does not support OCI output") {
 			t.Errorf("error = %v, want OCI rejection", err)
+		}
+	})
+}
+
+// TestParseBundleCmdOptions_Split covers --split: it flows to opts.split for
+// a local output directory and is rejected with OCI output, which is outside
+// the ADR-018 v1 support matrix.
+func TestParseBundleCmdOptions_Split(t *testing.T) {
+	tmp := t.TempDir()
+	recipePath := filepath.Join(tmp, "recipe.yaml")
+	if err := os.WriteFile(recipePath, []byte("kind: Recipe\n"), 0o600); err != nil {
+		t.Fatalf("write recipe: %v", err)
+	}
+	out := filepath.Join(tmp, "set")
+
+	t.Run("off by default", func(t *testing.T) {
+		opts := captureBundleOpts(t, []string{"--recipe", recipePath, "--output", out})
+		if opts == nil || opts.split {
+			t.Fatalf("split = %v, want false by default", opts != nil && opts.split)
+		}
+	})
+
+	t.Run("flows to opts.split", func(t *testing.T) {
+		opts := captureBundleOpts(t, []string{"--recipe", recipePath, "--output", out, "--split"})
+		if opts == nil || !opts.split {
+			t.Fatalf("split = %v, want true", opts != nil && opts.split)
+		}
+	})
+
+	t.Run("rejected without an explicit --output", func(t *testing.T) {
+		opts, err := tryCaptureBundleOpts(t, []string{"--recipe", recipePath, "--split"})
+		if err == nil {
+			t.Fatalf("expected --split without --output to be rejected, got opts=%+v", opts)
+		}
+		if !strings.Contains(err.Error(), "explicit --output") {
+			t.Errorf("error should ask for an explicit --output, got: %v", err)
+		}
+	})
+
+	t.Run("rejected with OCI output", func(t *testing.T) {
+		opts, err := tryCaptureBundleOpts(t, []string{"--recipe", recipePath, "--output", "oci://registry.example.com/aicr/bundle", "--split"})
+		if err == nil {
+			t.Fatalf("expected --split with OCI output to be rejected, got opts=%+v", opts)
+		}
+		if !strings.Contains(err.Error(), "does not support OCI output") {
+			t.Errorf("error should name the OCI restriction, got: %v", err)
 		}
 	})
 }

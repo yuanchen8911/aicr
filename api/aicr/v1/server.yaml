@@ -126,6 +126,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
       responses:
         '200':
           description: Headers for the response GET would return
@@ -142,6 +143,11 @@ paths:
               $ref: '#/components/headers/RequestIdResponse'
         '400':
           description: Invalid criteria, profile selection, or query parameter (headers only)
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestIdResponse'
+        '404':
+          description: Resolved recipe has no committed evidence pointer (headers only)
           headers:
             X-Request-Id:
               $ref: '#/components/headers/RequestIdResponse'
@@ -191,6 +197,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
       responses:
         "200":
           description: Resolved legacy, profile-bearing, or accounting-configured recipe
@@ -211,6 +218,15 @@ paths:
                 $ref: "#/components/schemas/RecipeResponse"
         "400":
           description: Invalid criteria, profile selection, or query parameter
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestIdResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resolved recipe has no committed evidence pointer
           headers:
             X-Request-Id:
               $ref: "#/components/headers/RequestIdResponse"
@@ -270,6 +286,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
       requestBody:
         required: true
         content:
@@ -308,6 +325,15 @@ paths:
                 $ref: "#/components/schemas/Error"
         "413":
           description: Request body exceeds the maximum allowed size
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestIdResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Resolved recipe has no committed evidence pointer
           headers:
             X-Request-Id:
               $ref: "#/components/headers/RequestIdResponse"
@@ -378,6 +404,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
         - $ref: "#/components/parameters/Selector"
       responses:
         '200':
@@ -399,7 +426,7 @@ paths:
             X-Request-Id:
               $ref: '#/components/headers/RequestIdResponse'
         '404':
-          description: Selector path not found (headers only)
+          description: Selector path not found, or the resolved recipe has no committed evidence pointer (headers only)
           headers:
             X-Request-Id:
               $ref: '#/components/headers/RequestIdResponse'
@@ -447,6 +474,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
         - $ref: "#/components/parameters/Selector"
       responses:
         "200":
@@ -476,7 +504,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: Selector path not found
+          description: Selector path not found, or the resolved recipe has no committed evidence pointer
           headers:
             X-Request-Id:
               $ref: "#/components/headers/RequestIdResponse"
@@ -536,6 +564,7 @@ paths:
         - $ref: "#/components/parameters/ProfileSelection"
         - $ref: "#/components/parameters/SlurmAccountingMode"
         - $ref: "#/components/parameters/GKETCPXOInterfaces"
+        - $ref: "#/components/parameters/RequireEvidence"
       requestBody:
         required: true
         content:
@@ -582,7 +611,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: Selector path not found
+          description: Selector path not found, or the resolved recipe has no committed evidence pointer
           headers:
             X-Request-Id:
               $ref: "#/components/headers/RequestIdResponse"
@@ -658,7 +687,16 @@ paths:
         - $ref: "#/components/parameters/BundleNodes"
         - $ref: "#/components/parameters/VendorCharts"
         - $ref: "#/components/parameters/Serial"
+        - $ref: "#/components/parameters/Split"
         - $ref: "#/components/parameters/AppName"
+        - $ref: "#/components/parameters/ArgoCDNamePrefix"
+        - $ref: "#/components/parameters/ArgoCDDestinationServer"
+        - $ref: "#/components/parameters/ArgoCDProject"
+        - $ref: "#/components/parameters/ArgoCDCascadeDelete"
+        - $ref: "#/components/parameters/ArgoCDSyncRetryLimit"
+        - $ref: "#/components/parameters/ArgoCDSyncRetryBackoffDuration"
+        - $ref: "#/components/parameters/ArgoCDSyncRetryBackoffFactor"
+        - $ref: "#/components/parameters/ArgoCDSyncRetryBackoffMaxDuration"
         - $ref: "#/components/parameters/Attest"
       requestBody:
         required: true
@@ -930,7 +968,7 @@ components:
       description: Kubernetes service/environment type.
       schema:
         type: string
-        enum: [eks, gke, aks, oke, ocp, kind, lke, bcm, metal3, rke2, generic, k0s, mk8s, any]
+        enum: [eks, gke, aks, oke, ocp, kind, lke, bcm, metal3, rke2, generic, k0s, mk8s, nvke, cks, any]
         default: any
     Accelerator:
       name: accelerator
@@ -966,7 +1004,7 @@ components:
       description: GPU node operating system.
       schema:
         type: string
-        enum: [ubuntu, rhel, cos, amazonlinux, ol, talos, sles, any]
+        enum: [ubuntu, rhel, cos, amazonlinux, ol, talos, sles, rocky, any]
         default: any
     Platform:
       name: platform
@@ -1016,6 +1054,21 @@ components:
         accelerator=h100, platform=kubeflow).
       schema:
         type: string
+    RequireEvidence:
+      name: requireEvidence
+      in: query
+      required: false
+      description: >
+        When 1, true, yes, or on, reject the resolved recipe unless a
+        committed evidence pointer exists for its id, including the selected
+        profile value. The check is offline presence only. A pointer on a
+        base id does not cover a profiled resolve, and a leaf that is not
+        the embedded catalog recipe fails. 0, false, no, and off leave the
+        request unchanged. Any other value is rejected. AICR_REQUIRE_EVIDENCE
+        enables the same check for the process when this parameter is absent
+        or false.
+      schema:
+        type: string
     Selector:
       name: selector
       in: query
@@ -1037,7 +1090,12 @@ components:
       description: >-
         Repeatable component:path=value override. Rejected with HTTP 400
         when the component is absent from the generated bundle (scalar
-        enabled=false exempt on a declared component).
+        enabled=false exempt on a declared component). The reserved
+        deployer:<key> spelling (namePrefix, destinationServer, project,
+        cascadeDelete) is deprecated in favor of the argocd-* parameters; it
+        still works, and a request that uses it gets a Link response header
+        with rel="deprecation" pointing at the migration entry. Supplying the
+        same setting both ways is rejected with HTTP 400.
       schema:
         type: array
         items:
@@ -1188,6 +1246,19 @@ components:
       schema:
         type: boolean
         default: false
+    Split:
+      name: split
+      in: query
+      required: false
+      description: >-
+        Return a bundle set partitioned by registry class (ADR-018): one
+        directory per class (core, then ops) under a set root holding
+        recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and, with
+        attest, the attestation. Helm deployer only; cannot be combined
+        with bundlers.
+      schema:
+        type: boolean
+        default: false
     AppName:
       name: app-name
       in: query
@@ -1199,6 +1270,86 @@ components:
         type: string
         pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
         maxLength: 253
+    ArgoCDNamePrefix:
+      name: argocd-name-prefix
+      in: query
+      required: false
+      description: >-
+        Prefix prepended to every child Application name (argocd,
+        argocd-helm). The parent is named by app-name.
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9-]*$'
+    ArgoCDDestinationServer:
+      name: argocd-destination-server
+      in: query
+      required: false
+      description: >-
+        Cluster API URL child Applications deploy to (argocd, argocd-helm;
+        default https://kubernetes.default.svc). The parent stays on the
+        Argo CD cluster.
+      schema:
+        type: string
+        format: uri
+    ArgoCDProject:
+      name: argocd-project
+      in: query
+      required: false
+      description: >-
+        Argo CD project for child Applications (argocd, argocd-helm; default
+        "default"). The parent stays in "default".
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 253
+    ArgoCDCascadeDelete:
+      name: argocd-cascade-delete
+      in: query
+      required: false
+      description: >-
+        Add Argo CD's resources finalizer to the parent and every child
+        Application (argocd, argocd-helm).
+      schema:
+        type: boolean
+    ArgoCDSyncRetryLimit:
+      name: argocd-sync-retry-limit
+      in: query
+      required: false
+      description: >-
+        spec.syncPolicy.retry.limit on every child Application (argocd,
+        argocd-helm). Omit to leave retry to Argo CD's auto-sync default; 0
+        disables retries. Required by the backoff parameters.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    ArgoCDSyncRetryBackoffDuration:
+      name: argocd-sync-retry-backoff-duration
+      in: query
+      required: false
+      description: Delay before the first sync retry, as a Go duration.
+      schema:
+        type: string
+      example: 30s
+    ArgoCDSyncRetryBackoffFactor:
+      name: argocd-sync-retry-backoff-factor
+      in: query
+      required: false
+      description: Multiplier applied to the retry delay after each failed sync.
+      schema:
+        type: integer
+        format: int64
+        minimum: 1
+    ArgoCDSyncRetryBackoffMaxDuration:
+      name: argocd-sync-retry-backoff-max-duration
+      in: query
+      required: false
+      description: >-
+        Upper bound on the delay between sync retries, as a Go duration. Must
+        not be less than argocd-sync-retry-backoff-duration.
+      schema:
+        type: string
+      example: 5m
     Attest:
       name: attest
       in: query
@@ -1253,7 +1404,7 @@ components:
         service:
           type: string
           description: Kubernetes service type
-          enum: [eks, gke, aks, oke, ocp, kind, lke, bcm, metal3, rke2, generic, k0s, mk8s, any]
+          enum: [eks, gke, aks, oke, ocp, kind, lke, bcm, metal3, rke2, generic, k0s, mk8s, nvke, cks, any]
           example: eks
         accelerator:
           type: string
@@ -1268,7 +1419,7 @@ components:
         os:
           type: string
           description: Operating system family
-          enum: [ubuntu, rhel, cos, amazonlinux, ol, talos, sles, any]
+          enum: [ubuntu, rhel, cos, amazonlinux, ol, talos, sles, rocky, any]
           example: ubuntu
         platform:
           type: string

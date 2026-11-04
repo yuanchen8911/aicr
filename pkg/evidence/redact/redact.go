@@ -49,6 +49,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/NVIDIA/aicr/pkg/defaults"
 	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/measurement"
 	"github.com/NVIDIA/aicr/pkg/snapshotter"
@@ -70,7 +71,9 @@ const (
 	//   - v4 added the named-in-skip-checks skipReason code.
 	//   - v5 added the bandwidth, readiness, inference, allocation-policy, and
 	//     operator-version keys, and the in-pod skipReason codes.
-	PolicyVersion = "v5"
+	//   - v6 narrowed the fabric extra's closed set to efa.
+	//   - v7 added the nodesFailed and nodesSkipped coverage counts.
+	PolicyVersion = "v7"
 )
 
 // headerMetadataAllowlist is the fail-closed set of snapshot header metadata
@@ -271,8 +274,10 @@ var ctrfRuntimeSources = []string{
 // failing its validator, is dropped. Keep the keys mirrored in
 // docs/contributor/validator.md.
 var ctrfExtraAllowlist = map[string]ctrfExtraValidator{
-	"nodesValidated": ctrfCountValue.MatchString, // count of nodes a coverage check actually verified
-	"nodesTotal":     ctrfCountValue.MatchString, // count of candidate nodes (validated + skipped/cordoned)
+	"nodesValidated": ctrfCountValue.MatchString, // count of nodes a coverage check verified and found passing
+	"nodesTotal":     ctrfCountValue.MatchString, // count of candidate nodes (validated + failed + skipped)
+	"nodesFailed":    ctrfCountValue.MatchString, // count of nodes a coverage check verified and found failing
+	"nodesSkipped":   ctrfCountValue.MatchString, // count of nodes a coverage check skipped (busy, busy-probe error, cordoned)
 	"skipReason":     closedSet(ctrfSkipReasons...),
 	// NCCL benchmark runtime provenance, which artifact the bandwidth number
 	// describes. The template digests and path diff backing the claim are
@@ -287,7 +292,7 @@ var ctrfExtraAllowlist = map[string]ctrfExtraValidator{
 	"workerNodes":   ctrfCountValue.MatchString,
 	"gpusInvolved":  ctrfCountValue.MatchString,
 	"transport":     closedSet("default", "net", "nvls"),
-	"fabric":        closedSet("efa", "roce"),
+	"fabric":        closedSet("efa"),
 
 	// Deployment readiness.
 	"draReady":           ctrfCountValue.MatchString,
@@ -474,7 +479,7 @@ var ctrfVendorKeys = map[string]struct{}{
 	"cloud.google.com/gke-accelerator":            {},
 	"trainer.kubeflow.org/trainjob-ancestor-step": {},
 	"nvidia.com/gpu":                              {}, // the worker's GPU request — the count the measurement ran on
-	"nvidia.com/gpu.present":                      {},
+	defaults.GPUPresentNodeLabelKey:               {},
 	"node.kubernetes.io/instance-type":            {},
 }
 

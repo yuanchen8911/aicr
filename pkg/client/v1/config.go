@@ -358,14 +358,24 @@ func (c *Config) IsCriteriaStrict() bool {
 	return c.internal.Recipe().IsCriteriaStrict()
 }
 
+// IsRequireEvidence reports spec.recipe.requireEvidence, which rejects a
+// resolved recipe that has no committed evidence pointer. The caller applies
+// it after resolution. It does not change catalog matching.
+func (c *Config) IsRequireEvidence() bool {
+	if c == nil || c.internal == nil {
+		return false
+	}
+	return c.internal.Recipe().IsRequireEvidence()
+}
+
 // BundleOptions derives Client.MakeBundle options from spec.bundle, as plain
 // fields rather than a built *BundleConfig — so a caller (the CLI in
 // particular) can read and override individual settings with its own flag
 // precedence instead of reaching into an opaque built config.
 //
-// Eighteen flat fields project the bundler settings the section configures —
+// Nineteen flat fields project the bundler settings the section configures —
 // deployment (deployer, repo, value overrides, dynamic values, vendoring, app
-// name), scheduling (system/accelerated selectors and tolerations, DRA
+// name, Argo CD settings), scheduling (system/accelerated selectors and tolerations, DRA
 // eviction label, workload gate and selector, node count, storage classes),
 // and the two attestation flags the bundler itself reads (attest, certificate
 // identity regexp). OIDCResolve carries what reaches the attester rather than
@@ -431,6 +441,7 @@ func (c *Config) BundleOptions() (BundleOptions, error) {
 		CertIDRegexp:         resolved.CertIDRegexp,
 		VendorCharts:         resolved.VendorCharts,
 		AppName:              resolved.AppName,
+		ArgoCD:               resolved.ArgoCD,
 		OIDCResolve: OIDCResolveOptions{
 			Attest:     resolved.Attest,
 			DeviceFlow: resolved.OIDCDeviceFlow,
@@ -830,7 +841,9 @@ func (c *Config) EvidenceAttestationOptions() (EvidenceOptions, bool, error) {
 // --feature). The CALLER reads it, applies its own flag precedence, and then
 // picks a Client method. CNCFSubmission true means Client.CollectCNCFEvidence
 // with Dir and Features in CNCFCollectOptions. Otherwise a non-empty Dir
-// means Client.RenderCNCFEvidence after ValidateState.
+// means Client.RenderCNCFEvidenceWithOptions after ValidateState, with
+// KubernetesVersion from the snapshot, which is what aicr validate does;
+// Client.RenderCNCFEvidence renders the latest carried checklist instead.
 type CNCFEvidenceOptions struct {
 	// Dir is spec.validate.evidence.cncf.dir, the directory CNCF AI
 	// Conformance evidence markdown is written to.

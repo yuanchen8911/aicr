@@ -1,0 +1,234 @@
+# aicr-operator chart
+
+Installs the AICR Operator
+([ADR-027](../../docs/design/027-aicr-operator.md)), its identities, admission
+policies, Argo CD project and namespaces. Values are described in
+[values.yaml](values.yaml) and the
+[API reference](../../docs/operator/api.md#installation-values); the schema
+rejects unknown keys, and rendering fails for an AICR version outside
+`>=1.0.0, <2.0.0`.
+
+## Prerequisites
+
+- Kubernetes 1.34 or later.
+- Argo CD installed (the pinned release is in `.settings.yaml`), with
+  `CreateNamespace` off.
+- For the default in-cluster registry, a default StorageClass and its CSI
+  driver that exist before install, or `registry.inCluster.storage.storageClassName`.
+  Nothing else: the chart runs the registry and generates its login. EKS has
+  no StorageClass until its recipe installs one through the operator, so use
+  an external registry there.
+- For an external registry (`registry.mode: external`), the registry itself.
+  With `registry.auth.provider: aws`, an IAM role for the operator through EKS
+  Pod Identity or IRSA (`operator.serviceAccountAnnotations`) carrying
+  [files/ecr-iam-policy.json](files/ecr-iam-policy.json) for the runtime
+  prefix. With `static`, the docker config Secret
+  `registry.auth.staticSecretRef` in the operator and Job namespaces (and the
+  validation namespace with `validation.enabled`), and the Argo CD
+  `repo-creds` Secret, all created by the administrator.
+- The operator namespace, which is the release namespace, created with the
+  restricted Pod Security profile. Helm cannot template its own release
+  namespace, so the chart does not create it:
+
+  ```shell
+  kubectl create namespace aicr-system
+  kubectl label namespace aicr-system pod-security.kubernetes.io/enforce=restricted
+  ```
+
+## Install and upgrade
+
+```shell
+helm upgrade --install aicr-operator oci://ghcr.io/nvidia/charts/aicr-operator \
+  --version <version> --namespace aicr-system -f values.yaml
+```
+
+A published chart defaults to its release's operator and registry images and
+to the AICR and validator images the operator was qualified against, which
+can be an earlier AICR release, all pinned by digest. Installing from this
+source tree instead needs `operator.image`, `aicr.image` and
+`registry.inCluster.image` set, and `aicr.validatorImages` with
+`validation.enabled`.
+
+The in-cluster registry is the default. An installation from a chart that had
+only external registries keeps its registry with `registry.mode: external`;
+rendering fails until that is set. Switching a running installation between
+registries is not supported, because its plans name the registry they were
+mirrored to: an upgrade whose values select another registry than the
+installed `aicr` AppProject's fails to render.
+
+The chart generates the in-cluster registry's login on install and reads it
+back with Helm's `lookup` on upgrade, so install and upgrade it with
+`helm install` and `helm upgrade`. A renderer without cluster access, such as
+`helm template` or an Argo CD Application managing this chart, generates a new
+login on every render and restarts the registry with it, and its output holds
+that login in clear: never commit it.
+
+An operator upgrade is a chart upgrade: image, CRDs, RBAC and policies
+together. The CRDs are templates, not `crds/` files, so `helm upgrade` updates
+them. AICR upgrades are a values change.
+
+## Values
+
+Every value, with its default and when to set it. **Required** values have no
+usable default; a published chart already pins `aicr.image`,
+`aicr.validatorImages`, `operator.image` and `registry.inCluster.image` to the
+images its release was tested with, so those are required only when
+installing from source. The
+[API reference](../../docs/operator/api.md#installation-values) shows them in
+context; the schema rejects unknown keys.
+
+| Key | Default | Set it | Meaning |
+| --- | --- | --- | --- |
+| `aicr.version` | `v1.0.0`; a published chart, the version it was tested with | To change AICR | The declared AICR release, `>=1.0.0, <2.0.0`. Changing it is an AICR upgrade, rolled out like any other change |
+| `aicr.image` | A published chart's tested image | Required from source | AICR CLI and snapshot agent image, pinned by digest |
+| `aicr.validatorImages` | A published chart's tested images | Required from source with `validation.enabled` | AICR's validator images for `aicr.version`, each `repository:tag@sha256:<digest>` |
+| `aicr.jobs.nodeSelector` | `{}` | When every node is tainted | Node selector for every AICR Job the operator runs; empty places none |
+| `aicr.jobs.tolerations` | `[]` | When every node is tainted | Tolerations for every AICR Job the operator runs, such as `CriticalAddonsOnly` on EKS system nodes |
+| `operator.image` | A published chart's tested image | Required from source | Operator image; pin it by digest on a shared cluster |
+| `operator.imagePullPolicy` | `IfNotPresent` | Optional | |
+| `operator.replicas` | `1` | Optional | 1 to 3; extra replicas wait on the leader-election Lease |
+| `operator.logLevel` | `info` | Optional | `debug`, `info`, `warn` or `error` |
+| `operator.resources` | Requests `100m`, `128Mi`; limit `512Mi` | Optional | The operator container's requests and limits; the memory limit is also its `GOMEMLIMIT` |
+| `operator.serviceAccountAnnotations` | `{}` | With `registry.auth.provider: aws` | Annotations on the operator's ServiceAccount, such as the IRSA role ARN |
+| `operator.nodeSelector` | `{}` | Optional | Node selector for the operator pod |
+| `operator.tolerations` | `[]` | Optional | Tolerations for the operator pod |
+| `operator.affinity` | `{}` | Optional | Affinity for the operator pod |
+| `engine.type` | `ArgoCD` | No | The supported engine; Flux follows |
+| `engine.namespace` | `argocd` | When Argo CD runs elsewhere | Argo CD's control namespace |
+| `engine.project` | `aicr` | Optional | The AppProject the chart creates and every owned Application uses |
+| `registry.mode` | `inCluster` | To use your own registry | `inCluster`: the chart runs the runtime registry in the operator namespace with a generated login. `external`: the registry at `registry.repository` |
+| `registry.repository` | `""` | **Required** with `external` | Runtime registry prefix, `oci://host/path`, for bundles, mirrored charts and evidence |
+| `registry.plainHTTP` | `false` | Test registries only | Plain HTTP to an external registry; the in-cluster registry always uses it |
+| `registry.auth.provider` | `aws` | With `external` | `aws`: ECR through the operator's AWS identity, with a token the operator refreshes. `static`: Secrets you provide |
+| `registry.auth.staticSecretRef` | `""` | With `static` and a private registry | Docker config Secret name in the operator, Job and validation namespaces |
+| `registry.auth.repoCredsSecret` | `aicr-registry` | Optional | Argo CD `repo-creds` Secret for the runtime registry; the chart creates it with `aws` and `inCluster` |
+| `registry.inCluster.image` | A published chart's registry image | Required from source with `inCluster` | The registry image (`cmd/aicr-registry`, CNCF Distribution); from source, `KO_DOCKER_REPO=<repo> ko build ./cmd/aicr-registry`. The upstream `registry:3` image also works. It runs on the operator's nodes: `operator.nodeSelector`, `operator.tolerations` and the node affinity in `operator.affinity` |
+| `registry.inCluster.clusterDomain` | `cluster.local` | When the cluster's DNS domain differs | Completes the registry's fully qualified Service host, `aicr-registry.<namespace>.svc.<domain>:5000` |
+| `registry.inCluster.storage` | `10Gi`, the default StorageClass | Optional | The registry volume's `size` and `storageClassName`. Nothing is deleted from it, and it is kept on uninstall. Growing it needs a StorageClass that allows expansion; the class cannot change after install |
+| `registry.inCluster.resources` | Requests `50m`, `64Mi`; limit `512Mi` | Optional | The registry container's requests and limits |
+| `registry.inCluster.repoServerLabels` | `app.kubernetes.io/name: argocd-repo-server` | When Argo CD's repo server is labeled otherwise | The only pods in `engine.namespace` the registry's NetworkPolicy admits |
+| `namespaces.discovery` | `aicr-discovery` | Optional | Snapshot namespace, Pod Security `privileged` |
+| `namespaces.jobs` | `aicr-jobs` | Optional | Recipe, render and upgrade-check namespace, Pod Security `restricted` |
+| `namespaces.validation` | `aicr-validation` | Optional | Validation namespace, created with `validation.enabled` |
+| `namespaces.components` | `[]` | **Required** | Every namespace the recipe deploys into (`name`, `podSecurity`, `create`); a release outside them stalls with `NamespaceNotAllowed` |
+| `discovery.agentRequests` | `""` | Optional | Snapshot agent requests, `name=quantity,...`; empty keeps AICR's GPU-node defaults |
+| `validation.enabled` | `false` | Recommended | Installs deployment validation, which gates every rollout by default; without it, set `spec.validation.deployment: Disabled` |
+| `validation.serviceAccountAnnotations` | `{}` | With `validation.signingKey` | Annotations on the validation launcher's ServiceAccount, such as the workload identity that signs evidence |
+| `validation.signingKey` | `""` | Optional, AICR v1.1.0 or later | KMS key URI that signs evidence; empty pushes it unsigned |
+| `validation.transparencyLog` | `true` | Optional | Upload key signatures to Rekor; `false` keeps them out of the public log |
+| `approvers.users` | `[]` | **Required**, with `approvers.groups` | Users bound to the approver roles; without an approver no rollout that needs approval can proceed |
+| `approvers.groups` | `[]` | **Required**, with `approvers.users` | Groups bound to the approver roles; keep them apart from `ClusterRuntime` editors |
+| `development.bypassApprovals` | `false` | Development only | Proceed without approvals. Only a development build (the `aicr_operator_development` tag) starts with it |
+| `development.skipDiscovery` | `false` | Development only | Resolve from declared criteria without a snapshot. Only a development build starts with it |
+
+`engine.manageCustomizations` is still accepted and ignored: the operator no
+longer writes `argocd-cm`
+([Argo CD](../../docs/operator/argocd.md#comparison-exceptions-and-argocd-cm)).
+
+## What it installs
+
+| Resource | On `helm uninstall` |
+| --- | --- |
+| CRDs `ClusterRuntime`, `RuntimeRollout` | Kept; runtime and rollout objects survive |
+| Job (`restricted`), discovery (`privileged`), validation (`privileged`, when enabled) and component namespaces | Kept; the GPU stack survives |
+| `aicr` AppProject; with `aws`, the `repo-creds` Secret the operator refreshes; with `inCluster`, the registry's `repo-creds` | Kept; owned Applications stay valid |
+| With `inCluster`: the registry Deployment, Service, ConfigMap, NetworkPolicy, login Secret and volume | Kept; the registry keeps serving owned Applications, and a reinstall adopts it with the same content and login |
+| With `inCluster`: the login's copies in the operator, Job and validation namespaces | Deleted |
+| Policies `aicr-operator-state` and `aicr-operator-approval` and their bindings | Kept; plans and rollouts stay protected while no operator runs |
+| Policies `aicr-operator-applications`, `aicr-operator-application-deletes`, `aicr-operator-jobs`, `aicr-operator-rollout-outcome`, `aicr-operator-runtime` | Deleted with the operator they constrain |
+| Deployment, ServiceAccounts, roles and bindings | Deleted |
+
+With `validation.enabled`, deployment validation also needs
+`aicr.validatorImages`: AICR's validator images for `aicr.version`, each as
+`repository:tag@sha256:<digest>` (the pins for the supported releases are in
+`.settings.yaml`). AICR names the tags in its evidence; the operator fails a run
+whose evidence names any other validator image, and checks that each tag still
+resolves to its digest before binding the evidence.
+With AICR v1.1.0 or later, `validation.signingKey` (a KMS key URI) signs the
+evidence through the launcher's workload identity
+(`validation.serviceAccountAnnotations`), and `validation.transparencyLog:
+false` keeps the signatures out of the public Rekor log. The chart refuses a
+signing key with AICR v1.0.x or without `validation.enabled`.
+
+`namespaces.components` is also the allowlist the operator enforces itself: a
+plan that renders a release into any other namespace stalls resolution with
+`NamespaceNotAllowed` and never reaches Argo CD.
+
+Admission policies, all ValidatingAdmissionPolicies without webhooks:
+
+- `aicr-operator-applications` (the operator only): project `aicr`; one source
+  under the runtime registry's `charts/` or `wrappers/` pinned by `sha256:`;
+  no plugin, value files or parameters; the in-cluster server and a component
+  namespace; the resources finalizer only with a non-empty `delete-rollout`
+  annotation.
+- `aicr-operator-application-deletes` (the operator only): deletes only of
+  its own Applications that carry the resources finalizer and a non-empty
+  `delete-rollout` annotation, which an approved `Remove` step sets.
+- `aicr-operator-jobs` (the operator only): one container running the pinned
+  AICR image with its entrypoint; the namespace's AICR identity and allowed
+  subcommand (`recipe`, `bundle`, `upgrade-check` in the Job namespace,
+  `snapshot` in discovery, `validate` in validation); a TTL; only the flags
+  the operator builds for that subcommand, each value flag followed by a
+  value that does not start with `-`, so `--config`, `--data` and any flag a later AICR release adds are
+  denied; a snapshot agent image named only as `--image <pinned AICR image>`;
+  only `HOME`, `TMPDIR` and
+  `DOCKER_CONFIG` in the environment, each set by value, and only `emptyDir`
+  and Secret volumes.
+- `aicr-operator-rollout-outcome` (the operator only): the `outcome` label and
+  `evidence` annotation never change once set.
+- `aicr-operator-runtime` (the operator only): a `ClusterRuntime` changes only
+  through the operator's `operator.aicr.run/cleanup` finalizer.
+- `aicr-operator-state` (everyone but the operator): no create or update of an
+  operator-labeled ConfigMap in the operator namespace, including removing the
+  label. Deletion is left to RBAC, so deleting the namespace works.
+- `aicr-operator-approval` (kept on uninstall): only the operator creates
+  rollouts, never with an approval, and it never writes one; anyone else
+  changes only `spec.approval`, needs `update` on `runtimerollouts/approve`,
+  records their own username, and cannot revoke a rollout that has ended or
+  is validating.
+
+Approvers get the `aicr-operator-approver` ClusterRole and Role (read
+rollouts, the runtime and assessment reports in the operator namespace;
+approve), bound to `approvers.users` and `approvers.groups`. Keep them apart
+from `ClusterRuntime` editors.
+
+## Pod Security
+
+The operator, the in-cluster registry and AICR's recipe, bundle and
+upgrade-check Jobs run under the restricted profile: non-root, read-only root file system, all capabilities
+dropped, `RuntimeDefault` seccomp and size-limited `emptyDir` scratch space.
+Two namespaces are documented exceptions:
+
+- discovery is `privileged`: AICR's snapshot agent runs privileged with host
+  PID, network and IPC and read-only host paths;
+- validation is `privileged`: AICR's validators are cluster-admin-equivalent;
+  the level stays until the profile they need is measured.
+
+## Network egress
+
+| Component | Destinations |
+| --- | --- |
+| Operator | Kubernetes API; runtime registry; pinned upstream chart repositories; the validator images' registry; AWS STS and ECR endpoints |
+| AICR render Jobs | Kubernetes API; runtime registry |
+| Argo CD repo-server | Runtime registry only |
+| Snapshot agent | Kubernetes API |
+| Validation Jobs | Kubernetes API; runtime registry for evidence |
+
+The operator makes no Sigstore or TUF calls. The in-cluster registry makes no
+outbound calls; its NetworkPolicy admits only the operator, the operator's
+Jobs in the Job and validation namespaces and Argo CD's repo server, where
+the CNI enforces
+NetworkPolicy. `kubectl port-forward` bypasses that policy, so for anyone
+allowed `pods/portforward` in the operator namespace the login is the only
+control.
+
+## Uninstall
+
+1. Delete the `ClusterRuntime` and wait for its finalizer.
+2. `helm uninstall aicr-operator --namespace aicr-system`.
+3. Optionally, once nothing will re-adopt the stack, delete the operator, Job,
+   discovery and validation namespaces (the operator namespace holds the
+   in-cluster registry and its volume), the Argo CD `repo-creds` Secret, the
+   kept policies and bindings, and the CRDs by hand.
+
+A reinstall with the same release name adopts the kept resources.

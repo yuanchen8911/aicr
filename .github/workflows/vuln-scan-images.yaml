@@ -17,8 +17,9 @@ name: Weekly Image Vulnerability Scan
 on:
   schedule:
     # Weekly on Thursday at 6:00 AM UTC. Every run reports the full HIGH+
-    # set, carried-over findings included -- an open vulnerability keeps
-    # being reported until it is fixed or VEX-suppressed.
+    # set in its scan-* artifacts, carried-over findings included -- an open
+    # vulnerability keeps being reported until it is fixed or VEX-suppressed.
+    # The Slack message summarizes it (tools/vuln-scan-summary).
     - cron: '0 6 * * 4'
   workflow_dispatch:
     inputs:
@@ -43,7 +44,7 @@ env:
 jobs:
 
   # =============================================================================
-  # Build Ko Images (aicr, aicrd)
+  # Build Ko Images (aicr, aicrd, aicr-operator, aicr-registry)
   # =============================================================================
 
   build-ko:
@@ -98,6 +99,31 @@ jobs:
         run: |
           set -euo pipefail
           ko build ./cmd/aicrd \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --image-label="org.opencontainers.image.revision=${{ github.sha }}" \
+            --tags="${SCAN_TAG}"
+
+      # The AICR Operator's images, built as the release builds them
+      # (tools/operator-candidate): .ko.yaml with no development build tag.
+      - name: Build and push aicr-operator
+        env:
+          KO_DOCKER_REPO: ghcr.io/nvidia/aicr-operator
+          AICR_OPERATOR_DEVELOPMENT: 'false'
+        run: |
+          set -euo pipefail
+          ko build ./cmd/aicr-operator \
+            --bare \
+            --platform=linux/amd64,linux/arm64 \
+            --image-label="org.opencontainers.image.revision=${{ github.sha }}" \
+            --tags="${SCAN_TAG}"
+
+      - name: Build and push aicr-registry
+        env:
+          KO_DOCKER_REPO: ghcr.io/nvidia/aicr-registry
+        run: |
+          set -euo pipefail
+          ko build ./cmd/aicr-registry \
             --bare \
             --platform=linux/amd64,linux/arm64 \
             --image-label="org.opencontainers.image.revision=${{ github.sha }}" \
@@ -307,13 +333,17 @@ jobs:
   # =============================================================================
 
   scan:
-    name: Scan (${{ matrix.image }})
-    runs-on: ubuntu-24.04
+    name: Scan (${{ matrix.image }}${{ matrix.arch && format(' {0}', matrix.arch) || '' }})
+    # The two NVSentinel NCCL check images (matrix.large) need about 28 GiB
+    # while grype catalogs them (#3249). A 16 GiB ubuntu-24.04 runner runs out
+    # of memory and gets killed with a shutdown signal; linux-amd64-cpu16
+    # (NVIDIA self-hosted, 61 GiB) holds it in RAM.
+    runs-on: ${{ matrix.large && 'linux-amd64-cpu16' || 'ubuntu-24.04' }}
     needs: [build-ko, docker-manifest]
-    # 30, not 15: the two NVSentinel NCCL check images are ~9.9 GiB compressed
-    # each, so the pull and extraction alone outlast the budget the small
-    # AICR-built images need. Matrix jobs get their own runner, so the larger
-    # budget costs nothing for the images that finish in two minutes.
+    # 30, not 15: the NCCL check images take about five minutes on cpu16 but
+    # ten or more wherever they get less memory, and a slow registry pull
+    # adds to either. Matrix jobs get their own runner, so the larger budget
+    # costs nothing for the images that finish in two.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -329,11 +359,15 @@ jobs:
           - ghcr.io/nvidia/aicr-validators/conformance
           - ghcr.io/nvidia/aicr-validators/aiperf-bench
           - ghcr.io/nvidia/aicr-gate
+          # aicr-operator and aicr-registry are scanned once per architecture,
+          # as the release's operator-scan does; see include below.
           # AICR does not build the images below. They ship only with the
           # opt-in nvsentinel-object-monitor (#2612), nvsentinel-preflight
           # (#2610), nvsentinel-nic-health-monitor, nvsentinel-slurm-drain-monitor
-          # (#2611), remediation, nvsentinel-slinky-drainer (#2615) and
-          # nvsentinel-health-events-analyzer (#2618) mixins, and no other job
+          # (#2611), remediation, nvsentinel-slinky-drainer (#2615),
+          # nvsentinel-health-events-analyzer (#2618), nvsentinel-event-exporter
+          # (#2621), nvsentinel-log-collector (#2619) and
+          # nvsentinel-node-validation (#3088) mixins, and no other job
           # scans a mixin-gated image, so nothing else would surface a CVE in
           # them.
           # Because they are not built by this workflow they carry their
@@ -353,6 +387,16 @@ jobs:
           - ghcr.io/nvidia/nvsentinel/gpu-reset
           - ghcr.io/nvidia/nvsentinel/slinky-drainer
           - ghcr.io/nvidia/nvsentinel/health-events-analyzer
+          - ghcr.io/nvidia/nvsentinel/event-exporter
+          - ghcr.io/nvidia/nvsentinel/log-collector
+          - ghcr.io/nvidia/nvsentinel/file-server-cleanup
+          - ghcr.io/nvidia/nvsentinel/lifecycle-manager
+          # The nvsentinel-log-collector mixin's file server, at the nvsentinel
+          # chart's own pins; its init container's busybox is the AICR pin
+          # below. bitnamilegacy is Bitnami's frozen archive and is never
+          # patched, so expect findings here.
+          - docker.io/bitnamilegacy/nginx
+          - quay.io/martinhelmich/prometheus-nginxlog-exporter
           # Percona, from the remediation mixins' separately bundled datastore
           # (psmdb-operator, nvsentinel-mongodb). Pinned by AICR, by digest.
           - docker.io/percona/percona-server-mongodb-operator
@@ -364,23 +408,37 @@ jobs:
           # Third-party, pinned by AICR rather than the chart:
           # global.initContainerImage, used by chown/permission init
           # containers in the nic-health-monitor and audit-logging paths,
-          # and janitor-provider's generic reboot Job image. AICR overrides
-          # the chart's defaults for both -- the first in
+          # janitor-provider's generic reboot Job image, and the in-cluster
+          # file server's init container. AICR overrides the chart's defaults
+          # for all three -- the first in
           # recipes/components/nvsentinel/values.yaml, the second
           # (janitor-provider.csp.generic.rebootImage) in
-          # recipes/mixins/nvsentinel-remediation.yaml -- so what is scanned
+          # recipes/mixins/nvsentinel-remediation.yaml, the third
+          # (incluster-file-server.initImage) in
+          # recipes/mixins/nvsentinel-log-collector.yaml -- so what is scanned
           # here is the override; keep them in step.
           - docker.io/library/busybox
         include:
+          # One leg per architecture: an include entry naming an image the
+          # list above lacks adds a leg rather than extending one.
+          - image: ghcr.io/nvidia/aicr-operator
+            arch: amd64
+          - image: ghcr.io/nvidia/aicr-operator
+            arch: arm64
+          - image: ghcr.io/nvidia/aicr-registry
+            arch: amd64
+          - image: ghcr.io/nvidia/aicr-registry
+            arch: arm64
           # Keep in lockstep with nvsentinel's defaultVersion in
           # recipes/registry.yaml; TestObjectMonitorImagePinnedEverywhere,
           # TestPreflightImagesPinnedEverywhere,
           # TestNICHealthMonitorImagePinnedEverywhere,
           # TestSlurmDrainMonitorImagePinnedEverywhere,
           # TestRemediationImagesPinnedEverywhere,
-          # TestSlinkyDrainerImagePinnedEverywhere and
-          # TestHealthEventsAnalyzerImagePinnedEverywhere fail if these drift
-          # apart.
+          # TestSlinkyDrainerImagePinnedEverywhere,
+          # TestHealthEventsAnalyzerImagePinnedEverywhere,
+          # TestEventExporterImagePinnedEverywhere and
+          # TestLogCollectorImagesPinnedEverywhere fail if these drift apart.
           - image: ghcr.io/nvidia/nvsentinel/kubernetes-object-monitor
             tag: v1.28.0
           - image: ghcr.io/nvidia/nvsentinel/preflight
@@ -389,8 +447,10 @@ jobs:
             tag: v1.28.0
           - image: ghcr.io/nvidia/nvsentinel/preflight-nccl-loopback
             tag: v1.28.0
+            large: true
           - image: ghcr.io/nvidia/nvsentinel/preflight-nccl-allreduce
             tag: v1.28.0
+            large: true
           - image: ghcr.io/nvidia/nvsentinel/nic-health-monitor
             tag: v1.28.0
           - image: ghcr.io/nvidia/nvsentinel/slurm-drain-monitor
@@ -412,14 +472,30 @@ jobs:
             tag: v1.28.0@sha256:bf6ccaf1d6c035aa5f86e70a929dc6d9a18c5c05b10104d23c69aacff35bcb14
           - image: ghcr.io/nvidia/nvsentinel/health-events-analyzer
             tag: v1.28.0
+          - image: ghcr.io/nvidia/nvsentinel/event-exporter
+            tag: v1.28.0
+          - image: ghcr.io/nvidia/nvsentinel/log-collector
+            tag: v1.28.0
+          - image: ghcr.io/nvidia/nvsentinel/file-server-cleanup
+            tag: v1.28.0
+          - image: ghcr.io/nvidia/nvsentinel/lifecycle-manager
+            tag: v1.28.0
+          # The nvsentinel chart's own pins for the file server's third-party
+          # images. The weekly TestNVSentinelLogCollectorChartRender fails if a
+          # chart bump moves them; TestLogCollectorImagesPinnedEverywhere then
+          # keeps this list, the mirror lane and the docs on the new tags.
+          - image: docker.io/bitnamilegacy/nginx
+            tag: 1.27.2-debian-12-r2
+          - image: quay.io/martinhelmich/prometheus-nginxlog-exporter
+            tag: v1.10.0
           # AICR's own pins in recipes/components/{psmdb-operator,nvsentinel-mongodb};
           # TestRemediationImagesPinnedEverywhere fails if these drift apart.
           - image: docker.io/percona/percona-server-mongodb-operator
             tag: 1.23.1@sha256:78c87b933e184b9af36dbb0078751862c75934c1521c33d3be4d0a38aa58dd0a
           - image: docker.io/percona/percona-server-mongodb
-            tag: 8.0.26-11@sha256:53f89c001997627554e6afc0feb5906209ba109f4f98c62f2ca8456c214af60c
+            tag: 8.0.32-14@sha256:5ba5f240d2dc98bc6236ab1d79c0862c4b62dba9d98cd0ffdf716c30473d2d11
           - image: docker.io/percona/mongodb_exporter
-            tag: 0.53.0@sha256:0214e482b2cd4b1849f9f4dcef90d328a99ba3727dd1103e7da48b42060bcec1
+            tag: 0.54.0@sha256:934e9db87e85e0fa63654e73c3504845993a254e898783ca905e65a68848b5a4
           - image: docker.io/percona/percona-backup-mongodb
             tag: 2.15.0@sha256:12dcba7f1b55e00eb1b49dac51427d942c221b826d621d6bfad926a9d959a7c5
           - image: docker.io/percona/fluentbit
@@ -431,7 +507,7 @@ jobs:
           # not move with defaultVersion. Digest-pinned, so the tag is only
           # there to read; grype resolves the digest.
           - image: docker.io/library/busybox
-            tag: 1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e
+            tag: 1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -441,24 +517,21 @@ jobs:
       - name: Authenticate to registry
         uses: ./.github/actions/ghcr-login
 
-      # Only for images this workflow does not build. An ubuntu-24.04 runner
-      # ships with roughly 21 GiB free, and grype extracts the image before
-      # scanning it, so a ~9.9 GiB compressed NCCL check image does not fit
-      # without this. matrix.tag is the marker for "upstream image".
-      - name: Free disk space for large upstream images
-        if: ${{ matrix.tag != '' }}
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
-          docker system prune -f
-          df -h /
-
       - name: Scan container image
         id: scan
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
+        env:
+          # The action passes its environment to grype, which reads the leg's
+          # platform from the image index.
+          GRYPE_PLATFORM: ${{ matrix.arch && format('linux/{0}', matrix.arch) || '' }}
         with:
           # matrix.tag is set only for images this workflow does not build,
           # which carry their upstream version instead of SCAN_TAG.
-          image: '${{ matrix.image }}:${{ matrix.tag || env.SCAN_TAG }}'
+          # Large images are read straight from the registry, which halves
+          # the scan time: through the docker daemon they land on disk three
+          # times (pull, save, extract). So is a leg with an architecture,
+          # which the registry source selects from the index.
+          image: '${{ (matrix.large || matrix.arch) && ''registry:'' || '''' }}${{ matrix.image }}:${{ matrix.tag || env.SCAN_TAG }}'
           severity-cutoff: 'high'
           output-format: json
           only-fixed: true
@@ -474,16 +547,22 @@ jobs:
         shell: bash
         env:
           IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           JSON_FILE="${{ steps.scan.outputs.json }}"
-          SHORT_NAME="${IMAGE##*/}"
+          # A leg with an architecture names it, matching its job name, which
+          # the notify job reads for a leg that did not complete.
+          SHORT_NAME="${IMAGE##*/}${ARCH:+ ${ARCH}}"
           mkdir -p scan-results
-          OUT="scan-results/${SHORT_NAME}.txt"
+          OUT="scan-results/${IMAGE##*/}${ARCH:+-${ARCH}}.txt"
 
+          # grype killed by a signal can leave the scan step green with no
+          # output. Fail the leg so the summary reports it as incomplete
+          # instead of counting the image as clean.
           if [[ ! -f "${JSON_FILE}" ]]; then
-            echo "${SHORT_NAME}: scan output missing" > "${OUT}"
-            exit 0
+            echo "::error::${SHORT_NAME}: scan output missing"
+            exit 1
           fi
 
           # Severity counts from non-suppressed matches.
@@ -524,18 +603,28 @@ jobs:
           retention-days: 1
 
   # =============================================================================
-  # Notify: Post scan results to Slack (only on critical/high findings)
+  # Notify: Post scan results to Slack (on critical/high findings or incomplete scans)
   # =============================================================================
 
   notify:
     name: Slack Notification
     runs-on: ubuntu-24.04
     needs: [scan]
-    if: always() && needs.scan.result != 'cancelled'
+    # !cancelled(), not needs.scan.result: a single leg that hits its
+    # timeout concludes as cancelled and would otherwise skip the summary.
+    if: ${{ !cancelled() }}
     timeout-minutes: 5
     permissions:
       contents: read
+      # actions: read -- lists this run's scan jobs so a leg that died
+      # before uploading its artifact is reported instead of omitted.
+      actions: read
     steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Download all scan results
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
@@ -545,6 +634,7 @@ jobs:
 
       - name: Post to Slack
         env:
+          GH_TOKEN: ${{ github.token }}
           SLACK_SERVICE: ${{ secrets.SLACK_SERVICE }}
           # Scheduled runs always post; manual runs post only when the
           # notify_slack input is set. The message is echoed to the logs
@@ -554,6 +644,8 @@ jobs:
           SERVER: ${{ github.server_url }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SCAN_RESULT: ${{ needs.scan.result }}
         run: |
           set -euo pipefail
           SHORT_SHA="${SHA:0:7}"
@@ -563,14 +655,9 @@ jobs:
           # Aggregate critical and high counts across all images
           TOTAL_CRITICAL=0
           TOTAL_HIGH=0
-          RESULTS=""
           for f in scan-results/*.txt; do
             [[ -f "$f" ]] || continue
-            # First line: summary counts. Subsequent lines (when present):
-            # HIGH+ CVE/GHSA IDs for triage. Both flow into the Slack message.
             HEADER=$(head -1 "$f")
-            BODY=$(cat "$f")
-            RESULTS="${RESULTS}\\n• ${BODY//$'\n'/\\n  }"
             # Parse counts from the header line only so trailing ID lines
             # never contaminate the totals.
             C=$(echo "${HEADER}" | grep -oP '\d+(?= critical)' || echo 0)
@@ -579,25 +666,57 @@ jobs:
             TOTAL_HIGH=$((TOTAL_HIGH + H))
           done
 
-          # Only notify when critical or high vulnerabilities are found
-          if [[ "${TOTAL_CRITICAL}" -eq 0 && "${TOTAL_HIGH}" -eq 0 ]]; then
+          # A leg that dies before its upload step leaves no artifact, so
+          # the loop above cannot see it. Ask the API which scan jobs in this
+          # attempt did not succeed and report each one as incomplete. A
+          # failed lookup is reported too, rather than ending the step before
+          # the findings above are posted.
+          if ! INCOMPLETE=$(gh api --paginate \
+            "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}/jobs?per_page=100" \
+            --jq '.jobs[]
+              | select(.name | startswith("Scan ("))
+              | select(.conclusion != "success" and .conclusion != "skipped")
+              | "\(.name | ltrimstr("Scan (") | rtrimstr(")") | split("/") | last): scan did not complete (\(.conclusion))"'); then
+            INCOMPLETE="scan completion status unavailable (jobs API lookup failed)"
+          fi
+          # A failed build or manifest job skips the whole scan matrix. No
+          # leg is skipped on its own, so the lookup above leaves skipped
+          # jobs out and this reports the matrix once.
+          if [[ "${SCAN_RESULT}" == "skipped" ]]; then
+            INCOMPLETE="${INCOMPLETE}"$'\n'"no image was scanned: an image build or manifest job failed"
+          fi
+          INCOMPLETE_COUNT=0
+          while IFS= read -r line; do
+            [[ -n "${line}" ]] || continue
+            INCOMPLETE_COUNT=$((INCOMPLETE_COUNT + 1))
+          done <<< "${INCOMPLETE}"
+
+          # One line per image with findings, naming its first five distinct
+          # advisory IDs; the clean images collapse into one line. The full
+          # lists stay in the run's scan-* artifacts.
+          RESULTS=$(tools/vuln-scan-summary scan-results <<< "${INCOMPLETE}")
+
+          # Notify when critical or high vulnerabilities are found, or when
+          # a scan did not complete and its image went unchecked.
+          if [[ "${TOTAL_CRITICAL}" -eq 0 && "${TOTAL_HIGH}" -eq 0 && "${INCOMPLETE_COUNT}" -eq 0 ]]; then
             echo "No critical or high vulnerabilities found, skipping Slack notification"
-            echo -e "Vulnerability Scan: ${TIMESTAMP} (${SHORT_SHA})${RESULTS}"
+            printf 'Vulnerability Scan: %s (%s)\n%s\n' "${TIMESTAMP}" "${SHORT_SHA}" "${RESULTS}"
             exit 0
           fi
 
-          MESSAGE="Vulnerability Scan: ${TIMESTAMP} (${SHORT_SHA})${RESULTS}\\n<${RUN_URL}|View run>"
+          MESSAGE=$(printf 'Vulnerability Scan: %s (%s)\n%s\n<%s|Full findings in the run>' \
+            "${TIMESTAMP}" "${SHORT_SHA}" "${RESULTS}" "${RUN_URL}")
 
           # Always echo the message so the run logs carry the findings,
           # then post to Slack only when enabled for this trigger.
-          echo -e "${MESSAGE}"
+          echo "${MESSAGE}"
 
           if [[ "${POST_SLACK}" != "true" ]]; then
             echo "Slack notification disabled for this run (POST_SLACK=${POST_SLACK}); skipping post"
           elif [[ -n "${SLACK_SERVICE}" ]]; then
-            curl -sSf -X POST \
+            jq -n --arg text "${MESSAGE}" '{text: $text}' | curl -sSf -X POST \
               -H 'Content-type: application/json' \
-              --data "{\"text\":\"${MESSAGE}\"}" \
+              --data @- \
               "https://hooks.slack.com/services/${SLACK_SERVICE}"
           else
             echo "SLACK_SERVICE not set, skipping notification"
@@ -624,15 +743,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # All image paths to clean up (org-level packages)
+          # The org-level packages this workflow pushes to. A package's name
+          # is its path under ghcr.io/nvidia, with no org prefix.
           IMAGES=(
-            "nvidia/aicr"
-            "nvidia/aicrd"
-            "nvidia/aicr-validators/deployment"
-            "nvidia/aicr-validators/performance"
-            "nvidia/aicr-validators/conformance"
-            "nvidia/aicr-validators/aiperf-bench"
-            "nvidia/aicr-gate"
+            "aicr"
+            "aicrd"
+            "aicr-validators/deployment"
+            "aicr-validators/performance"
+            "aicr-validators/conformance"
+            "aicr-validators/aiperf-bench"
+            "aicr-gate"
+            "aicr-operator"
+            "aicr-registry"
           )
 
           for IMAGE in "${IMAGES[@]}"; do

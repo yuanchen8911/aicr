@@ -126,6 +126,12 @@ type RecipeSpec struct {
 	// distinguish nil (absent in YAML/JSON) from &false (explicit
 	// opt-out); the resolved layer flattens to plain bool.
 	CriteriaStrict *bool `yaml:"criteriaStrict,omitempty" json:"criteriaStrict,omitempty"`
+
+	// RequireEvidence, when true, rejects a resolved recipe that has no
+	// committed evidence pointer. Mirrors the --require-evidence CLI flag
+	// and AICR_REQUIRE_EVIDENCE; any of the three enabling it is sufficient.
+	// Pointer so the spec can distinguish nil (absent) from &false.
+	RequireEvidence *bool `yaml:"requireEvidence,omitempty" json:"requireEvidence,omitempty"`
 }
 
 // RecipeConfigurationSpec contains typed desired-state inputs that do not
@@ -209,7 +215,8 @@ type BundleInputSpec struct {
 
 // BundleOutputSpec describes the bundle output destination.
 type BundleOutputSpec struct {
-	// Target is a local directory path or an oci:// URI.
+	// Target is a local directory path, an oci:// URI, or an
+	// oci-layout:<dir>[:tag] OCI image layout target.
 	Target    string `yaml:"target,omitempty" json:"target,omitempty"`
 	ImageRefs string `yaml:"imageRefs,omitempty" json:"imageRefs,omitempty"`
 }
@@ -228,6 +235,37 @@ type DeploymentSpec struct {
 	// Required for multi-bundle installs that share an Argo CD namespace or
 	// Fleet workspace. See #1011.
 	AppName string `yaml:"appName,omitempty" json:"appName,omitempty"`
+	// ArgoCD carries the Argo CD bundle settings for the argocd and
+	// argocd-helm deployers, replacing the deprecated `deployer:<key>`
+	// entries in Set. See #3264.
+	ArgoCD *ArgoCDSpec `yaml:"argocd,omitempty" json:"argocd,omitempty"`
+}
+
+// ArgoCDSpec captures the Argo CD bundle settings. Pointer fields keep an
+// explicit false or 0 distinct from an omitted key. NamePrefix,
+// DestinationServer and Project apply to child Applications only;
+// CascadeDelete applies to the parent and every child.
+type ArgoCDSpec struct {
+	NamePrefix        *string        `yaml:"namePrefix,omitempty" json:"namePrefix,omitempty"`
+	DestinationServer *string        `yaml:"destinationServer,omitempty" json:"destinationServer,omitempty"`
+	Project           *string        `yaml:"project,omitempty" json:"project,omitempty"`
+	CascadeDelete     *bool          `yaml:"cascadeDelete,omitempty" json:"cascadeDelete,omitempty"`
+	SyncRetry         *SyncRetrySpec `yaml:"syncRetry,omitempty" json:"syncRetry,omitempty"`
+}
+
+// SyncRetrySpec is spec.syncPolicy.retry for every child Application, in
+// Argo CD's own shape. Limit is required when Backoff is set.
+type SyncRetrySpec struct {
+	Limit   *int64                `yaml:"limit,omitempty" json:"limit,omitempty"`
+	Backoff *SyncRetryBackoffSpec `yaml:"backoff,omitempty" json:"backoff,omitempty"`
+}
+
+// SyncRetryBackoffSpec is the retry backoff. Durations use Go duration
+// syntax ("30s", "5m"); an omitted field keeps Argo CD's default.
+type SyncRetryBackoffSpec struct {
+	Duration    *string `yaml:"duration,omitempty" json:"duration,omitempty"`
+	Factor      *int64  `yaml:"factor,omitempty" json:"factor,omitempty"`
+	MaxDuration *string `yaml:"maxDuration,omitempty" json:"maxDuration,omitempty"`
 }
 
 // SchedulingSpec captures node-placement inputs for system and accelerated workloads.

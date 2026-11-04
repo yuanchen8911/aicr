@@ -34,6 +34,8 @@ navigation:
     contents:
       - page: Installation
         path: user/installation.md
+      - page: Frequently Asked Questions
+        path: user/faq.md
       - page: End-to-End Tutorial
         path: user/tutorial.md
       - page: CLI Reference
@@ -75,6 +77,29 @@ navigation:
       - page: Slurm Shared Storage
         path: user/slinky-slurm-storage.md
 
+  - section: Operator (Preview)
+    contents:
+      - page: Overview
+        path: operator/index.md
+      - page: Installing on EKS
+        path: operator/eks-installation.md
+      - page: Day-2 Operations
+        path: operator/operations.md
+      - page: Troubleshooting
+        path: operator/troubleshooting.md
+      - page: Operator Lifecycle
+        path: operator/lifecycle.md
+      - page: Privilege Boundaries
+        path: operator/security.md
+      - page: Argo CD
+        path: operator/argocd.md
+      - page: kubectl aicr
+        path: operator/cli-reference.md
+      - page: Support Policy
+        path: operator/support.md
+      - page: API Reference
+        path: operator/api.md
+
   - section: Integrator Guide
     contents:
       - page: Automation
@@ -95,6 +120,12 @@ navigation:
         path: integrator/nebius-b300.md
       - page: k0s H200 Setup
         path: integrator/k0s-h200-setup.md
+      - page: CoreWeave H100 Setup
+        path: integrator/cks-h100-setup.md
+      - page: CoreWeave RTX PRO 6000 Setup
+        path: integrator/cks-rtx-pro-6000-setup.md
+      - page: NVKE GB200 Setup
+        path: integrator/nvke-gb200-setup.md
       - page: EKS Dynamo Networking
         path: integrator/eks-dynamo-networking.md
       - page: GKE TCPXO Networking

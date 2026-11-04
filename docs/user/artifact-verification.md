@@ -22,6 +22,11 @@ Bundles are unsigned by default; attestation is opt-in via `aicr bundle
 --attest`. An unsigned bundle can still have its closed-world inventory
 verified, but it cannot reach the higher trust levels described below.
 
+A bundle set generated with `aicr bundle --split` is verified the same way
+at its set root, where `checksums.txt` and the attestation cover every
+class directory; a class directory on its own has no inventory to verify
+(see [Split a bundle by class](bundling.md#split-a-bundle-by-class)).
+
 AICR treats a deployment bundle as a closed-world inventory. `checksums.txt` contains one SHA256 entry for every regular payload file, including `recipe.yaml` when present. Verification derives the required directories from those paths and rejects every additional file or directory, symlink, and other non-regular filesystem object. Only `checksums.txt`, `attestation/bundle-attestation.sigstore.json`, and `attestation/aicr-attestation.sigstore.json` may exist outside the manifest; they remain part of the verified inventory. Inventory validation accepts valid manifest entries in any order, while AICR generates them sorted by canonical slash-relative path. AICR ZIP and CLI OCI publication revalidate a private snapshot and publish only that inventory. Legacy bundles with incomplete manifests report `unknown` trust and must be regenerated.
 
 ## Released Container Image Metadata
@@ -310,9 +315,10 @@ an allowlisted set of fields and the CTRF reports omit per-test stdout/message,
 keeping sensitive operational detail (node names, provider instance IDs, the
 node label/taint set, OS tuning, raw container logs) out of the published
 artifact. Each test's CTRF `extra` keeps only allowlisted counts, measurements,
-thresholds, versions, allocation modes, and skip-reason codes, never node names
-or IPs, and is omitted when none remain. See [Structured evidence that survives
-redaction](../contributor/validator.md#structured-evidence-that-survives-redaction)
+thresholds, versions, allocation modes, transport, fabric, and runtime-source
+codes, the `nodeLocal` and `versionSatisfied` booleans, and skip-reason codes,
+never node names or IPs, and is omitted when none remain. See [Structured
+evidence that survives redaction](../contributor/validator.md#structured-evidence-that-survives-redaction)
 for the keys. The predicate records the applied policy in a `redaction` block,
 which `aicr evidence verify` surfaces. Minimal bundles self-verify exactly like
 full ones, because the digests cover whatever bytes shipped. Pass `--full` to

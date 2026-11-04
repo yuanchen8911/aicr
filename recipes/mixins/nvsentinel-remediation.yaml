@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Opt-in mixin, step 3 of 3 of NVSentinel remediation: after cordon and
-# drain, the node is repaired. The drain evicts nothing, as in
-# nvsentinel-quarantine, so repair waits for the node's user pods to finish.
+# drain, the node is repaired. The drain is the one nvsentinel-quarantine
+# runs, so repair waits for the node's user pods up to the drain timeout.
 # A recoverable GPU fault (COMPONENT_RESET) resets that GPU in place;
 # RESTART_VM and RESTART_BM reboot the node through a privileged Job running
 # `chroot /host reboot` (janitor-provider's generic provider, whose image
@@ -27,6 +27,12 @@
 # prerequisites, and needs metadata-collector for the GPU UUID a reset is
 # scoped to, and nvsentinel-health-events-analyzer composed beside it for the
 # MultipleRemediations rule (CheckNVSentinelRemediationPipelineCoherent).
+#
+# A node rebooted for a fatal GPU fault is validated before it returns to
+# work: fault-quarantine keeps it cordoned until lifecycle-manager's DCGM
+# diagnostic passes, so nvsentinel-node-validation, which runs
+# lifecycle-manager, must be composed beside it
+# (CheckNVSentinelPostRemediationValidationCoherent).
 
 kind: RecipeMixin
 apiVersion: aicr.run/v1beta1
@@ -45,6 +51,32 @@ spec:
           processingStrategy: EXECUTE_REMEDIATION
         syslog-health-monitor:
           processingStrategy: EXECUTE_REMEDIATION
+        # Only RESTART_VM and RESTART_BM (15, 24) are validated. A GPU reset
+        # takes seconds and a diagnostic minutes; a reset that did not fix the
+        # GPU reports the fault again, and MultipleRemediations reports the
+        # loop. REPLACE_VM and unmapped actions are not repaired, so the node
+        # stays cordoned with nothing to validate.
+        fault-quarantine:
+          validation:
+            enabled: true
+            ruleSets:
+              - enabled: true
+                version: "1"
+                name: "Post-reboot validation"
+                match:
+                  all:
+                    - kind: "HealthEvent"
+                      expression: >-
+                        event.componentClass == 'GPU' && event.isFatal == true &&
+                        event.recommendedAction in [15, 24]
+                tests:
+                  - dcgm-diag-test
+        # Same drain timing as nvsentinel-quarantine.
+        node-drainer:
+          deleteAfterTimeoutMinutes: 300
+          evictionTimeoutInSeconds: "60"
+          drainGPUPods: false
+          partialDrainEnabled: false
         global:
           dryRun: false
           # NVSentinel's datastore is the separately bundled Percona cluster
@@ -68,7 +100,7 @@ spec:
             setupJob:
               image:
                 repository: docker.io/percona/percona-server-mongodb
-                tag: "8.0.26-11@sha256:53f89c001997627554e6afc0feb5906209ba109f4f98c62f2ca8456c214af60c"
+                tag: "8.0.32-14@sha256:5ba5f240d2dc98bc6236ab1d79c0862c4b62dba9d98cd0ffdf716c30473d2d11"
           faultQuarantine:
             enabled: true
           nodeDrainer:
@@ -119,7 +151,7 @@ spec:
         janitor-provider:
           csp:
             generic:
-              rebootImage: "docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+              rebootImage: "docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
     - name: psmdb-operator
       type: Helm
       valuesFile: components/psmdb-operator/values.yaml

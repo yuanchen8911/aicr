@@ -87,58 +87,40 @@ deferred_verifications:
       above returned `[]`. A failure on that release is the finding to triage,
       not something a later release discharges.
 
-  - id: libexpat1-vex-applies-at-release
-    opened: 2026-10-19
-    document_version: 21
+  - id: pillow-13-override-scan
+    opened: 2026-10-29
+    document_version: 25
     why_deferred: >-
-      Version 21 adds five not_affected statements for libexpat1
-      2.8.3-1~deb13u1 on aiperf-bench. Local evidence is grype 0.118.0 against
-      the v1.1.0-rc1 image index (sha256:a8356af2...) built at e898b8d58, per
-      platform, plus a local run of openvex-guard.sh and tools/openvex-bind on a
-      stand-in digest. The re-cut v1.1.0-rc1 rebuilds that image at a new head,
-      and only a release scans both architectures and signs the projection.
+      Version 25 retired all 28 pillow statements because the image now
+      installs pillow 13.0.0 from validators/performance/requirements-overrides.txt.
+      The evidence is a local linux/amd64 build scanned with grype 0.116.1
+      (`--only-fixed -c .grype.yaml`, no VEX): no pillow match at any
+      severity, and syft catalogued pillow 13.0.0. That is a newer grype than
+      the scan action pins and not the bytes CI publishes. The weekly scan
+      cannot settle it: its cleanup job deletes the scan-<sha> images when the
+      run ends and its text artifact expires after a day, so the first
+      published release image is the earliest evidence that persists.
     check: >-
-      The release run for the re-cut v1.1.0-rc1 (the first on-tag.yaml run
-      after 39266148817 for that tag) passes "Image Vuln Scan
-      (aiperf-bench/amd64)" and "(aiperf-bench/arm64)", passes "Verify OpenVEX
-      document", and publishes an OpenVEX attestation on both aiperf-bench
-      platform manifests listing CVE-2026-66046, CVE-2026-76956,
-      CVE-2026-76957, CVE-2026-77214 and CVE-2026-93990, with every product
-      ending in that manifest's digest.
+      The aiperf-bench image of the first release cut from a main head
+      containing document version 25, scanned by digest on both linux/amd64
+      and linux/arm64, has no pillow match at any severity and catalogues
+      pillow 13.0.0. Scoped to pillow: other findings (CVE-2026-115557 in the
+      base's CPython, NVIDIA/aicr#3523) are not this entry's concern.
     how: |
-      for p in amd64 arm64; do
-        d=$(crane digest --platform linux/$p ghcr.io/nvidia/aicr-validators/aiperf-bench:v1.1.0-rc1)
-        cosign verify-attestation --type openvex \
-          --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-          --certificate-identity-regexp 'https://github.com/NVIDIA/aicr/.*' \
-          "ghcr.io/nvidia/aicr-validators/aiperf-bench@${d}" \
-          | jq -rs '.[0].payload | @base64d | fromjson
-                    | [.predicate.statements[] | {n: .vulnerability.name, p: [.products[]["@id"]]}]'
+      IMG=ghcr.io/nvidia/aicr-validators/aiperf-bench@$(crane digest ghcr.io/nvidia/aicr-validators/aiperf-bench:<release tag>)
+      for arch in amd64 arm64; do
+        grype "registry:${IMG}" --platform "linux/${arch}" --only-fixed -c .grype.yaml -o json \
+          | jq '[.matches[], (.ignoredMatches // [])[]] | map(select(.artifact.name == "pillow")) | length'
+        syft "registry:${IMG}" --platform "linux/${arch}" -q -o json \
+          | jq -r '.artifacts[] | select(.name == "pillow") | .version'
       done
     resolves_when: >-
-      that specific release run has been inspected AND both aiperf-bench scan
-      legs passed, the guard passed, and the command above listed the five
-      names on both platforms with digest-bound products. A failure on that run
-      is the finding to triage.
+      that release's image has been scanned as above, every count is 0 and
+      every version is 13.0.0, with the release tag and digest recorded in the
+      PR that deletes this entry. A pillow finding on that release is the
+      finding to triage, not something a later release discharges.
 
-known_negatives:
-  - id: no-ngc-distroless-python-with-fixed-libexpat1
-    checked: 2026-10-19
-    result: >-
-      No NGC distroless python base carries the fixed libexpat1
-      2.9.0-1~deb13u1. The 3.12, 3.13 and 3.14 series all end at v4.1.7;
-      3.13-v4.1.7 was built 2026-10-11, its index digest is still
-      sha256:fb9e31d8..., and grype 0.118.0 reports libexpat1 2.8.3-1~deb13u1
-      on it for linux/amd64 and linux/arm64. The vendor's own CycloneDX VEX on
-      that base marks the libexpat1 CVEs exploitable or in_triage, so it offers
-      nothing to inherit. The five libexpat1 statements in version 21 exist
-      only because of this negative.
-    invalidated_by: >-
-      a 3.13 tag past v4.1.7 on nvcr.io/nvidia/distroless/python, or the
-      3.13-v4.1.7 tag moving to a new digest. Scan it per platform; if it
-      carries libexpat1 2.9.0-1~deb13u1 or later, bump the FROM pin in
-      validators/performance/aiperf-bench.Dockerfile and delete the five
-      libexpat1 statements in the same change
+known_negatives: []
 
 deliberate_exclusions:
   - id: arm64-aiperf-bench-is-never-scanned
@@ -167,45 +149,15 @@ deliberate_exclusions:
       release even though the weekly scan never sees it. The `invalidated_by`
       above still stands for vuln-scan-images.yaml, which remains amd64-only.
 
-  - id: nvsentinel-image-cves-are-a-pin-bump
-    decided: 2026-09-17
-    rechecked: 2026-10-08
-    decision: >-
-      HIGH+ findings on the nvsentinel images get no VEX statement. AICR does
-      not build them -- the scan matrix pins each to nvsentinel's registry
-      defaultVersion -- so the fix is a pin bump, and a statement would be a
-      reachability claim about third-party binaries this repo has no source
-      to support. That holds with no clean successor to bump to as well: the
-      fix then belongs upstream, as a rebuild, not here as a statement.
-      Current instance: every Go image at v1.26.0 is built on go1.27.0 with
-      golang.org/x/net v0.59.0 and carries GO-2026-6603/6605/6607/6608/6610/
-      6611/6612/6613 (2 critical and up to 10 high rows per image), fixed in
-      go1.27.2 and x/net v0.60.0; gpu-reset carries CVE-2026-84782 (High) on
-      libssl3t64 and openssl 3.0.13-0ubuntu3.15, fixed in 3.0.13-0ubuntu3.16.
-    evidence_2026_10_15: >-
-      grype 0.118.0 (the scan-action pin), `--only-fixed -c .grype.yaml`,
-      linux/amd64. v1.27.0, the newest tag, is not a clean successor:
-      fault-quarantine still reports 2 critical / 10 high on stdlib go1.27.0
-      and x/net v0.59.0, and gpu-reset 2 high on openssl
-      3.0.13-0ubuntu3.15. Only those two were scanned at v1.27.0, so a bump
-      must scan all fourteen.
-    invalidated_by: >-
-      an nvsentinel release built on go1.27.2+ and golang.org/x/net v0.60.0+
-      whose gpu-reset image carries openssl 3.0.13-0ubuntu3.16+ (then advance
-      defaultVersion in recipes/registry.yaml and the scan-matrix tags
-      together, after scanning every image), or AICR starting to build these
-      images, which would make their reachability provable from source
-
   - id: percona-image-cves-are-a-digest-bump
     decided: 2026-10-15
     decision: >-
       HIGH+ findings on the six Percona images in the scan matrix
       (percona-server-mongodb-operator, percona-server-mongodb,
       mongodb_exporter, percona-backup-mongodb, fluentbit, pmm-client) get no
-      VEX statement, for the reason that applies to nvsentinel: AICR pins them
-      by digest for the remediation mixins' datastore (psmdb-operator,
-      nvsentinel-mongodb) but does not build them, so the fix is a digest bump
-      to a cleaner upstream build. Scale at weekly run 38690982469:
+      VEX statement. AICR pins them by digest for the remediation mixins'
+      datastore (psmdb-operator, nvsentinel-mongodb) but does not build them,
+      so the fix is a digest bump to a cleaner upstream build. Scale at weekly run 38690982469:
       percona-server-mongodb 26 critical / 235 high, pmm-client 26 / 130,
       percona-backup-mongodb 6 / 108, percona-server-mongodb-operator 4 / 25,
       mongodb_exporter 2 / 21, fluentbit 1 / 17.

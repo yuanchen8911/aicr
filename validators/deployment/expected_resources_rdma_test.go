@@ -185,7 +185,7 @@ func TestVerifyRDMAFabricReady_Poll(t *testing.T) {
 			})
 			ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-			err := verifyRDMAFabricReady(ctx, helper.AKSRdmaSharedResource)
+			err := verifyRDMAFabricReady(ctx, []string{helper.AKSRdmaSharedResource})
 			if tt.wantErrSub != "" {
 				if err == nil {
 					t.Fatalf("verifyRDMAFabricReady() error = nil, want error containing %q", tt.wantErrSub)
@@ -218,31 +218,31 @@ func TestVerifyRDMAFabricReady_Poll(t *testing.T) {
 func TestVerifyRDMAFabricReady_EagerDisclosureFloor(t *testing.T) {
 	t.Parallel()
 
-	type emitCall struct{ validated, total int }
+	type emitCall struct{ validated, total, failed, skipped string }
 
 	tests := []struct {
-		name          string
-		schedRDMA     int64 // allocatable fabric on the schedulable node (-1 => absent)
-		wantErr       bool
-		wantTerminalV int // validated on the terminal (settled) emit
+		name         string
+		schedRDMA    int64 // allocatable fabric on the schedulable node (-1 => absent)
+		wantErr      bool
+		wantTerminal emitCall // the terminal (settled) emit
 	}{
 		{
 			// The schedulable node's fabric never appears → the gate never
 			// certifies and times out. The eager floor must still have disclosed
 			// the 2-node total (incl. the cordoned node) so a deadline kill leaves
 			// the coverage in the logs instead of nothing.
-			name:          "never ready fails closed but floor disclosed the cordoned total",
-			schedRDMA:     -1,
-			wantErr:       true,
-			wantTerminalV: 0,
+			name:         "never ready fails closed but floor disclosed the cordoned total",
+			schedRDMA:    -1,
+			wantErr:      true,
+			wantTerminal: emitCall{validated: "0", total: "2", failed: "1", skipped: "1"},
 		},
 		{
 			// Fabric present+uniform → the gate certifies. The eager floor emits
 			// validated=0 first; the terminal emit reflects the certified cohort.
-			name:          "ready certifies after floor",
-			schedRDMA:     1000,
-			wantErr:       false,
-			wantTerminalV: 1,
+			name:         "ready certifies after floor",
+			schedRDMA:    1000,
+			wantErr:      false,
+			wantTerminal: emitCall{validated: "1", total: "2", failed: "0", skipped: "1"},
 		},
 	}
 
@@ -259,8 +259,11 @@ func TestVerifyRDMAFabricReady_EagerDisclosureFloor(t *testing.T) {
 			// pollUntilStable runs the probe synchronously in this goroutine, so
 			// the injected emit is never called concurrently — no lock needed.
 			var calls []emitCall
-			err := verifyRDMAFabricReadyEmit(ctx, helper.AKSRdmaSharedResource, func(validated, total int) {
-				calls = append(calls, emitCall{validated, total})
+			err := verifyRDMAFabricReadyEmit(ctx, []string{helper.AKSRdmaSharedResource}, func(extra map[string]string) {
+				calls = append(calls, emitCall{
+					validated: extra["nodesValidated"], total: extra["nodesTotal"],
+					failed: extra["nodesFailed"], skipped: extra["nodesSkipped"],
+				})
 			})
 
 			if (err != nil) != tt.wantErr {
@@ -269,14 +272,14 @@ func TestVerifyRDMAFabricReady_EagerDisclosureFloor(t *testing.T) {
 			if len(calls) < 2 {
 				t.Fatalf("expected an eager floor emit AND a terminal emit, got %d: %+v", len(calls), calls)
 			}
-			// The FIRST emit is the eager floor: validated=0 (nothing certified
-			// mid-poll) and total=2 (the schedulable node + the disclosed cordoned
+			// The FIRST emit is the eager floor: nothing passed or failed
+			// mid-poll, and total=2 (the schedulable node + the disclosed cordoned
 			// node). This is the sentinel a deadline SIGKILL would leave behind.
-			if want := (emitCall{validated: 0, total: 2}); calls[0] != want {
+			if want := (emitCall{validated: "0", total: "2", failed: "0", skipped: "1"}); calls[0] != want {
 				t.Errorf("eager floor emit = %+v, want %+v (cordoned node disclosed before the terminal emit)", calls[0], want)
 			}
 			// The terminal emit reflects the settled outcome.
-			if want := (emitCall{validated: tt.wantTerminalV, total: 2}); calls[len(calls)-1] != want {
+			if want := tt.wantTerminal; calls[len(calls)-1] != want {
 				t.Errorf("terminal emit = %+v, want %+v", calls[len(calls)-1], want)
 			}
 		})
@@ -294,7 +297,7 @@ func TestRDMAFabricProbe_FailsClosedOnListError(t *testing.T) {
 	})
 	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-	cov, err := rdmaFabricProbeCoverage(ctx, helper.AKSRdmaSharedResource)
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
 	if err == nil {
 		t.Fatal("expected an error when listing nodes fails, got nil (must fail closed)")
 	}
@@ -327,7 +330,7 @@ func TestRDMAFabricProbe_FailsClosedWithoutRDMANodes(t *testing.T) {
 	)
 	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-	cov, err := rdmaFabricProbeCoverage(ctx, helper.AKSRdmaSharedResource)
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
 	if err == nil {
 		t.Fatal("expected an error when no RDMA GPU nodes are present, got nil (must fail closed)")
 	}
@@ -356,12 +359,76 @@ func TestRDMAFabricProbe_ExcludesCordonedNonRDMAAndCPU(t *testing.T) {
 	)
 	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-	cov, err := rdmaFabricProbeCoverage(ctx, helper.AKSRdmaSharedResource)
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
 	if err != nil {
 		t.Fatalf("rdmaFabricProbeCoverage() error = %v, want nil (only the schedulable RDMA GPU node is required to carry the fabric)", err)
 	}
 	if cov.schedulable != 1 {
 		t.Fatalf("rdmaFabricProbeCoverage() cohort size = %d, want 1 (cordoned/non-RDMA/zero-GPU/CPU excluded)", cov.schedulable)
+	}
+}
+
+// TestRDMAFabricProbe_AllResourcesEachPass proves one probe pass checks every
+// fabric resource (NVKE: one per IB rail), so the gate holds them in a single
+// stability window: a rail missing on one node fails the pass and is named,
+// and the pass succeeds only when every rail is uniform on every node.
+func TestRDMAFabricProbe_AllResourcesEachPass(t *testing.T) {
+	t.Parallel()
+
+	const rail1 = "nvidia.com/sriov_resource_rail_1"
+	withRail1 := func(n *corev1.Node, count int64) *corev1.Node {
+		if count >= 0 {
+			n.Status.Allocatable[corev1.ResourceName(rail1)] = *resource.NewQuantity(count, resource.DecimalSI)
+		}
+		return n
+	}
+	rails := []string{helper.AKSRdmaSharedResource, rail1}
+
+	tests := []struct {
+		name       string
+		node1Rail1 int64
+		wantErrSub string
+	}{
+		{
+			name:       "second resource absent on one node names that resource",
+			node1Rail1: -1,
+			wantErrSub: rail1 + " not yet allocatable on 1 of 2 RDMA GPU node(s): [rdma-gpu-1]",
+		},
+		{
+			name:       "second resource skewed on one node is not ready",
+			node1Rail1: 8,
+			wantErrSub: rail1 + " allocatable count is non-uniform",
+		},
+		{
+			name:       "every resource uniform on every node passes",
+			node1Rail1: 16,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientset := k8sfake.NewClientset(
+				withRail1(rdmaGPUNode("rdma-gpu-0", 8, 1000), 16),
+				withRail1(rdmaGPUNode("rdma-gpu-1", 8, 1000), tt.node1Rail1),
+			)
+			ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
+
+			cov, err := rdmaFabricProbeCoverage(ctx, rails)
+			if cov.schedulable != 2 {
+				t.Fatalf("expected cohort size 2, got %d", cov.schedulable)
+			}
+			if tt.wantErrSub == "" {
+				if err != nil {
+					t.Fatalf("rdmaFabricProbeCoverage() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("rdmaFabricProbeCoverage() error = %v, want substring %q", err, tt.wantErrSub)
+			}
+		})
 	}
 }
 
@@ -377,7 +444,7 @@ func TestRDMAFabricProbe_NonUniformCountFails(t *testing.T) {
 	)
 	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-	cov, err := rdmaFabricProbeCoverage(ctx, helper.AKSRdmaSharedResource)
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
 	if err == nil {
 		t.Fatal("expected an error on non-uniform fabric counts, got nil")
 	}
@@ -400,7 +467,7 @@ func TestRDMAFabricProbe_PassesWhenUniform(t *testing.T) {
 	)
 	ctx := &validators.Context{Ctx: context.Background(), Clientset: clientset}
 
-	cov, err := rdmaFabricProbeCoverage(ctx, helper.AKSRdmaSharedResource)
+	cov, err := rdmaFabricProbeCoverage(ctx, []string{helper.AKSRdmaSharedResource})
 	if err != nil {
 		t.Fatalf("rdmaFabricProbeCoverage() error = %v, want nil (fabric uniform on all RDMA GPU nodes)", err)
 	}

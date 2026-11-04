@@ -17,9 +17,13 @@
 # deploys them; this lane composes each step onto one EKS leaf on helm, and
 # the widest step on one Argo CD and one Flux deployer as well. The widest step
 # carries nvsentinel-health-events-analyzer, which
-# CheckNVSentinelRemediationPipelineCoherent requires beside live remediation.
+# CheckNVSentinelRemediationPipelineCoherent requires beside live remediation,
+# and nvsentinel-node-validation, the lifecycle-manager that
+# CheckNVSentinelPostRemediationValidationCoherent requires to validate a
+# rebooted node.
 # It also composes quarantine with nvsentinel-slinky-drainer onto the EKS Slurm
-# leaf, which adds the plugin and switches node-drainer to customDrain.
+# leaf, which adds the plugin and switches node-drainer to customDrain, the
+# event exporter onto the observe step, and node validation on its own.
 
 name: KWOK NVSentinel Remediation
 
@@ -99,19 +103,35 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        mixin: [nvsentinel-observe, nvsentinel-quarantine, 'nvsentinel-remediation,nvsentinel-health-events-analyzer']
+        mixin: [nvsentinel-observe, nvsentinel-quarantine, 'nvsentinel-remediation,nvsentinel-health-events-analyzer,nvsentinel-node-validation']
         deployer: [helm]
         # The widest step adds the Percona operator, its CRDs and a -post
         # Certificate that depends on the operator's Issuer, so it is the one
         # whose ordering the GitOps deployers can get wrong.
         include:
-          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer'
+          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer,nvsentinel-node-validation'
             deployer: argocd-oci
-          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer'
+          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer,nvsentinel-node-validation'
             deployer: flux-oci
           - mixin: nvsentinel-quarantine,nvsentinel-slinky-drainer
             deployer: helm
             recipe: h100-eks-ubuntu-training-slurm
+          # The event exporter (#2621), which reads the datastore a step adds.
+          - mixin: nvsentinel-observe,nvsentinel-event-exporter
+            deployer: helm
+          # The log collector's file server runs on emptyDir under KWOK
+          # (kwok/scripts/validate-scheduling.sh); EKS's GPU Operator installs
+          # the driver, so CheckNVSentinelLogCollectorCoherent accepts it.
+          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer,nvsentinel-node-validation,nvsentinel-log-collector'
+            deployer: helm
+          # New-node validation (#3088), which needs no datastore.
+          - mixin: nvsentinel-node-validation
+            deployer: helm
+          # ExternalRemediationRequest routing (#3091) beside the live
+          # remediation it needs. No fault is declared, so
+          # CheckNVSentinelExternalRemediationCoherent only warns.
+          - mixin: 'nvsentinel-remediation,nvsentinel-health-events-analyzer,nvsentinel-node-validation,nvsentinel-external-remediation'
+            deployer: helm
     steps:
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

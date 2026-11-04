@@ -33,6 +33,7 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/attestation"
 	"github.com/NVIDIA/aicr/pkg/bundler/result"
 	aicr "github.com/NVIDIA/aicr/pkg/client/v1"
+	"github.com/NVIDIA/aicr/pkg/deprecation"
 	aicrerrors "github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/recipe"
@@ -673,6 +674,52 @@ func TestBundleHandler_VendorChartsDisabled(t *testing.T) {
 	}
 }
 
+// TestBundleHandler_LegacyDeployerDeprecationHeaders pins the REST arm of the
+// deployer:<key> deprecation: a request using the deprecated spelling carries
+// a Link to the scoped register entry, a request without it carries nothing,
+// and no Sunset is sent while no removal date is set. The body is garbage on
+// purpose: the headers must not depend on the request succeeding.
+func TestBundleHandler_LegacyDeployerDeprecationHeaders(t *testing.T) {
+	t.Parallel()
+	client, err := aicr.NewClient(aicr.WithRecipeSource(aicr.EmbeddedSource()))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	h := newBundleHandler(client, nil, nil, false)
+
+	for _, tt := range []struct {
+		name     string
+		target   string
+		wantLink bool
+	}{
+		{"deprecated spelling", "/v1/bundle?deployer=argocd&set=deployer:project=gpu-infra", true},
+		{"dedicated parameter", "/v1/bundle?deployer=argocd&argocd-project=gpu-infra", false},
+		{"component override", "/v1/bundle?deployer=argocd&set=gpuoperator:driver.version=580", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodPost, tt.target, strings.NewReader("not-json"))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			h.HandleBundles(w, req)
+
+			link := w.Header().Get("Link")
+			if tt.wantLink {
+				want := "<" + deprecation.DocsURL + "#argo-cd-options-as-deployer-value-overrides>; rel=\"deprecation\""
+				if link != want {
+					t.Errorf("Link = %q, want %q", link, want)
+				}
+			} else if link != "" {
+				t.Errorf("Link = %q, want none", link)
+			}
+			if s := w.Header().Get("Sunset"); s != "" {
+				t.Errorf("Sunset = %q, want none until a removal date is set", s)
+			}
+		})
+	}
+}
+
 // TestBundleHandler_VendorChartsFalseAllowed verifies vendor-charts=false is
 // always allowed regardless of the server opt-in — the gate only guards the
 // egress-triggering true value.
@@ -1100,5 +1147,44 @@ func TestBundleHandler_RejectsLegacyRecipeKind(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), string(recipe.RecipeResultKind)) {
 		t.Errorf("rejection does not name the expected kind; body: %s", rec.Body.String())
+	}
+}
+
+// TestBundleHandler_SplitReturnsSetZip exercises ?split=true through the
+// strict query gate and the handler: the response is a zip rooted at the
+// bundle set, with split.yaml and class directories and no root deploy.sh.
+func TestBundleHandler_SplitReturnsSetZip(t *testing.T) {
+	h := newTestBundleHandler(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/bundle?split=true", bytes.NewReader(resolveEmbeddedBundleBody(t)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.HandleBundles(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/zip" {
+		t.Fatalf("Content-Type = %q, want application/zip", ct)
+	}
+	zr, err := zip.NewReader(bytes.NewReader(w.Body.Bytes()), int64(w.Body.Len()))
+	if err != nil {
+		t.Fatalf("open bundle zip: %v", err)
+	}
+	names := make(map[string]bool, len(zr.File))
+	hasCore, hasOps := false, false
+	for _, f := range zr.File {
+		names[f.Name] = true
+		hasCore = hasCore || strings.HasPrefix(f.Name, "core/")
+		hasOps = hasOps || strings.HasPrefix(f.Name, "ops/")
+	}
+	for _, want := range []string{"split.yaml", "recipe.yaml", "checksums.txt"} {
+		if !names[want] {
+			t.Errorf("zip lacks %s at the set root", want)
+		}
+	}
+	if !hasCore || !hasOps {
+		t.Errorf("zip lacks class directories: core=%v ops=%v", hasCore, hasOps)
+	}
+	if names["deploy.sh"] {
+		t.Errorf("zip has a root deploy.sh; a set has one per class")
 	}
 }

@@ -22,9 +22,9 @@ a supported release.
 
 | Version | Status |
 |---------|--------|
-| `1.0.x` (latest released minor) | Supported: receives security fixes |
-| `0.22.x` (previous minor) | Supported: receives security fixes |
-| `< 0.22` | End-of-life: upgrade to a supported release |
+| `1.2.x` (latest released minor) | Supported: receives security fixes |
+| `1.1.x` (previous minor) | Supported: receives security fixes |
+| `< 1.1` | End-of-life: upgrade to a supported release |
 
 A fix lands on `main` first and ships in the next release cut from `main`.
 Reaching the previous minor also requires the manual path in
@@ -115,9 +115,31 @@ the user who read neither.
    | Go SDK | A `// Deprecated:` godoc marker, which `staticcheck` surfaces to consumers automatically |
    | Bundle + schemas | The loader accepts the deprecated shape and warns, naming the file and the release that stops reading it |
 
-The CLI and REST arms have unit coverage in `pkg/deprecation` and `pkg/server`
-but have never carried a real deprecation: no REST route is marked deprecated
-and no CLI flag or subcommand is deprecated. The loader arm ran end to end in
+#### A deprecated parameter value, not a deprecated operation
+
+The REST row above describes a deprecated operation. When only one value or
+spelling of a parameter is deprecated, and the operation and the parameter
+itself remain supported, the notice is scoped to that value:
+
+- The operation is not marked `deprecated: true`, and neither is the parameter.
+  Its description in `api/aicr/v1/server.yaml` names the deprecated value and
+  its replacement.
+- Only responses to requests that use the deprecated value carry the headers.
+  The `Link` points at the value's own entry on `docs/user/deprecations.md`
+  (`deprecation.Notice.Anchor`), not the top of the page.
+- `Deprecation` is sent only when the notice records a deprecation date, and
+  `Sunset` only once a removal date is committed. Neither header admits a
+  placeholder, so a notice with no dates sends the `Link` alone.
+- The CLI warning omits the removal release while none is scheduled, as the
+  existing `docs/user/deprecations.md` entries do.
+
+The first deprecation to use this form is the `deployer:<key>` value override
+on `set` ([#3264](https://github.com/NVIDIA/aicr/issues/3264)).
+
+The CLI and REST arms have unit coverage in `pkg/deprecation` and `pkg/server`.
+They first carried a real deprecation with the `deployer:<key>` value override
+above; no REST route is marked deprecated and no CLI flag or subcommand is
+deprecated. The loader arm ran end to end in
 the ADR-022 alpha migration (warn in v0.22,
 [#2416](https://github.com/NVIDIA/aicr/issues/2416); reject in v1.0.0,
 [#2417](https://github.com/NVIDIA/aicr/issues/2417)). Treat the first change
@@ -196,6 +218,50 @@ are not promoted.
 
 ## How to Release
 
+### Release Checklist
+
+The release captain's path from `main` to GA. Examples use `v1.3.0`; substitute
+your release's tags. Post progress in a release thread as you go.
+
+1. **Check UAT on `main`** with the `aicr-uat-report` skill. Failures in
+   cluster bring-up or image builds are infra, not product signal; cover that
+   combination manually in step 3.
+2. **Cut an RC** (see [Release Candidates](#release-candidates)). Update local
+   `main` (`git pull origin main`) and check that `HEAD` matches `origin/main`,
+   since `make bump-rc` tags `HEAD`. Confirm every check on that commit passed;
+   there are several hundred, so list failures across all pages:
+   `gh api --paginate repos/NVIDIA/aicr/commits/<sha>/check-runs --jq '.check_runs[]|select(.conclusion!="success" and .conclusion!="skipped")|.name'`.
+   Then run `make bump-rc`, and wait for the tag's release run to succeed and
+   its release to be published before step 3.
+3. **Validate the RC.**
+   - UAT: the nightly batch tests `main` and stable releases, not RCs. Dispatch
+     the UAT Run workflow with `aicr_version` set to the RC tag, once per
+     reservation and intent the nightly batch covers (`nightly-intents` in
+     `infra/uat/reservations.yaml`); one dispatch runs one of each.
+   - Live clusters for what UAT misses (new services or accelerators, lanes
+     that are down): deploy the bundle, run `aicr validate` per intent, and
+     compare performance with the previous release.
+   - `--no-cluster` CLI checks for new features and repros of issues filed
+     against the RC.
+4. **Iterate.** Fix blockers on `main`, cut the next RC (see
+   [Release Candidates](#release-candidates)), re-validate what changed.
+5. **Draft the release notes** with the `aicr-release-notes` skill and review
+   them with another maintainer. Lead with new and updated recipes.
+6. **Promote** after a maintainer's go-ahead (see
+   [Promoting an RC to GA](#promoting-an-rc-to-ga)):
+   `git fetch origin --tags && make bump-promote TAG=v1.3.0-rc2`. Wait for the
+   GA release run to succeed and the release to be published (no longer a
+   draft) before steps 7 and 8; a re-run of the release step replaces a draft's
+   body.
+7. **Publish the notes** above the generated changelog in the GitHub UI, or
+   with `gh release edit v1.3.0 --notes-file <file>`. That flag replaces the
+   whole body, so the file must include the existing changelog after the
+   summary.
+8. **Announce** with the link, three or four highlights, and contributor
+   thanks (GitHub handles in public channels).
+9. **Finish the post-release steps** in
+   [What Goes Into a Release](#what-goes-into-a-release).
+
 ### Standard Release
 
 ```bash
@@ -210,9 +276,12 @@ make bump-minor       # v1.2.3 → v1.3.0
 
 `make bump-*` checks for a clean, pushed tree, computes the next version from
 the latest **local** tag, tags `HEAD`, and pushes the tag, which starts the
-release pipeline. No commits are created. `make changelog` previews the changes
-since the last stable tag; the changelog is generated for the GitHub release
-and not committed.
+release pipeline. No commits are created. `make bump-major`, `bump-minor`, and
+`bump-patch` count from the latest **stable** tag, so a leftover RC of the next
+version does not change the result; `bump-rc` counts from the latest tag of any
+kind so that it can increment an existing RC. `make changelog` previews the
+changes since the last stable tag; the changelog is generated for the GitHub
+release and not committed.
 
 ### Release Candidates
 
@@ -224,8 +293,11 @@ make bump-rc          # v1.2.3 → v1.3.0-rc1 (always the next minor)
 make bump-rc          # v1.3.0-rc1 → v1.3.0-rc2
 ```
 
-An RC runs the full build, test, scan, and attest pipeline and gets
-`vX.Y.Z-rcN` image tags, but it does not update:
+The release workflow accepts only `vX.Y.Z` and `vX.Y.Z-(alpha|beta|rc)N` tags
+(a dot before `N` is allowed), the versions the AICR Operator's release builds
+accept. An RC runs the full build, test, scan, and attest pipeline and gets
+image tags spelled exactly as its git tag (`vX.Y.Z-rcN` or `vX.Y.Z-rc.N`), but
+it does not update:
 
 - the Homebrew formula
 - container `:latest` tags
@@ -236,46 +308,47 @@ Slack notifications fire for both pre-releases and stable releases.
 
 ### Promoting an RC to GA
 
-Delete every RC of the version, on GitHub and locally, before tagging GA. Two
-things go wrong otherwise:
-
-- **Incomplete release notes.** GoReleaser picks the previous tag with
-  `git describe` on the parent of the GA commit, so an RC tag on an earlier
-  commit becomes the previous tag and the GA notes list only the changes since
-  that RC. `make bump-promote` leaves the RC tags in place, so it is not used
-  until [#3289](https://github.com/NVIDIA/aicr/issues/3289) is fixed.
-- **Wrong version.** `make bump-*` reads the latest local tag, so a leftover
-  `v1.3.0-rc2` makes `make bump-minor` produce `v1.4.0`.
+Promote the RC that was validated. The RC tag must exist locally and
+`origin/main` must be current, so fetch first:
 
 ```bash
-VERSION=v1.3.0
-RC="${VERSION}-rc2"
-
-# Delete the RC release and its tag on GitHub
-gh release delete "${RC}" --repo NVIDIA/aicr --cleanup-tag --yes
-
-# Update the local clone and delete the local tag
-git checkout main
-git pull --all
-git tag -d "${RC}"
-
-# Both must print nothing; delete any earlier RC of this version the same way
-git ls-remote --tags origin "${VERSION}-rc*"
-git tag -l "${VERSION}-rc*"
-
-make bump-minor       # v1.2.3 → v1.3.0 (bump-major for a new major)
+git fetch origin --tags
+make bump-promote TAG=v1.3.0-rc2     # tags v1.3.0 on the RC's commit and pushes it
 ```
 
+`make bump-promote` tags the RC's own commit, so GA ships exactly what the RC
+validated. Anything merged to `main` after the RC waits for the next release.
+The commit must be reachable from `origin/main`; otherwise the target refuses.
 The GA tag runs the full pipeline and rebuilds from source; it does not reuse
-the RC's images, which stay on GHCR. `make bump-minor` tags `HEAD`, so anything
-merged after the RC ships in GA without RC validation. To ship exactly the
-validated commit, save `SHA=$(git rev-list -n1 "${RC}")` before deleting the RC,
-then tag it directly instead of running `make bump-minor`:
+the RC's images, which stay on GHCR.
+
+Leave the RC releases and tags in place. They are history, and nothing has to
+be deleted before tagging GA:
+
+- **Release tag.** After `make bump-promote` the GA tag and its RC tag point at
+  the same commit, and git version-sorts `v1.3.0-rc2` ahead of `v1.3.0`. Left
+  alone, GoReleaser would take the RC as the tag being released and build the
+  GA run as that RC. For a stable tag, the release workflow sets
+  `GORELEASER_CURRENT_TAG` to the tag that triggered the run, so GA is always
+  released as GA.
+- **Release notes.** For a stable tag, the release workflow sets
+  `GORELEASER_PREVIOUS_TAG` to the latest stable tag before the GA commit, so
+  the GA notes always cover everything since the previous stable release. They
+  do not start at an RC, whether GA is tagged on the RC's commit or on a later
+  one. RC notes are unchanged: they cover the changes since the previous tag of
+  any kind, so `rc2` lists what landed after `rc1`.
+- **Version.** `make bump-major`, `bump-minor`, and `bump-patch` ignore RC tags,
+  so a leftover `v1.3.0-rc2` does not turn `make bump-minor` into `v1.4.0`.
+
+To ship `HEAD` instead of the RC's commit, for example because a fix landed
+after the RC, tag it as an ordinary release:
 
 ```bash
-git tag -a "${VERSION}" "${SHA}" -m "Release ${VERSION}"
-git push origin "${VERSION}"
+make bump-minor       # v1.2.3 → v1.3.0, even with v1.3.0-rc2 present (bump-major for a new major)
 ```
+
+That release includes everything merged after the RC, so it ships without RC
+validation of those changes.
 
 ### Re-run Existing Release
 
@@ -284,8 +357,9 @@ git push origin "${VERSION}"
   keep the candidate tag emitted by `detect`, so promotion converges on the same
   digest set. If GoReleaser left a partial exact-tag draft, the rerun reuses it
   only when its name and tag both equal the release tag, its pre-release state
-  matches the tag, and every asset belongs to the fixed 13-asset GoReleaser
-  set. It then replaces expected assets, uploads missing ones, and regenerates
+  matches the tag, and every asset belongs to the release's fixed asset set
+  (`expected_release_asset_names` in `.github/scripts/release-images.sh`: the
+  GoReleaser assets and the four `kubectl-aicr` binaries). It then replaces expected assets, uploads missing ones, and regenerates
   release notes from the current tag. Unexpected, duplicate, or malformed
   assets fail closed for maintainer inspection. The generated Homebrew formula
   is kept for GitHub's 30-day workflow-rerun window.
@@ -296,7 +370,7 @@ git push origin "${VERSION}"
   candidate tag.
 - Once the exact-tag GitHub release is public, the build fails closed rather
   than modify its assets; cut a new tag for any further release. Publication
-  revalidates the tag commit and the exact 13-asset set, then publishes by the
+  revalidates the tag commit and that exact asset set, then publishes by the
   validated numeric release ID, never by a mutable name or tag. If GitHub made
   the release public but the response was lost, a failed-job rerun accepts it
   after revalidating source, identity, pre-release state, and assets, and does
@@ -381,9 +455,56 @@ Stable releases promote `vX.Y.Z` and `latest`; pre-releases promote
 `candidate-<run-id>-<run-attempt>` tags stay in the public packages for audit,
 diagnosis, and recovery.
 
+### AICR Operator (preview)
+
+The [AICR Operator](docs/operator/index.md) ships at the release's version
+outside the image promotion above: `operator-candidate` builds it from the tag
+(`make operator-candidate`) and malware-scans the `kubectl-aicr` binaries,
+`operator-scan` scans the operator and in-cluster registry images on both
+architectures, `operator-reproducible` builds the candidate twice (the second
+time with an empty Go build cache) and requires identical bytes, and
+`operator-lifecycle` installs the newest published operator release older than
+the tag and runs the qualify suite's lifecycle scenarios upgrading to this
+candidate (`make operator-qualify-published`). `operator-publish` runs only
+after the release integrity check, and `operator-attest`
+(`attest-operator.yaml`) attests what it pushed. It publishes:
+
+| Artifact | Where |
+|----------|-------|
+| Operator image | `ghcr.io/nvidia/aicr-operator:vX.Y.Z`, with build provenance on the index and each platform image and a CycloneDX SBOM and OpenVEX on each platform image, in the registry |
+| In-cluster registry image | `ghcr.io/nvidia/aicr-registry:vX.Y.Z`, built from `cmd/aicr-registry`, attested as the operator image is |
+| Helm chart | `oci://ghcr.io/nvidia/charts/aicr-operator`, version `X.Y.Z`, with build provenance in the registry |
+| `kubectl-aicr` | Release assets `kubectl-aicr-<os>-<arch>` for darwin and linux on amd64 and arm64, malware-scanned and attested |
+
+The chart defaults to the operator and registry images by digest and to the
+AICR release the operator was qualified against (`operator:` in `.settings.yaml`).
+`release-check` fails closed on the operator candidate, its scans, and the
+reproducibility and lifecycle checks, so neither the image aliases above nor
+the operator are published when they fail, and `publish` waits for
+`operator-publish` and `operator-attest`. Publishing the same candidate again is
+a no-op, so re-running the failed jobs converges; a tag that already names
+other content is refused. The operator image takes no `latest` alias.
+
+The first release that publishes each of the `aicr-operator`, `aicr-registry`
+and `charts/aicr-operator` packages creates it. If GHCR creates one private, an
+organization administrator makes it public once, as for the other images, so
+users can pull and verify it anonymously.
+
+The operator's attestations come from the reusable `attest-operator.yaml`, which
+runs the same `sbom-and-attest` action as AICR's images, so they are SLSA Build
+Level 3. v1.2.0 and its release candidates were attested in `on-tag.yaml` itself
+(Level 2, SPDX SBOMs, no OpenVEX). Verify against the workflow that signed the
+release and its tag:
+
+```shell
+SIGNER=NVIDIA/aicr/.github/workflows/attest-operator.yaml   # for v1.2.0 and its release candidates: NVIDIA/aicr/.github/workflows/on-tag.yaml
+gh attestation verify "oci://ghcr.io/nvidia/charts/aicr-operator:${VERSION}" --repo NVIDIA/aicr \
+  --signer-workflow "${SIGNER}" --source-ref "refs/tags/v${VERSION}"
+```
+
 ### Supply Chain
 
-Every release includes:
+Every release includes, for the AICR binaries and the seven images above:
 
 - **SLSA Build Level 3 Provenance**: verifiable image build attestations (provenance v1), generated from a reusable workflow
 - **SBOM**: SPDX for the release binaries, CycloneDX for the container images
@@ -401,6 +522,15 @@ Every release includes:
   `GITHUB_TOKEN` keeps its license-URL probes from being rate-limited. The
   `notices-generator` merge-gate job runs it on dependency changes, so a break
   shows up on the PR rather than at tag time.
+
+The AICR Operator preview's images carry the same evidence as the seven images
+above, from the reusable `attest-operator.yaml`: Level 3 provenance on each
+index and platform image, and a CycloneDX SBOM and OpenVEX on each platform
+image. Its chart and each `kubectl-aicr` binary carry Level 3 provenance; the
+plugin has no `aicr_checksums.txt` entry, since its attestations bind its
+digests. v1.2.0 and its release candidates carry less: Level 2 provenance from
+`on-tag.yaml`, SPDX SBOMs and no OpenVEX
+([AICR Operator (preview)](#aicr-operator-preview)).
 
 ## Versioning
 
@@ -520,12 +650,15 @@ fi
 | Tests fail during release | Fix on `main`, cut new tag |
 | Lint errors | Run `make lint` locally before releasing |
 | Image push failure | Check GHCR permissions |
-| GA release notes list only changes since an RC | An RC tag of that version was still on the remote; see [Promoting an RC to GA](#promoting-an-rc-to-ga) |
-| `make bump-minor` skips a version | A deleted RC tag is still in the local clone; `git tag -d` it |
+| GA release notes list only changes since an RC | The `Pin the release tag and the previous stable tag` step in the `build-ko` job should have set `GORELEASER_PREVIOUS_TAG`; check that it ran. It is skipped for pre-releases, and sets no previous tag when no earlier stable tag exists. See [Promoting an RC to GA](#promoting-an-rc-to-ga) |
+| A GA run builds or publishes as its RC (RC version in the artifacts, or a conflict with the existing RC release) | The same step should have set `GORELEASER_CURRENT_TAG` to the GA tag; check its log. Without it, GoReleaser picks the RC when both tags are on one commit |
+| `make bump-major`, `bump-minor`, or `bump-patch` computes an unexpected version | They count from the latest stable tag reachable from `HEAD` in your local clone. Run `git fetch origin --tags`, then `git describe --tags --abbrev=0 --match='v[0-9]*' --exclude='*-*'` to see the base |
 | Promotion partially completed | Re-run failed jobs for the same workflow run; do not repoint aliases manually |
 | Version alias conflict | Stop and verify the existing digest; the workflow intentionally refuses overwrite |
 | Draft identity or asset check fails | Inspect the exact-tag draft; correct the name/tag or remove only verified stale assets, then re-run failed jobs |
 | Need a full rebuild | Re-run all jobs only before public aliases move; this creates a new candidate tag |
+| `make bump-rc` skips an RC number or refuses an existing tag | It counts from the latest tag reachable from `HEAD` in your local clone. A local tag deleted on the remote makes it skip a number: delete it (`git tag -d <tag>`). An RC on the remote you have not fetched makes it pick a taken number and stop: run `git fetch origin --tags` and `git pull origin main`, since a tag on a newer commit is not reachable from an older `HEAD` |
+| `Publish Operator Artifacts` fails with `403 Forbidden` while downloading Go modules | Usually a transient Go module proxy error: re-run the failed job (`gh run rerun <run-id> --failed`). If it repeats, check the proxy access |
 
 ## Prerequisites
 

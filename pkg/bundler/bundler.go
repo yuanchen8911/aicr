@@ -42,12 +42,14 @@ import (
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer/helm"
 	"github.com/NVIDIA/aicr/pkg/bundler/deployer/helmfile"
 	tfdeployer "github.com/NVIDIA/aicr/pkg/bundler/deployer/terraform"
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
 	"github.com/NVIDIA/aicr/pkg/bundler/result"
 	"github.com/NVIDIA/aicr/pkg/bundler/types"
 	"github.com/NVIDIA/aicr/pkg/bundler/validations"
 	"github.com/NVIDIA/aicr/pkg/bundler/verifier"
 	"github.com/NVIDIA/aicr/pkg/component"
 	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/deprecation"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/header"
 	"github.com/NVIDIA/aicr/pkg/netutil"
@@ -281,6 +283,12 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, errors.PropagateOrWrap(err, errors.ErrCodeInvalidRequest,
 			"invalid bundler configuration")
 	}
+	// Before any output exists: os.CopyFS will not overwrite the data files a
+	// rejected attempt leaves behind, so a corrected rerun into the same
+	// directory would fail.
+	if err := b.validateDeployerConfig(); err != nil {
+		return nil, err
+	}
 
 	// Reject incoherent component refs (e.g. a Helm ref that also carries a
 	// Kustomize tag/path, which the deployers silently build as Kustomize)
@@ -302,9 +310,13 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, err
 	}
 
-	recipeResult, err := b.filterAndValidateRecipe(recipeResult)
+	// The PromQL scrape scope spans the platform, not the bundlers subset.
+	recipeResult, platformRefs, err := b.filterAndValidateRecipe(recipeResult)
 	if err != nil {
 		return nil, err
+	}
+	if ownershipErr := b.enforcePromQLServerOwnership(recipeResult, platformRefs); ownershipErr != nil {
+		return nil, ownershipErr
 	}
 
 	// Bundle-time override policy for GPU allocation-policy keys (#1327):
@@ -315,8 +327,10 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 		return nil, policyErr
 	}
 
-	// Extract values for each component from the recipe
-	componentValues, err := b.extractComponentValues(ctx, recipeResult)
+	// The declared union lets the NVSentinel drain scope cover components this
+	// bundle filters out.
+	componentValues, err := b.extractComponentValues(ctx,
+		recipeResult.WithDeclaredComponents(profileBaseline.ComponentRefs))
 	if err != nil {
 		if _, ok := stderrors.AsType[*errors.StructuredError](err); ok {
 			return nil, err
@@ -343,10 +357,15 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 	if evictionErr := b.injectDRAEvictionLabel(componentValues, recipeResult); evictionErr != nil {
 		return nil, evictionErr
 	}
+	if scopeErr := b.injectPromQLScrapeScope(recipeResult, platformRefs, componentValues); scopeErr != nil {
+		return nil, scopeErr
+	}
 	if warningErr := b.warnPeermemReadinessDisabled(ctx, recipeResult, componentValues); warningErr != nil {
 		return nil, warningErr
 	}
-	b.warnNFDNICLabelMismatch(componentValues)
+	if nicErr := b.checkNFDNICLabelMismatch(componentValues, dynamicValues); nicErr != nil {
+		return nil, nicErr
+	}
 	b.warnNRIManagementAllowlist(recipeResult, componentValues)
 
 	if warningErr := b.warnMissingStorageClassForPVCs(ctx, recipeResult, componentValues); warningErr != nil {
@@ -386,6 +405,13 @@ func (b *DefaultBundler) Make(ctx context.Context, recipeResult *recipe.RecipeRe
 	upgradeNotes, upgradeNotice, err := b.selectUpgradeNotes(ctx, recipeResult)
 	if err != nil {
 		return nil, err
+	}
+
+	// A class-partitioned set (ADR-018) branches here: every gate above ran
+	// once on the complete component set, and the partition is rendered
+	// into private staging and published atomically.
+	if b.Config.Split() {
+		return b.makeSplit(ctx, profileBaseline.ComponentRefs, recipeResult, componentValues, dir, upgradeNotes, start)
 	}
 
 	// No filesystem output is created until the final candidate has passed the
@@ -801,35 +827,8 @@ func (b *DefaultBundler) buildDeployer(ctx context.Context, recipeResult *recipe
 		"dynamic_components", len(dynamicValues),
 	)
 
-	// Readiness gate emission is wired for the deployers whose ordering
-	// primitive can block on the gate Job:
-	//   - helm: deploy.sh runs the folder's install.sh with
-	//     `helm upgrade --install --wait`; the gate Job is a helm hook, and
-	//     helm blocks on hook completion as part of the release.
-	//   - argocd / argocd-helm: the gate folder inherits the next sync-wave,
-	//     and Argo CD's built-in batch/Job health blocks that wave until the
-	//     Job completes.
-	//   - terraform: the gate is the last helm_release in the component's
-	//     module call, and the provider blocks on the hook as helm does.
-	// Flux, helmfile and fleet wrap each folder in HelmRelease / needs /
-	// dependsOn semantics that need dedicated gating wiring (not yet
-	// implemented). Fail clearly rather
-	// than silently dropping the opt-in flag and shipping a bundle without the
-	// readiness gate the user asked for. See #904.
-	if b.Config.ReadinessHooks() {
-		switch b.Config.Deployer() {
-		case config.DeployerHelm, config.DeployerArgoCD, config.DeployerArgoCDHelm, config.DeployerTerraform:
-			// supported. terraform gates on the emitted readiness release
-			// natively: the gate arrives as one more folder in the
-			// component's chain and becomes the last helm_release in its
-			// module; the gate Job is a helm hook, so that release does not
-			// apply until the Job COMPLETES, and a dependent's depends_on
-			// on the module call waits for it.
-		case config.DeployerFlux, config.DeployerHelmfile, config.DeployerFleet:
-			return nil, errors.New(errors.ErrCodeInvalidRequest,
-				fmt.Sprintf("--readiness-hooks is not supported with --deployer %q; supported deployers: helm, argocd, argocd-helm, terraform",
-					b.Config.Deployer()))
-		}
+	if err = b.validateDeployerConfig(); err != nil {
+		return nil, err
 	}
 
 	argoOpts, err := b.argoDeployerOptions()
@@ -886,13 +885,10 @@ func (b *DefaultBundler) buildDeployer(ctx context.Context, recipeResult *recipe
 			DestinationServer:      argoOpts.DestinationServer,
 			Project:                argoOpts.Project,
 			CascadeDelete:          argoOpts.CascadeDelete,
+			SyncRetry:              argoOpts.SyncRetry,
 		}, nil
 
 	case config.DeployerArgoCD:
-		if b.Config.HasDynamicValues() {
-			return nil, errors.New(errors.ErrCodeInvalidRequest,
-				"dynamic declarations are not supported with deployer \"argocd\"; use deployer \"argocd-helm\" instead")
-		}
 		componentPreManifests, err := b.collectComponentPreManifests(ctx, recipeResult)
 		if err != nil {
 			return nil, errors.PropagateOrWrap(err, errors.ErrCodeInternal,
@@ -927,6 +923,7 @@ func (b *DefaultBundler) buildDeployer(ctx context.Context, recipeResult *recipe
 			DestinationServer:      argoOpts.DestinationServer,
 			Project:                argoOpts.Project,
 			CascadeDelete:          argoOpts.CascadeDelete,
+			SyncRetry:              argoOpts.SyncRetry,
 			// Inline values when the bundle repo is OCI: Argo CD's $values
 			// multi-source ref is Git-only (see #960), so an OCI repoURL
 			// must use single-source with helm.valuesObject embedded.
@@ -1054,23 +1051,87 @@ func (b *DefaultBundler) buildDeployer(ctx context.Context, recipeResult *recipe
 	}
 }
 
-// argoDeployerOptions parses the deployer-level Argo Application options
-// (`--set deployer:<key>=<value>`) from the value overrides. Parsing lives
-// here — in front of deployer construction — so both the CLI and API paths
-// share a single validation point. The options only apply to the Argo CD
+// validateDeployerConfig rejects deployer settings that are invalid whatever
+// the recipe.
+func (b *DefaultBundler) validateDeployerConfig() error {
+	// Readiness gate emission is wired for the deployers whose ordering
+	// primitive can block on the gate Job:
+	//   - helm: deploy.sh runs the folder's install.sh with
+	//     `helm upgrade --install --wait`; the gate Job is a helm hook, and
+	//     helm blocks on hook completion as part of the release.
+	//   - argocd / argocd-helm: the gate folder inherits the next sync-wave,
+	//     and Argo CD's built-in batch/Job health blocks that wave until the
+	//     Job completes.
+	//   - terraform: the gate is the last helm_release in the component's
+	//     module call, and the provider blocks on the hook as helm does.
+	// Flux, helmfile and fleet wrap each folder in HelmRelease / needs /
+	// dependsOn semantics that need dedicated gating wiring (not yet
+	// implemented). Fail clearly rather
+	// than silently dropping the opt-in flag and shipping a bundle without the
+	// readiness gate the user asked for. See #904.
+	if b.Config.ReadinessHooks() {
+		switch b.Config.Deployer() {
+		case config.DeployerHelm, config.DeployerArgoCD, config.DeployerArgoCDHelm, config.DeployerTerraform:
+			// supported. terraform gates on the emitted readiness release
+			// natively: the gate arrives as one more folder in the
+			// component's chain and becomes the last helm_release in its
+			// module; the gate Job is a helm hook, so that release does not
+			// apply until the Job COMPLETES, and a dependent's depends_on
+			// on the module call waits for it.
+		case config.DeployerFlux, config.DeployerHelmfile, config.DeployerFleet:
+			return errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("--readiness-hooks is not supported with --deployer %q; supported deployers: helm, argocd, argocd-helm, terraform",
+					b.Config.Deployer()))
+		}
+	}
+
+	if _, err := b.resolveArgoDeployerOptions(); err != nil {
+		return err
+	}
+	if b.Config.Deployer() == config.DeployerArgoCD && b.Config.HasDynamicValues() {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"dynamic declarations are not supported with deployer \"argocd\"; use deployer \"argocd-helm\" instead")
+	}
+	return nil
+}
+
+// argoDeployerOptions resolves the deployer-level Argo Application options
+// from the dedicated Argo CD settings and the deprecated
+// `--set deployer:<key>=<value>` value overrides. Resolving here, in front
+// of deployer construction, validates the final layered settings for every
+// caller, whatever it checked on the way in. The options only apply to the Argo CD
 // generators; fail closed for every other deployer so a typo or unsupported
-// combination never silently ships a misconfigured bundle. See #1625.
+// combination never silently ships a misconfigured bundle. See #1625, #3264.
 // Typed (--set-json / --set-file) deployer overrides are rejected up front:
-// every deployer option is a scalar, so silently dropping typed input would
-// ship a misconfigured artifact.
-// Returns a zero-value options struct when no deployer overrides were set.
+// every deprecated deployer option is a scalar, so silently dropping typed
+// input would ship a misconfigured artifact.
+// Returns a zero-value options struct when nothing was set.
 func (b *DefaultBundler) argoDeployerOptions() (*config.ArgoDeployerOptions, error) {
+	opts, err := b.resolveArgoDeployerOptions()
+	if err != nil {
+		return nil, err
+	}
+	legacy := b.Config.ValueOverrides()[config.DeployerOverrideKey]
+	keys := make([]string, 0, len(legacy))
+	for key := range legacy {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		warnDeprecated(config.LegacyDeployerNotice(key))
+	}
+	return opts, nil
+}
+
+// resolveArgoDeployerOptions is argoDeployerOptions without the deprecation
+// warnings, so validateDeployerConfig can run it without warning twice.
+func (b *DefaultBundler) resolveArgoDeployerOptions() (*config.ArgoDeployerOptions, error) {
 	if typed := b.Config.ValueOverridesTyped()[config.DeployerOverrideKey]; len(typed) > 0 {
 		return nil, errors.New(errors.ErrCodeInvalidRequest,
-			"deployer options do not support --set-json/--set-file; use --set deployer:<key>=<value>")
+			"deployer options do not support --set-json/--set-file; use the --argocd-* settings")
 	}
-	opts, err := config.ParseArgoDeployerOptions(
-		b.Config.ValueOverrides()[config.DeployerOverrideKey])
+	legacy := b.Config.ValueOverrides()[config.DeployerOverrideKey]
+	opts, err := config.ResolveArgoDeployerOptions(legacy, b.Config.ArgoCDSettings())
 	if err != nil {
 		return nil, err
 	}
@@ -1078,11 +1139,19 @@ func (b *DefaultBundler) argoDeployerOptions() (*config.ArgoDeployerOptions, err
 		return &config.ArgoDeployerOptions{}, nil
 	}
 	if d := b.Config.Deployer(); d != config.DeployerArgoCD && d != config.DeployerArgoCDHelm {
+		if len(legacy) > 0 {
+			return nil, errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("--set deployer:<key> options are only supported with --deployer argocd or argocd-helm (got %q)", d))
+		}
 		return nil, errors.New(errors.ErrCodeInvalidRequest,
-			fmt.Sprintf("--set deployer:<key> options are only supported with --deployer argocd or argocd-helm (got %q)", d))
+			fmt.Sprintf("Argo CD settings are only supported with deployer argocd or argocd-helm (got %q)", d))
 	}
 	return opts, nil
 }
+
+// warnDeprecated is deprecation.Warn, a variable so tests can observe each
+// notice despite the process-wide once-per-subject deduplication.
+var warnDeprecated = deprecation.Warn
 
 // runDeployer executes a deployer and builds the result output.
 // dataFiles is the list of external data file paths already copied by Make().
@@ -1420,6 +1489,14 @@ func (b *DefaultBundler) extractComponentValues(ctx context.Context, recipeResul
 			return nil, err
 		}
 
+		// After every override, so an operator's own systemNamespaces is
+		// kept alongside the generated one rather than replacing it.
+		if ref.Name == drainscope.ComponentName {
+			if drainErr := ApplyNVSentinelDrainScope(ctx, values, recipeResult); drainErr != nil {
+				return nil, drainErr
+			}
+		}
+
 		if ref.Name == slinkySlurmComponentName {
 			supported := hasSlinkySharedStoragePreManifest(ref.PreManifestFiles)
 			if materializeErr := materializeSlinkySharedStorage(values, supported); materializeErr != nil {
@@ -1519,46 +1596,46 @@ func (b *DefaultBundler) getTypedValueOverridesForComponent(componentName string
 	return mergeOverridesAcrossKeys(allOverrides, b.componentOverrideKeys(componentName, provider))
 }
 
-func (b *DefaultBundler) filterAndValidateRecipe(recipeResult *recipe.RecipeResult) (*recipe.RecipeResult, error) {
-	enabledRefs, filteredOrder, excludedReasons, filterErr := b.filterEnabledComponents(recipeResult)
+// filterAndValidateRecipe also returns the platform's refs, before the
+// bundlers filter.
+func (b *DefaultBundler) filterAndValidateRecipe(recipeResult *recipe.RecipeResult) (*recipe.RecipeResult, []recipe.ComponentRef, error) {
+	selection, filterErr := b.filterEnabledComponents(recipeResult)
 	if filterErr != nil {
-		return nil, filterErr
+		return nil, nil, filterErr
 	}
 
 	// A --set / --set-json / --set-file naming a component that is not in
 	// the generated bundle cannot take effect. Reject it rather than drop
 	// it on the floor. Runs immediately after filtering, so the "present"
 	// set is exactly what will be rendered.
-	if overrideErr := b.rejectOverridesForAbsentComponents(recipeResult, enabledRefs, excludedReasons); overrideErr != nil {
-		return nil, overrideErr
+	if overrideErr := b.rejectOverridesForAbsentComponents(recipeResult, selection.emitted, selection.excluded); overrideErr != nil {
+		return nil, nil, overrideErr
 	}
 
 	// Work on a shallow copy so the caller's RecipeResult is not mutated
 	filtered := *recipeResult
-	filtered.ComponentRefs = enabledRefs
-	filtered.DeploymentOrder = filteredOrder
+	filtered.ComponentRefs = selection.emitted
+	filtered.DeploymentOrder = selection.order
 	spec := recipe.RecipeMetadataSpec{ComponentRefs: filtered.ComponentRefs}
 	if err := spec.ValidateDependencies(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &filtered, nil
+	return &filtered, selection.platform, nil
 }
 
-// filterEnabledComponents resolves the set of components to bundle by applying
-// recipe-level overrides.enabled, bundle-time --set enabled toggles, and the
-// positive bundlers component-name filter (config.WithBundlers, #1531), then
-// returns the enabled refs (with dangling dependency edges pruned) alongside
-// the deployment order filtered to those refs and a name-keyed map of why
-// each excluded component was dropped (consumed by
-// rejectOverridesForAbsentComponents).
-//
-// Bundle-time --set can disable a component the recipe enabled
-// (--set <c>:enabled=false), but it cannot re-enable a component the recipe
-// deliberately disabled: the author disables a component because the platform
-// already provides it (e.g. a CSP-managed cert-manager on OKE), so re-enabling
-// would install a conflicting second copy and there is no authored deployment
-// order for it. Such an attempt is rejected with ErrCodeInvalidRequest.
-func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResult) ([]recipe.ComponentRef, []string, map[string]string, error) {
+// componentSelection is what filterEnabledComponents selected. emitted has
+// dangling dependency edges pruned; platform is before the bundlers filter;
+// excluded holds the reason rejectOverridesForAbsentComponents quotes.
+type componentSelection struct {
+	emitted  []recipe.ComponentRef
+	order    []string
+	excluded map[string]string
+	platform []recipe.ComponentRef
+}
+
+// filterEnabledComponents narrows platformEnabledComponents by the bundlers
+// filter (config.WithBundlers, #1531).
+func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResult) (componentSelection, error) {
 	// declaredSet is every component the recipe names, regardless of enabled
 	// state. It distinguishes a declared-but-disabled dependency (prune the
 	// edge — satisfied externally) from an undeclared one (keep it so topology
@@ -1568,45 +1645,13 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 		declaredSet[ref.Name] = struct{}{}
 	}
 
-	enabledRefs := make([]recipe.ComponentRef, 0, len(recipeResult.ComponentRefs))
-	enabledSet := make(map[string]struct{})
-	// excludedReasons records, per dropped component, the reason phrase
-	// rejectOverridesForAbsentComponents quotes back to the operator.
-	excludedReasons := make(map[string]string)
-	for _, ref := range recipeResult.ComponentRefs {
-		setEnabled, ok, overrideErr := b.getSetEnabledOverride(ref.Name, recipeResult.DataProvider())
-		if overrideErr != nil {
-			return nil, nil, nil, overrideErr
-		}
-		recipeEnabled := ref.IsEnabled()
-		if ok {
-			if setEnabled && !recipeEnabled {
-				return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
-					"component %q is disabled by the recipe and cannot be re-enabled with "+
-						"--set %s:%s=true", ref.Name, ref.Name, config.ComponentEnabledKey))
-			}
-			if !setEnabled {
-				slog.Info("skipping component disabled via --set", "component", ref.Name)
-				// A redundant enabled=false on a component the recipe
-				// already disables keeps the recipe-disabled reason — it
-				// is the more fundamental one, and the override merely
-				// agrees with it.
-				if recipeEnabled {
-					excludedReasons[ref.Name] = "an " + config.ComponentEnabledKey + "=false value override removed it"
-				} else {
-					excludedReasons[ref.Name] = "the recipe disables it"
-				}
-				b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled via --set")
-				continue
-			}
-			// setEnabled && recipeEnabled: explicit --set enabled=true is a no-op.
-		} else if !recipeEnabled {
-			slog.Info("skipping disabled component", "component", ref.Name)
-			excludedReasons[ref.Name] = "the recipe disables it"
-			b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled by the recipe")
-			continue
-		}
-		enabledRefs = append(enabledRefs, ref)
+	platformRefs, excludedReasons, platformErr := b.platformEnabledComponents(recipeResult)
+	if platformErr != nil {
+		return componentSelection{}, platformErr
+	}
+	enabledRefs := slices.Clone(platformRefs)
+	enabledSet := make(map[string]struct{}, len(enabledRefs))
+	for _, ref := range enabledRefs {
 		enabledSet[ref.Name] = struct{}{}
 	}
 
@@ -1627,12 +1672,12 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 					for _, ref := range recipeResult.ComponentRefs {
 						declaredNames = append(declaredNames, ref.Name)
 					}
-					return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					return componentSelection{}, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
 						"unknown component %q in bundlers filter; recipe declares: %s",
 						name, strings.Join(declaredNames, ", ")))
 				}
 				if _, enabled := enabledSet[name]; !enabled {
-					return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					return componentSelection{}, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
 						"component %q is disabled and cannot be selected via the bundlers filter", name))
 				}
 				requestedSet[name] = struct{}{}
@@ -1656,11 +1701,11 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 	// labeler but drops either half of the contract it serves still removes it.
 	enabledRefs, labelerErr := b.dropUnservedDRANodeLabeler(enabledRefs, enabledSet, excludedReasons)
 	if labelerErr != nil {
-		return nil, nil, nil, labelerErr
+		return componentSelection{}, labelerErr
 	}
 
 	if len(enabledRefs) == 0 {
-		return nil, nil, nil, errors.New(errors.ErrCodeInvalidRequest,
+		return componentSelection{}, errors.New(errors.ErrCodeInvalidRequest,
 			"recipe has no enabled components after filtering")
 	}
 
@@ -1701,7 +1746,64 @@ func (b *DefaultBundler) filterEnabledComponents(recipeResult *recipe.RecipeResu
 		}
 	}
 
-	return enabledRefs, filteredOrder, excludedReasons, nil
+	return componentSelection{
+		emitted:  enabledRefs,
+		order:    filteredOrder,
+		excluded: excludedReasons,
+		platform: platformRefs,
+	}, nil
+}
+
+// platformEnabledComponents returns the recipe's enabled refs minus those
+// --set <c>:enabled=false removes, and why each other component was dropped.
+//
+// Bundle-time --set can disable a component the recipe enabled
+// (--set <c>:enabled=false), but it cannot re-enable a component the recipe
+// deliberately disabled: the author disables a component because the platform
+// already provides it (e.g. a CSP-managed cert-manager on OKE), so re-enabling
+// would install a conflicting second copy and there is no authored deployment
+// order for it. Such an attempt is rejected with ErrCodeInvalidRequest.
+func (b *DefaultBundler) platformEnabledComponents(recipeResult *recipe.RecipeResult) ([]recipe.ComponentRef, map[string]string, error) {
+	enabledRefs := make([]recipe.ComponentRef, 0, len(recipeResult.ComponentRefs))
+	// excludedReasons records, per dropped component, the reason phrase
+	// rejectOverridesForAbsentComponents quotes back to the operator.
+	excludedReasons := make(map[string]string)
+	for _, ref := range recipeResult.ComponentRefs {
+		setEnabled, ok, overrideErr := b.getSetEnabledOverride(ref.Name, recipeResult.DataProvider())
+		if overrideErr != nil {
+			return nil, nil, overrideErr
+		}
+		recipeEnabled := ref.IsEnabled()
+		if ok {
+			if setEnabled && !recipeEnabled {
+				return nil, nil, errors.New(errors.ErrCodeInvalidRequest, fmt.Sprintf(
+					"component %q is disabled by the recipe and cannot be re-enabled with "+
+						"--set %s:%s=true", ref.Name, ref.Name, config.ComponentEnabledKey))
+			}
+			if !setEnabled {
+				slog.Info("skipping component disabled via --set", "component", ref.Name)
+				// A redundant enabled=false on a component the recipe
+				// already disables keeps the recipe-disabled reason — it
+				// is the more fundamental one, and the override merely
+				// agrees with it.
+				if recipeEnabled {
+					excludedReasons[ref.Name] = "an " + config.ComponentEnabledKey + "=false value override removed it"
+				} else {
+					excludedReasons[ref.Name] = "the recipe disables it"
+				}
+				b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled via --set")
+				continue
+			}
+			// setEnabled && recipeEnabled: explicit --set enabled=true is a no-op.
+		} else if !recipeEnabled {
+			slog.Info("skipping disabled component", "component", ref.Name)
+			excludedReasons[ref.Name] = "the recipe disables it"
+			b.warnExcludedDriverInstaller(recipeResult, ref.Name, "disabled by the recipe")
+			continue
+		}
+		enabledRefs = append(enabledRefs, ref)
+	}
+	return enabledRefs, excludedReasons, nil
 }
 
 // rejectOverridesForAbsentComponents rejects a value override
@@ -2838,7 +2940,16 @@ func (b *DefaultBundler) copyDataFiles(dir string, provider recipe.DataProvider)
 // dataFiles is the list of external data file paths (relative to bundle dir) to include
 // in resolvedDependencies. Returns the list of attestation files added, or nil if skipped.
 func (b *DefaultBundler) attestBundle(ctx context.Context, dir string, dataFiles []string, recipeResult *recipe.RecipeResult) ([]string, error) {
+	return b.attestBundleAt(ctx, dir, dir, dataFiles, recipeResult)
+}
+
+// attestBundleAt attests the bundle under dir while recording publishedDir
+// as the statement's output directory. A bundle set is attested in its
+// staging directory before one atomic move to publishedDir, and the signed
+// provenance must name the path the set lives at, not the transient stage.
+func (b *DefaultBundler) attestBundleAt(ctx context.Context, dir, publishedDir string, dataFiles []string, recipeResult *recipe.RecipeResult) ([]string, error) {
 	dir = filepath.Clean(dir)
+	publishedDir = filepath.Clean(publishedDir)
 	if b.Attester == nil || b.Config == nil || !b.Config.Attest() {
 		return nil, nil
 	}
@@ -2861,7 +2972,7 @@ func (b *DefaultBundler) attestBundle(ctx context.Context, dir string, dataFiles
 	// Build attestation subject with full SLSA metadata
 	metadata := attestation.StatementMetadata{
 		ToolVersion:   b.Config.Version(),
-		OutputDir:     dir,
+		OutputDir:     publishedDir,
 		Deterministic: b.Config.Deterministic(),
 	}
 
@@ -3012,7 +3123,15 @@ func (b *DefaultBundler) verifyAndCopyBinaryAttestation(ctx context.Context, dir
 			"pattern", identityPattern)
 	}
 
-	binaryBuilder, verifyErr := verifier.VerifyBinaryAttestation(ctx, binaryAttestPath, identityPattern, binaryDigest)
+	// Read once, verify that exact buffer, write the same buffer: the file
+	// cannot be swapped between verification and copy.
+	binaryAttestData, readErr := verifier.ReadBinaryAttestation(ctx, binaryAttestPath)
+	if readErr != nil {
+		return errors.PropagateOrWrap(readErr, errors.ErrCodeInternal,
+			"binary attestation exists but cannot be read: "+binaryAttestPath)
+	}
+
+	binaryBuilder, verifyErr := verifier.VerifyBinaryAttestationData(ctx, binaryAttestData, identityPattern, binaryDigest)
 	if verifyErr != nil {
 		if stderrors.Is(verifyErr, errors.New(errors.ErrCodeTimeout, "")) {
 			return verifyErr
@@ -3022,12 +3141,6 @@ func (b *DefaultBundler) verifyAndCopyBinaryAttestation(ctx context.Context, dir
 				"remove --attest to skip", verifyErr)
 	}
 	slog.Info("binary provenance verified", "builder", binaryBuilder)
-
-	binaryAttestData, readErr := readBoundedFile(binaryAttestPath, defaults.MaxAttestationFileBytes)
-	if readErr != nil {
-		return errors.Wrap(errors.ErrCodeInternal,
-			"binary attestation exists but cannot be read: "+binaryAttestPath, readErr)
-	}
 
 	destPath, joinErr := deployer.SafeJoin(dir, attestation.BinaryAttestationFile)
 	if joinErr != nil {

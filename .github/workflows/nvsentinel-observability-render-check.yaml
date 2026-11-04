@@ -24,9 +24,21 @@
 # action map, the quarantine rule sets and the drain mode, the slinky-drainer
 # one asserts node-drainer's customDrain wiring to the plugin, the
 # health-events-analyzer one asserts the workload, its datastore wiring and
-# that the mixin names every rule the chart ships, and the CRD
-# exclusion one asserts the chart still ships mongodb-store's CRDs where
-# nvsentinel's ownsCRDsExcludeSubcharts expects them.
+# that the mixin names every rule the chart ships, the event-exporter one
+# asserts the workload, its OIDC Secret and datastore wiring and its config,
+# the log-collector one asserts the collector Job, the file server it uploads
+# to and that server's volume and images, the system-namespaces one asserts
+# the chart's default list still matches the one the drain scope keeps, the
+# node-validation one asserts lifecycle-manager's workload, its new-node
+# criteria and tests, and the DCGM address its dcgm-diag-test calls, the
+# post-remediation validation one asserts fault-quarantine's [validation]
+# section, its post-reboot rule set and its RBAC to create ValidationRequests,
+# the external-remediation one asserts the ExternalRemediationRequest action,
+# its template and RBAC render only with its mixin, and that
+# kubernetes-object-monitor prints a declared policy's enabled and isFatal
+# verbatim, and the CRD exclusion one asserts every component's
+# ownsCRDsExcludeSubcharts (nvsentinel's and nktp's) still matches its pinned
+# chart.
 # All are gated on testing.Short() -- `make
 # test`/`make qualify`/every other CI job run with -short, so this is the only
 # place they execute. There is no PR-blocking trigger here on purpose: these
@@ -97,9 +109,15 @@ jobs:
             TestNVSentinelRemediationChartRender
             TestNVSentinelRemediationAbsentWithoutMixin
             TestNVSentinelMongoDBChartRender
-            TestNVSentinelCRDExclusionMatchesChart
+            TestCRDExclusionsMatchChart
             TestNVSentinelSlinkyDrainerChartRender
             TestNVSentinelHealthEventsAnalyzerChartRender
+            TestNVSentinelEventExporterChartRender
+            TestNVSentinelLogCollectorChartRender
+            TestNVSentinelExternalRemediationChartRender
+            TestNVSentinelChartSystemNamespacesDefault
+            TestNVSentinelNodeValidationChartRender
+            TestNVSentinelPostRemediationValidationChartRender
           )
           pattern="^($(IFS='|'; echo "${tests[*]}"))$"
           out=$(go test ./pkg/bundler/validations/... -run "$pattern" -v -count=1 2>&1) && rc=0 || rc=$?

@@ -590,7 +590,7 @@ func snapshotCmdFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:     "os",
-			Usage:    "Node OS family (ubuntu, rhel, cos, amazonlinux, ol, talos, sles). Selects the per-OS pod configuration and service collector backend. Talos skips systemd hostPath mounts and uses the Kubernetes-API service backend.",
+			Usage:    "Node OS family (ubuntu, rhel, cos, amazonlinux, ol, talos, sles, rocky). Selects the per-OS pod configuration and service collector backend. Talos skips systemd hostPath mounts and uses the Kubernetes-API service backend.",
 			Sources:  cli.EnvVars("AICR_OS"),
 			Category: catAgentDeployment,
 		},
@@ -770,6 +770,11 @@ See examples/templates/snapshot-template.md.tmpl for a sample template.
 				ser, serErr := createSnapshotSerializer(opts.tmplOpts, opts.kubeconfig)
 				if serErr != nil {
 					return errors.Wrap(errors.ErrCodeInternal, "failed to create output serializer", serErr)
+				}
+				// The stamp lets the controller tell this run's snapshot from
+				// an earlier one at the same ConfigMap.
+				if cmw, ok := ser.(*serializer.ConfigMapWriter); ok {
+					cmw.WithRunID(os.Getenv("AICR_RUN_ID"))
 				}
 				if c, ok := ser.(serializer.Closer); ok {
 					defer func() {

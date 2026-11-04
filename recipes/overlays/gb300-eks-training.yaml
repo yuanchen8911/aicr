@@ -27,7 +27,7 @@ spec:
     accelerator: gb300
     intent: training
 
-  # Targets p6e-gb300r.36xlarge (GB300 NVL72, 4 GPUs per node, Grace ARM64
+  # Targets the GB300 EKS instance (GB300 NVL72, 4 GPUs per node, Grace ARM64
   # host) on the EFA scale-out fabric.
   #
   # Verified on the reference cluster: each GPU node presents 2x Amazon ENA
@@ -42,9 +42,7 @@ spec:
   # interface is therefore the correct and maximal EFA configuration here,
   # not an under-provisioned one.
   #
-  # Fabric selection is not modelled in the recipe criteria today — this
-  # overlay targets EFA because that is what the reference cluster presents
-  # and what public AICR builds for (#1410).
+  # This overlay targets EFA, the GB300 EKS fabric.
   #
   # Specific constraints for GB300 on EKS training workloads.
   # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
@@ -79,7 +77,7 @@ spec:
       dependencyRefs:
         - nfd
         - cert-manager
-        - kube-prometheus-stack
+        - prometheus-operator-crds
         - nodewright-customizations
       overrides:
         cdi:
@@ -99,7 +97,7 @@ spec:
     # extra host prep: nvidia-gb300-performance sizes its hugepages for a 64k
     # granule (hugepagesz=512M, and no 1G, which a 64k granule cannot register),
     # and nvidia-setup-kernel installs the pinned kernel, which resolves to
-    # 6.17.0-1019-aws-64k on arm64. Running the profile on a 4k-granule kernel
+    # 7.0.0-1014-aws-64k on arm64. Running the profile on a 4k-granule kernel
     # would get the 512M clause rejected at boot and its hugepages= dropped.
     #
     # multiNodeTraining is a shim onto nvidia-gb300-performance in nvidia-tuned
@@ -140,7 +138,7 @@ spec:
       # actually carried traffic, so a silent fallback to Socket or NET does
       # not masquerade as a pass.
       #
-      # Measured on GB300 (2x p6e-gb300r.36xlarge, 8 GPUs, NCCL 2.27.7,
+      # Measured on GB300 (2 GPU nodes, 8 GPUs, NCCL 2.27.7,
       # 16 GiB message): net 44.04 GB/s, nvls 841.17 GB/s. Both land at ~88%
       # of their respective line rates (a single 400 Gb/s EFA device; 18
       # NVLink-5 links at 53.125 GB/s = ~956 GB/s per GPU).

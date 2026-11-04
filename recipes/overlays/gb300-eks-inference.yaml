@@ -27,7 +27,7 @@ spec:
     accelerator: gb300
     intent: inference
 
-  # Targets p6e-gb300r.36xlarge (GB300 NVL72, 4 GPUs per node, Grace ARM64
+  # Targets the GB300 EKS instance (GB300 NVL72, 4 GPUs per node, Grace ARM64
   # host) on the EFA scale-out fabric.
   #
   # Verified on the reference cluster: each GPU node presents 2x Amazon ENA
@@ -42,9 +42,7 @@ spec:
   # interface is therefore the correct and maximal EFA configuration here,
   # not an under-provisioned one.
   #
-  # Fabric selection is not modelled in the recipe criteria today — this
-  # overlay targets EFA because that is what the reference cluster presents
-  # and what public AICR builds for (#1410).
+  # This overlay targets EFA, the GB300 EKS fabric.
   #
   # Specific constraints for GB300 on EKS inference workloads.
   # Constraint names use fully qualified measurement paths: {type}.{subtype}.{key}
@@ -71,7 +69,7 @@ spec:
       dependencyRefs:
         - nfd
         - cert-manager
-        - kube-prometheus-stack
+        - prometheus-operator-crds
         - nodewright-customizations
       overrides:
         cdi:

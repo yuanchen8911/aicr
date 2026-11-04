@@ -33,6 +33,11 @@
 // cannot be read, a release held by both storage drivers, and a loosely
 // matched Application deploying outside the component's namespaces.
 //
+// ReadReleases reads the same source with the same naming but stops before the
+// version table. It returns every record attributed to each component, plus
+// the AICR-stamped Helm records that match none, for a caller that acts on the
+// records themselves, such as one removing what AICR installed.
+//
 // ScanAtRisk is the other half, and it answers a different question about the
 // same cluster. See "The at-risk scan" below.
 //
@@ -157,6 +162,14 @@
 // shape of every generated wrapper and every Kustomize component, reports no
 // version at all: the only revision it carries is the bundle repository's git
 // branch, and reporting that would claim each such component sits at "main".
+//
+// The exception is an Application the AICR Operator wrote. It is path-based
+// too, an OCI chart at path "." pinned by digest, but the operator records each
+// chart's version beside its digest in a plan ConfigMap. The digest status
+// establishes as deployed is looked up there, by release ID, in the operator's
+// namespace only, since only that namespace is guarded by the operator's
+// admission policy. A digest no plan records fails the read with the
+// alternatives rather than reading every operator component as unversioned.
 //
 // Only an Application deploying into this cluster is read. On an Argo CD
 // management cluster most deploy elsewhere, and a remote one carrying a

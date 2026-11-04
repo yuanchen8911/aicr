@@ -42,6 +42,13 @@ func TestParseCriteriaServiceType(t *testing.T) {
 		{"mk8s", "mk8s", CriteriaServiceMK8s, false},
 		{"MK8S whitespace", " MK8S ", CriteriaServiceMK8s, false},
 		{"unqualified Nebius provider", "nebius", CriteriaServiceAny, true},
+		{"nvke", "nvke", CriteriaServiceNVKE, false},
+		{"cks", "cks", CriteriaServiceCKS, false},
+		{"CKS whitespace", " CKS ", CriteriaServiceCKS, false},
+		{"CoreWeave alias", " CoreWeave ", CriteriaServiceCKS, false},
+		{"NVKE whitespace", " NVKE ", CriteriaServiceNVKE, false},
+		{"legacy NKE name", "nke", CriteriaServiceAny, true},
+		{"raw NICo provider", "nico", CriteriaServiceAny, true},
 		{"aks", "aks", CriteriaServiceAKS, false},
 		{"oke", "oke", CriteriaServiceOKE, false},
 		{"lke", "lke", CriteriaServiceLKE, false},
@@ -725,7 +732,7 @@ func TestGetCriteriaServiceTypes(t *testing.T) {
 	types := GetCriteriaServiceTypes()
 
 	// Should return sorted list
-	expected := []string{"aks", "bcm", "eks", "generic", "gke", "k0s", "kind", "lke", "metal3", "mk8s", "ocp", "oke", "rke2"}
+	expected := []string{"aks", "bcm", "cks", "eks", "generic", "gke", "k0s", "kind", "lke", "metal3", "mk8s", "nvke", "ocp", "oke", "rke2"}
 	if len(types) != len(expected) {
 		t.Errorf("GetCriteriaServiceTypes() returned %d types, want %d", len(types), len(expected))
 	}
@@ -797,7 +804,7 @@ func TestGetCriteriaOSTypes(t *testing.T) {
 	types := GetCriteriaOSTypes()
 
 	// Should return sorted list
-	expected := []string{"amazonlinux", "cos", "ol", "rhel", "sles", "talos", "ubuntu"}
+	expected := []string{"amazonlinux", "cos", "ol", "rhel", "rocky", "sles", "talos", "ubuntu"}
 	if len(types) != len(expected) {
 		t.Errorf("GetCriteriaOSTypes() returned %d types, want %d", len(types), len(expected))
 	}
@@ -894,6 +901,8 @@ func TestParseCriteriaOSType_AllAliases(t *testing.T) {
 		{"Talos uppercase", "Talos", CriteriaOSTalos},
 		{"sles", "sles", CriteriaOSSLES},
 		{"SLES uppercase", "SLES", CriteriaOSSLES},
+		{"rocky", "rocky", CriteriaOSRocky},
+		{"Rocky uppercase", "Rocky", CriteriaOSRocky},
 	}
 
 	for _, tt := range tests {

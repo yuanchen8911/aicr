@@ -61,6 +61,7 @@
             "cos",
             "ol",
             "rhel",
+            "rocky",
             "sles",
             "talos",
             "ubuntu"
@@ -84,6 +85,7 @@
             "aks",
             "any",
             "bcm",
+            "cks",
             "eks",
             "generic",
             "gke",
@@ -92,6 +94,7 @@
             "lke",
             "metal3",
             "mk8s",
+            "nvke",
             "ocp",
             "oke",
             "rke2"

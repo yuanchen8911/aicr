@@ -25,10 +25,10 @@
 // Criteria: Specifies target deployment parameters
 //
 //	type Criteria struct {
-//	    Service     CriteriaServiceType     // eks, gke, aks, oke, kind, lke, bcm, ocp, metal3, rke2, generic, k0s, mk8s, any
+//	    Service     CriteriaServiceType     // eks, gke, aks, oke, kind, lke, bcm, ocp, metal3, rke2, generic, k0s, mk8s, nvke, cks, any
 //	    Accelerator CriteriaAcceleratorType // h100, h200, gb200, gb300, b200, b300, a100, l40, l40s, rtx-pro-6000, vr200, any
 //	    Intent      CriteriaIntentType      // training, inference, any
-//	    OS          CriteriaOSType          // ubuntu, rhel, cos, amazonlinux, ol, talos, sles, any
+//	    OS          CriteriaOSType          // ubuntu, rhel, cos, amazonlinux, ol, talos, sles, rocky, any
 //	    Platform    CriteriaPlatformType    // dynamo, kubeflow, kueue, nim, runai, slurm, any
 //	    Nodes       int                     // node count (0 = any)
 //	}
@@ -74,6 +74,8 @@
 //   - CriteriaServiceGeneric: generic self-managed Kubernetes (no distinguishing distro or provisioner; opt-in-only, never inferred from a snapshot)
 //   - CriteriaServiceK0s: k0s (self-managed k0s clusters)
 //   - CriteriaServiceMK8s: Nebius Managed Service for Kubernetes
+//   - CriteriaServiceNVKE: NVIDIA Kubernetes Engine (Forge/NICo bare metal)
+//   - CriteriaServiceCKS: CoreWeave Kubernetes Service
 //   - CriteriaServiceAny: Any service (wildcard)
 //
 // Accelerator types for GPU selection:
@@ -103,6 +105,7 @@
 //   - CriteriaOSOracleLinux: Oracle Linux (OKE Gen2 GPU image)
 //   - CriteriaOSTalos: Talos Linux
 //   - CriteriaOSSLES: SUSE Linux Enterprise Server
+//   - CriteriaOSRocky: Rocky Linux
 //   - CriteriaOSAny: Any OS (wildcard)
 //
 // Platform types for workload frameworks:
@@ -192,11 +195,11 @@
 // # Query Parameters (HTTP API - GET)
 //
 // The HTTP handler accepts these query parameters for GET requests:
-//   - service: eks, gke, aks, oke, kind, lke, bcm, ocp, metal3, rke2, generic, k0s, mk8s, any (default: any)
+//   - service: eks, gke, aks, oke, kind, lke, bcm, ocp, metal3, rke2, generic, k0s, mk8s, nvke, cks, any (default: any)
 //   - accelerator: h100, h200, gb200, gb300, b200, b300, a100, l40, l40s, rtx-pro-6000, vr200, any (default: any)
 //   - gpu: alias for accelerator (backwards compatibility)
 //   - intent: training, inference, any (default: any)
-//   - os: ubuntu, rhel, cos, amazonlinux, ol, talos, sles, any (default: any)
+//   - os: ubuntu, rhel, cos, amazonlinux, ol, talos, sles, rocky, any (default: any)
 //   - platform: dynamo, kubeflow, kueue, nim, runai, slurm, any (default: any)
 //   - nodes: integer node count (default: 0 = any)
 //

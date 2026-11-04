@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/aicr/pkg/defaults"
+	"github.com/NVIDIA/aicr/pkg/deprecation"
 	"github.com/NVIDIA/aicr/pkg/errors"
 	"github.com/NVIDIA/aicr/pkg/serializer"
 	corev1 "k8s.io/api/core/v1"
@@ -459,6 +460,9 @@ type Config struct {
 	// collide. See #1011.
 	appName string
 
+	// argoCD holds the dedicated Argo CD bundle settings. See #3264.
+	argoCD ArgoCDSettings
+
 	// readinessHooks emits a standalone per-component readiness gate chart
 	// (NNN-<name>-readiness/) for each component that ships a
 	// recipes/components/<name>/readiness.yaml chainsaw Test. The chart runs
@@ -504,6 +508,13 @@ type Config struct {
 	// does not declare, or one the recipe/--set disabled, is rejected with
 	// ErrCodeInvalidRequest at bundle time. See #1531.
 	bundlers []string
+
+	// split renders one bundle set partitioned by registry class (ADR-018):
+	// a directory per class with enabled components, under a set root that
+	// holds recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and,
+	// with Attest, the attestation. Off
+	// by default; the ordinary single bundle is unchanged.
+	split bool
 }
 
 // Getter methods for read-only access
@@ -733,6 +744,21 @@ func (c *Config) AppName() string {
 	return c.appName
 }
 
+// ArgoCDSettings returns a copy of the dedicated Argo CD bundle settings.
+func (c *Config) ArgoCDSettings() ArgoCDSettings {
+	return c.argoCD.Clone()
+}
+
+// LegacyDeployerNotice returns the deprecation notice for the deprecated
+// deployer:<key> value overrides, and whether c uses any.
+func (c *Config) LegacyDeployerNotice() (deprecation.Notice, bool) {
+	legacy := c.valueOverrides[DeployerOverrideKey]
+	if len(legacy) == 0 {
+		return deprecation.Notice{}, false
+	}
+	return LegacyDeployerNotice(sortedKeys(legacy)[0]), true
+}
+
 // ReadinessHooks reports whether per-component readiness gate charts should
 // be emitted for components that ship a readiness.yaml. Off by default;
 // opt-in via --readiness-hooks on the CLI. See #904.
@@ -760,6 +786,11 @@ func (c *Config) TerraformClusterRollover() bool {
 // default; opt-in via --terraform-child-module.
 func (c *Config) TerraformChildModule() bool {
 	return c.terraformChildModule
+}
+
+// Split reports whether the bundle is rendered as a class-partitioned set.
+func (c *Config) Split() bool {
+	return c.split
 }
 
 // Bundlers returns a copy of the positive component-name filter. Empty means
@@ -796,12 +827,38 @@ func (c *Config) Validate() error {
 		return errors.Wrap(errors.ErrCodeInvalidRequest, "invalid WithAcceleratedNodeTolerations", err)
 	}
 
+	if err := c.validateSplit(); err != nil {
+		return err
+	}
+
 	// The zero label means the DRA eviction contract was not requested, which
 	// is the default (issue #2469). Only a configured label is validated.
 	if c.draEvictionNodeLabel == (NodeLabel{}) {
 		return nil
 	}
 	return c.draEvictionNodeLabel.Validate()
+}
+
+// validateSplit enforces the v1 support matrix of ADR-018: a bundle set is
+// Helm-local only, is the provenance unit so it cannot drop checksums, and is
+// the complete partition so it cannot be combined with a component filter.
+func (c *Config) validateSplit() error {
+	if !c.split {
+		return nil
+	}
+	if c.deployer != DeployerHelm {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			fmt.Sprintf("--split supports only the helm deployer in this release; got %q (ADR-018 support matrix)", c.deployer))
+	}
+	if !c.includeChecksums {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--split requires checksums: the bundle set is verified at its root before it is published")
+	}
+	if len(c.bundlers) > 0 {
+		return errors.New(errors.ErrCodeInvalidRequest,
+			"--split cannot be combined with a component filter (bundlers): the class partition is the only supported subsetting of a split set")
+	}
+	return nil
 }
 
 type Option func(*Config)
@@ -1126,6 +1183,16 @@ func WithAppName(name string) Option {
 	}
 }
 
+// WithArgoCDSettings sets the dedicated Argo CD bundle settings for the
+// argocd and argocd-helm deployers. Bundling with any other deployer rejects
+// a non-zero value. Validation runs at bundle time, together with any
+// deprecated deployer:<key> value overrides.
+func WithArgoCDSettings(s ArgoCDSettings) Option {
+	return func(c *Config) {
+		c.argoCD = s.Clone()
+	}
+}
+
 // WithReadinessHooks enables emission of per-component readiness gate charts
 // for components that ship a recipes/components/<name>/readiness.yaml. Off by
 // default; when enabled, each such component gets a standalone
@@ -1180,6 +1247,18 @@ func WithBundlers(names []string) Option {
 		}
 		c.bundlers = make([]string, len(names))
 		copy(c.bundlers, names)
+	}
+}
+
+// WithSplit renders the bundle as a class-partitioned set (ADR-018): one
+// directory per class with enabled components, under a set root carrying
+// recipe.yaml, split.yaml, bundle-info.yaml, checksums.txt and, with
+// Attest, the attestation. Off by
+// default. Validate rejects it with any deployer other than helm, with
+// checksums disabled, or together with WithBundlers.
+func WithSplit(enabled bool) Option {
+	return func(c *Config) {
+		c.split = enabled
 	}
 }
 

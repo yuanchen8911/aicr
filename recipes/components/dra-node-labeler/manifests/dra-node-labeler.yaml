@@ -138,14 +138,13 @@ spec:
           # and is not pinned in this repo's values.yaml, so nothing holds the two
           # together — the catalog carries a kubectl image for each, listed
           # separately in docs/user/container-images.md.
-          image: docker.io/alpine/kubectl:1.37.1@sha256:b568e8beb6a79aee269c142343078a278b85e7710f1c0e7d8d6b21d1eb566a48
+          image: docker.io/alpine/kubectl:1.37.2@sha256:5e2de75d37e811ba6eb92e06890b1b3263eae4f0a1c17b49269edec589b1352a
           command:
             - /bin/sh
             - -c
             - |
               LABEL_KEY={{ $vals.labelKey | quote }}
               LABEL_VALUE={{ $vals.labelValue | quote }}
-              READY=/var/run/dra-node-labeler/labeled
 
               # Retry in place instead of exiting: a container restart would be the
               # only retry and the health check treats restarts as failure. The pod
@@ -178,6 +177,9 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # The marker the readiness probe tests for, on the state emptyDir.
+            - name: READY
+              value: /var/run/dra-node-labeler/labeled
           # Ready means "this node carries the key", not "the shell started": kubelet
           # marks a probe-less container Ready immediately, which let the health
           # check pass while kubectl was still blocked.

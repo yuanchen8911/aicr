@@ -151,7 +151,7 @@ aicr snapshot \
 - `--privileged`: Run agent in privileged mode (default: enabled; required for GPU/SystemD collectors). Set to `false` for PSS-restricted namespaces.
 - `--require-gpu`: In privileged mode (the default), requests an `nvidia.com/gpu` resource for the agent pod (required in CDI environments). With `--privileged=false` it adds no GPU request, but still disables automatic GPU-node selection; pass `--node-selector` to target GPU nodes.
 - `--runtime-class`: Set `runtimeClassName` on the agent pod for `nvidia-smi` access without consuming a GPU. Use with `--node-selector` to target GPU nodes.
-- `--os`: Node OS family (`ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`, `sles`). Selects the per-OS pod configuration and service collector backend.
+- `--os`: Node OS family (`ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`, `sles`, `rocky`). Selects the per-OS pod configuration and service collector backend.
 - `--requests` / `--limits`: Override agent container resource requests/limits (comma-separated `name=quantity` pairs).
 - `--cluster-config`: Path to a pre-existing k8s-launch-kit cluster-config.yaml to ingest network topology (local agent mode only).
 - `--oke-addons`: Path to an `oci ce cluster list-addons --cluster-id <cluster-ocid> --all --output json` dump, projected into the `K8s.oke-addons.nvidia-gpu-plugin` and `K8s.oke-addons.nvidia-network-operator` readings. It runs controller-side, so it works in agent Job mode too. The file never enters the pod, and the CLI merges the projection into the returned snapshot.
@@ -173,6 +173,18 @@ kubectl logs -n gpu-operator -l app.kubernetes.io/name=aicr,app.kubernetes.io/co
 # Describe Job for events
 kubectl describe job -n gpu-operator -l app.kubernetes.io/name=aicr,app.kubernetes.io/component=snapshot-agent
 ```
+
+### When the agent pod cannot exit
+
+On an unhealthy node a kernel read can block in uninterruptible sleep. The agent stops waiting on that read after 1 second, leaves the entry out of the snapshot, and logs a warning naming the path. The stuck kernel thread still keeps the pod from being reaped, so its Job never completes.
+
+`aicr snapshot` detects this. Once the agent has written its snapshot, the CLI gives the Job 30 seconds to complete. If the Job has not completed by then, or the Job wait reaches `--timeout`, the CLI returns the snapshot with a warning that names the pod and node, and exits 0 instead of failing with a timeout. Scripts that treat a snapshot timeout as a signal to retry should also watch for that warning.
+
+The 30-second path needs `list` and `watch` on the output ConfigMap.
+
+The agent records the run ID on the ConfigMap as the `aicr.run/run-id` annotation, and the CLI rejects a snapshot stamped with any other run's ID. A `cm://` destination you name must hold a snapshot stamped with the current run's ID, so a snapshot an earlier run left there is never returned in its place. An agent image older than the CLI does not stamp the snapshot. The CLI accepts an unstamped snapshot only from its default internal ConfigMap, so recovery with an older agent does not work with a `cm://` destination you name.
+
+The pod stays `Running`, or `Terminating` after cleanup deletes its Job, until the node recovers or is rebooted. Investigate the node named in the warning.
 
 ## GPU Node Auto-Targeting
 
@@ -737,6 +749,7 @@ first group is required in both ServiceAccount modes:
 | `pods/log` | `get` | namespace | Streaming the agent's output back to your terminal |
 | `configmaps` | `get`, `list` | namespace | Reading the snapshot the agent staged |
 | `configmaps` | `delete` | namespace | Only when aicr owns the output ConfigMap (i.e. you did not pass your own `cm://` URI) |
+| `configmaps` | `list`, `watch` | output ConfigMap's namespace | Not checked by the gate. Recovering the snapshot when the agent pod cannot exit (see [When the agent pod cannot exit](#when-the-agent-pod-cannot-exit)) |
 
 `serviceaccounts: get` is not optional. Without it the run cannot tell whether
 `--service-account-name` names an existing ServiceAccount or is a prefix, and

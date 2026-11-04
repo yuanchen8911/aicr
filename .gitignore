@@ -33,9 +33,11 @@ bin/
 /testgrid-publish
 /health
 /registry-inventory
+/cleanup
 # ...and a compiled binary landing inside the tool package dir (its name equals
 # the dir, so `go build` there emits it right next to the source).
 tools/registry-inventory/registry-inventory
+tools/cleanup/cleanup
 
 # install
 /aicr_*.tar.gz
@@ -201,3 +203,10 @@ tools/mdx/.aicr-install-lock/
 # causes it rather than at tag time.
 /THIRD_PARTY_NOTICES.md
 /performance
+/validators/*/performance
+
+# AICR Operator kind suites: the kind cluster's kubeconfig and registry
+# credentials, and the kubeconfig path tests point at so they never reach a
+# real cluster.
+/.operator-e2e/
+/.no-kubeconfig

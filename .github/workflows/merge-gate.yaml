@@ -29,8 +29,8 @@ name: Merge Gate
 # The push trigger covers what on-push.yaml does not. on-push.yaml already runs
 # the full qualification on every main push, so this workflow skips its `tests`
 # job there (see below) and contributes only its own checks: actionlint,
-# verify-licenses, verify-renovate, docs-mdx, malware-scan, CodeQL and the
-# freshness gates.
+# verify-licenses, verify-renovate, docs-mdx, malware-scan, CodeQL, the
+# operator generated-code check and the freshness gates.
 #
 # That matters because main's ruleset is bypassable and bypassing is routine
 # here -- a direct push reports "Bypassed rule violations ... 2 of 2 required
@@ -86,10 +86,14 @@ jobs:
       settings: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.settings }}
       bom: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.bom }}
       nvcre: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.nvcre }}
+      crdcmd: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.crdcmd }}
+      crdinv: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.crdinv }}
+      classcol: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.classcol }}
       tuning: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.tuning }}
       notices: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.notices }}
       coverage: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.coverage }}
       docs: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.docs }}
+      operator: ${{ github.event_name == 'push' && 'true' || steps.changes.outputs.operator }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -188,6 +192,72 @@ jobs:
               - 'docs/user/component-catalog.md'
               - 'pkg/recipe/nvcre_wiring_guard_test.go'
               - 'recipes/components/nvcre/**'
+            crdcmd:
+              # TestCatalogCRDUpgradeCommand runs the manual CRD-upgrade block
+              # in the component catalog against an API server. The `tests`
+              # job runs it on any code change, but a docs-only PR editing
+              # the block skips `tests`, so it is gated here on the doc. The
+              # test is listed so renaming it re-runs the check, and this
+              # workflow so a change to the job cannot skip it.
+              - 'docs/user/component-catalog.md'
+              - 'pkg/bundler/deployer/localformat/catalog_crd_command_test.go'
+              - '.github/workflows/merge-gate.yaml'
+            crdinv:
+              # Inputs to make crd-inventory-check, which renders each pinned
+              # chart a health check asserts a CRD against and compares it with
+              # the committed crds.yaml. The recipes/ entries cover the data
+              # embedded in the recipes package, and the pkg/ entries every
+              # in-repo package the tool imports, directly or not.
+              # TestMergeGateWatchesCRDInventoryInputs fails when either misses
+              # a file the tool builds from. The helm pin, the Go toolchain and
+              # modules, the actions that set up the job, the Makefile target
+              # and this workflow are listed so a change to the check runs it.
+              - 'recipes/*.go'
+              - 'recipes/registry.yaml'
+              - 'recipes/overlays/**'
+              - 'recipes/mixins/**'
+              - 'recipes/checks/**'
+              - 'recipes/validators/catalog.yaml'
+              - 'recipes/components/*/*.yaml'
+              - 'recipes/components/*/manifests/**'
+              - 'tools/crd-inventory/**'
+              - 'pkg/allocpolicy/*.go'
+              - 'pkg/chainsaw/*.go'
+              - 'pkg/constraints/expr/*.go'
+              - 'pkg/defaults/*.go'
+              - 'pkg/errors/*.go'
+              - 'pkg/header/*.go'
+              - 'pkg/helm/**'
+              - 'pkg/inventory/*.go'
+              - 'pkg/k8s/client/*.go'
+              - 'pkg/k8s/labels/*.go'
+              - 'pkg/k8s/pod/*.go'
+              - 'pkg/measurement/*.go'
+              - 'pkg/recipe/*.go'
+              - 'pkg/recipe/oskind/*.go'
+              - 'pkg/serializer/*.go'
+              - 'pkg/upgrade/*.go'
+              - 'pkg/version/*.go'
+              - '.settings.yaml'
+              - '.go-version'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/actions/load-versions/**'
+              - '.github/actions/setup-build-tools/**'
+              - '.github/actions/ghcr-login/**'
+              - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            classcol:
+              # TestComponentCatalogClassColumnMatchesRegistry keeps the Class
+              # column of the component catalog equal to the registry. The
+              # `tests` job runs it on any code change (a registry edit is
+              # code), but a docs-only PR editing a Class cell skips `tests`,
+              # so it is gated here on the doc. The test is listed so renaming
+              # it re-runs the check, and this workflow so a change to the job
+              # cannot skip it.
+              - 'docs/user/component-catalog.md'
+              - 'pkg/recipe/component_class_test.go'
+              - '.github/workflows/merge-gate.yaml'
             tuning:
               # Inputs that can change the committed tuning-status table
               # WITHOUT tripping pkg/tuning's TestCompute_Structure — which runs
@@ -229,8 +299,8 @@ jobs:
               # image, whose dependency closure is an installed venv and not
               # part of the Go module graph. It cannot be regenerated here (needs
               # docker + PyPI), so the committed fragment is watched directly,
-              # alongside the requirements.txt whose sha256 the generator
-              # asserts the fragment still records — editing requirements
+              # alongside the requirements and overrides files whose sha256 the
+              # generator asserts the fragment still records — editing either
               # without a refresh must fail this gate rather than ship stale
               # attributions.
               - 'Makefile'
@@ -243,6 +313,7 @@ jobs:
               - 'tools/check-fence-balance'
               - 'tools/generate-python-licenses'
               - 'validators/performance/requirements.txt'
+              - 'validators/performance/requirements-overrides.txt'
               - 'validators/performance/licenses/**'
               # The actions that supply this job's toolchain. install-go-licenses
               # matters most: it exists to pin GOFLAGS, and a build that
@@ -307,6 +378,33 @@ jobs:
               - 'tools/docs-published-files'
               - 'tools/mdx/**'
               - 'Makefile'
+              - '.github/workflows/merge-gate.yaml'
+            operator:
+              # Inputs to make operator-check-generated and make
+              # operator-envtest-floor. The operator-boundary depguard rule
+              # limits what packages in api/operator and tests/operator import
+              # from this module to api/operator, pkg/operator and
+              # tests/operator, so the three trees cover every Go file the
+              # suites build from. The chart is
+              # both the generated CRDs' destination and what the chart suite
+              # installs. Generation reads the controller-gen pin in
+              # .settings.yaml, its wrapper and boilerplate, and the license
+              # header it prepends to each CRD; .settings.yaml also pins the
+              # Kubernetes floor and the tools the job installs.
+              - 'api/operator/**'
+              - 'pkg/operator/**'
+              - 'tests/operator/**'
+              - 'charts/aicr-operator/**'
+              - 'tools/operator-controller-gen'
+              - 'tools/operator-boilerplate.go.txt'
+              - '.github/headers/LICENSE'
+              - '.settings.yaml'
+              - '.go-version'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - '.github/actions/load-versions/**'
+              - '.github/actions/setup-build-tools/**'
               - '.github/workflows/merge-gate.yaml'
 
       # code = true iff at least one changed file is NOT docs/markdown/LICENSE.
@@ -387,11 +485,11 @@ jobs:
         with:
           go-version: ${{ steps.versions.outputs.go }}
           cache: true
-      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4.39.1
         with:
           languages: go
       - run: go build ./...
-      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d  # v4.38.3
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4.39.1
 
   analyze-skip:
     needs: [check-paths]
@@ -759,6 +857,149 @@ jobs:
       - run: echo "No NVCRE wiring inputs changed — wiring guard not required"
 
   # ---------------------------------------------------------------------------
+  # Documented CRD-upgrade command: runs the bash block in
+  # docs/user/component-catalog.md against envtest after a real helm install,
+  # on docs-only PRs that skip the `tests` job (mirrors nvcre-wiring).
+  # ---------------------------------------------------------------------------
+
+  catalog-crd-command:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdcmd == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      # The runner image bundles Helm 3; the test needs the pinned Helm 4 and
+      # fails rather than skips in CI without it or without envtest.
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_setup_envtest: 'true'
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+      - name: Run the documented CRD-upgrade command against an API server
+        # Requires the PASS line for the same reason nvcre-wiring does: a
+        # renamed test makes `go test -run` exit 0 having run nothing.
+        run: |
+          set -uo pipefail
+          assets=$(setup-envtest use --print path) || exit 1
+          out=$(KUBEBUILDER_ASSETS="$assets" go test ./pkg/bundler/deployer/localformat/ -run '^TestCatalogCRDUpgradeCommand$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if ! grep -q "^--- PASS: TestCatalogCRDUpgradeCommand" <<<"$out"; then
+            echo "::error::TestCatalogCRDUpgradeCommand did not execute (renamed or removed?); the catalog CRD command gate would silently pass. Update this job to run it."
+            exit 1
+          fi
+
+  catalog-crd-command-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdcmd != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No catalog CRD command inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # CRD inventory freshness: re-renders every chart a health check asserts a
+  # CRD against and compares the result with the committed crds.yaml files.
+  # It needs helm and network access, so make qualify does not run it.
+  # ---------------------------------------------------------------------------
+
+  crd-inventory:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdinv == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      # Helm reads the Docker credentials this writes, so ghcr.io chart pulls
+      # are authenticated and not rate limited as anonymous.
+      - name: Authenticate to GHCR
+        uses: ./.github/actions/ghcr-login
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      # The runner image bundles Helm 3. The inventories are rendered with the
+      # pinned Helm 4.
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+      - name: Verify the committed CRD inventories match the pinned charts
+        run: make crd-inventory-check
+
+  crd-inventory-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.crdinv != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No CRD inventory inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
+  # Catalog Class column: keeps docs/user/component-catalog.md equal to the
+  # registry's class assignments on docs-only PRs that skip the `tests` job
+  # (mirrors nvcre-wiring).
+  # ---------------------------------------------------------------------------
+
+  catalog-class-column:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.classcol == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - name: Verify the catalog Class column matches the registry
+        # Requires the PASS line for the same reason nvcre-wiring does: a
+        # renamed test makes `go test -run` exit 0 having run nothing.
+        run: |
+          set -uo pipefail
+          out=$(go test ./pkg/recipe/ -run '^TestComponentCatalogClassColumnMatchesRegistry$' -v -count=1 2>&1) && rc=0 || rc=$?
+          echo "$out"
+          if [ "$rc" -ne 0 ]; then
+            exit "$rc"
+          fi
+          if ! grep -q "^--- PASS: TestComponentCatalogClassColumnMatchesRegistry" <<<"$out"; then
+            echo "::error::TestComponentCatalogClassColumnMatchesRegistry did not execute (renamed or removed?); the catalog Class column gate would silently pass. Update this job to run it."
+            exit 1
+          fi
+
+  catalog-class-column-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.classcol != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No catalog Class column inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
   # Tuning-status doc freshness — ensures the committed tuning table in
   # docs/integrator/components/nodewright.md matches the recipe catalog and the
   # nodewright package pins, on PRs touching its inputs (mirrors bom-freshness).
@@ -886,6 +1127,49 @@ jobs:
       - run: echo "No coverage-matrix inputs changed — freshness check not required"
 
   # ---------------------------------------------------------------------------
+  # AICR Operator generated code and Kubernetes floor. An api/operator type
+  # change without `make generate` still builds and can pass `make test`, which
+  # runs the CRD validation and chart suites on the newest envtest release only.
+  # ---------------------------------------------------------------------------
+
+  operator-generated:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.operator == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/load-versions
+        id: versions
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: true
+      - uses: ./.github/actions/setup-build-tools
+        with:
+          install_setup_envtest: 'true'
+          setup_envtest_version: ${{ steps.versions.outputs.setup_envtest }}
+          setup_envtest_sha256: ${{ steps.versions.outputs.setup_envtest_sha256_linux_amd64 }}
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_yq: 'true'
+          yq_version: ${{ steps.versions.outputs.yq }}
+      - name: Generated code is current
+        run: make operator-check-generated
+      - name: CRD validation and chart suites on the Kubernetes floor
+        run: make operator-envtest-floor
+
+  operator-generated-skip:
+    needs: [check-paths]
+    if: needs.check-paths.outputs.operator != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - run: echo "No operator API, chart or generator inputs changed, so the check is not required"
+
+  # ---------------------------------------------------------------------------
   # Aggregate gate — the single required status check
   # ---------------------------------------------------------------------------
 
@@ -913,12 +1197,20 @@ jobs:
       - bom-freshness-skip
       - nvcre-wiring
       - nvcre-wiring-skip
+      - catalog-crd-command
+      - catalog-crd-command-skip
+      - crd-inventory
+      - crd-inventory-skip
+      - catalog-class-column
+      - catalog-class-column-skip
       - tuning-freshness
       - tuning-freshness-skip
       - notices-generator
       - notices-generator-skip
       - coverage-freshness
       - coverage-freshness-skip
+      - operator-generated
+      - operator-generated-skip
     runs-on: ubuntu-24.04
     timeout-minutes: 1
     steps:

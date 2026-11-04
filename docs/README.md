@@ -46,7 +46,7 @@ For pipelines and platforms that call AICR programmatically or host
 | Add or modify recipe metadata | [Recipe Development](integrator/recipe-development.md) |
 | Verify artifacts (SLSA, SBOM, attestations) | [Supply Chain Verification](integrator/supply-chain-verification.md) |
 | Ship custom validators via `--data` | [Validator Extension](integrator/validator-extension.md) |
-| Platform-specific GPU setup | [AKS](integrator/aks-gpu-setup.md), [GKE](integrator/gke-gpu-setup.md), [OKE](integrator/oke-gpu-setup.md), [Nebius B300](integrator/nebius-b300.md), [EKS networking](integrator/eks-dynamo-networking.md), [GKE TCPXO networking](integrator/gke-tcpxo-networking.md), [GKE GB200 networking](integrator/gke-gb200-networking.md), [GKE A4X Max networking](integrator/gke-a4x-max-networking.md), [Talos](integrator/talos-integration.md), [OpenShift](integrator/openshift.md), [RKE2 VR200](integrator/rke2-vr200-setup.md), [k0s H200](integrator/k0s-h200-setup.md) |
+| Platform-specific GPU setup | [AKS](integrator/aks-gpu-setup.md), [GKE](integrator/gke-gpu-setup.md), [OKE](integrator/oke-gpu-setup.md), [CoreWeave H100](integrator/cks-h100-setup.md), [CoreWeave RTX PRO 6000](integrator/cks-rtx-pro-6000-setup.md), [Nebius B300](integrator/nebius-b300.md), [EKS networking](integrator/eks-dynamo-networking.md), [GKE TCPXO networking](integrator/gke-tcpxo-networking.md), [GKE GB200 networking](integrator/gke-gb200-networking.md), [GKE A4X Max networking](integrator/gke-a4x-max-networking.md), [Talos](integrator/talos-integration.md), [OpenShift](integrator/openshift.md), [RKE2 VR200](integrator/rke2-vr200-setup.md), [k0s H200](integrator/k0s-h200-setup.md) |
 
 ### Contributor Guide
 
@@ -94,6 +94,7 @@ Reference for the terms used across the docs site.
 | **Overlay** | A recipe metadata file (`kind: RecipeMetadata`) under `recipes/overlays/` matched by criteria. Composes via single-parent inheritance (`spec.base`). |
 | **Mixin** | A composable fragment (`kind: RecipeMixin`) under `recipes/mixins/` carrying only `constraints` and `componentRefs`, referenced via `spec.mixins`. |
 | **Bundle** | Deployment artifacts emitted by `aicr bundle`: Helm values, manifests, install scripts, checksums. |
+| **Bundle set** | The output of `aicr bundle --split`: one helm bundle directory per registry class (`core`, then `ops`) under a root that holds the full `recipe.yaml`, `split.yaml`, `bundle-info.yaml`, `checksums.txt` and, with `--attest`, the attestation for the whole set (ADR-018). |
 | **Bundler** | The single, registry-driven generator (`pkg/bundler`) that turns each recipe component into bundle inputs (values, manifests) from its `recipes/registry.yaml` entry. There is no per-component bundler code. |
 | **Deployer** | An output adapter that serializes a bundle in a tool-specific format: `helm`, `helmfile`, `argocd`, `argocd-helm`, `flux`, `terraform`, `fleet`. |
 | **Component** | A deployable software package (e.g., GPU Operator, Network Operator). Lives in `recipes/registry.yaml`. |

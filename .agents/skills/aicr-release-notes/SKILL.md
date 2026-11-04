@@ -40,6 +40,11 @@ Do NOT re-derive any of this with separate `git log`, `gh api`, or
 `gh pr list` calls. If `tools/changelog` doesn't surface it, it
 doesn't belong in the summary.
 
+The one exception is the release-notes author, which
+`tools/changelog` cannot supply: the GitHub handle of the person
+running this skill, who publishes the release and is credited last in
+the thanks line. Step 1 resolves it with `gh api user`.
+
 No optional input is needed. Do not ask for or guess the target tag —
 the filename is fixed (see Step 5) and the body never names the new
 tag (GitHub renders the tag in the release header).
@@ -57,7 +62,27 @@ tools/changelog
 # Previous release body for style mirroring (use the tag from
 # tools/changelog's "[MSG] Changes since vX.Y.Z" stderr line)
 gh release view <previous-tag> --json body --jq '.body'
+
+# AICR Operator facts for the operator block (Step 3), once the release
+# pipeline has published the chart. Set VERSION to the tag without the leading
+# v; an empty --version would read the newest chart instead.
+: "${VERSION:?set VERSION to the release tag without the leading v}"
+helm show values oci://ghcr.io/nvidia/charts/aicr-operator --version "${VERSION}" \
+  | yq '{"operator": .operator.image, "registry": .registry.inCluster.image,
+         "aicr": .aicr.version, "aicrImage": .aicr.image}'
+crane digest "ghcr.io/nvidia/charts/aicr-operator:${VERSION}"
+# The qualified profiles only: stop before the "In qualification" table.
+git show "v${VERSION}:docs/operator/support.md" | awk '
+  /^## Qualified profiles$/ { in_section=1; print; next }
+  /^### In qualification$/ || /^## / { if (in_section) exit }
+  in_section'
+
+# Release-notes author, credited last in the thanks line (Step 4)
+gh api user --jq .login
 ```
+
+If `gh api user` fails, ask the user for their GitHub handle. Do not
+derive it from `git config`.
 
 If `tools/changelog` errors ("No release tags found", empty output),
 stop and ask the user how to proceed — do not invent a range.
@@ -105,7 +130,22 @@ order:
 3. **`**Theme Name**` blocks** — each starts with bolded title, em dash
    (` — `, with spaces), then 1–3 sentences OR a bulleted sub-list.
    Use sub-lists when enumerating 3+ concrete items (e.g. recipes added).
-4. **`### Deprecations`** — **required whenever the release deprecates or
+4. **`**AICR Operator (Preview)**` block** — required in every release that
+   ships the operator, inside Highlights after the theme blocks. Built from
+   the Step 1 operator facts, it names:
+   - the chart, `oci://ghcr.io/nvidia/charts/aicr-operator:<VERSION>`, with
+     its digest;
+   - the operator and in-cluster registry image digests the chart defaults
+     to;
+   - the AICR release it runs, phrased "runs AICR vX, the release it was
+     qualified against", with that AICR image digest;
+   - the qualified profiles, taken verbatim from `docs/operator/support.md`
+     at the tag. Write "No profile is qualified yet" while that page says
+     so. Its "In qualification" table lists profiles that are not
+     qualified; leave it out. Never infer a qualification from commits.
+
+   Do not paraphrase the digests; copy them.
+5. **`### Deprecations`** — **required whenever the release deprecates or
    removes anything on the four frozen surfaces** (CLI, REST, Go SDK, bundle
    and artifact schemas); omit the heading entirely when it does not. One
    bullet per item: what is deprecated, the replacement, and the release that
@@ -113,9 +153,10 @@ order:
    [deprecation policy](https://github.com/NVIDIA/aicr/blob/main/RELEASE.md#deprecation-policy).
    Every bullet here must also have an entry in `docs/user/deprecations.md`;
    if it does not, the deprecation is incomplete and the release is not ready.
-5. **Closing credits line** — `***Thanks to*** @user1, @user2, …, and
-   @mchmarny.` Alphabetical (case-insensitive) by handle, with
-   `@mchmarny` moved to the final position preceded by `and `.
+6. **Closing credits line** — `***Thanks to*** @user1, @user2, …, and
+   @<author>.` Alphabetical (case-insensitive) by handle, with the
+   release-notes author last when they are in the list. Step 4 has the
+   full rules.
 
 **Style rules** drawn from prior releases:
 
@@ -155,7 +196,14 @@ Then:
   `dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`,
   `copy-pr-bot`, etc.).
 - Sort alphabetically (case-insensitive).
-- Move `mchmarny` to the final slot preceded by `and `.
+- Move the release-notes author (Step 1) to the end of the list,
+  matching the handle case-insensitively. If the author is not in the
+  extracted list, do not add them; say so in the unresolved questions
+  (Step 5).
+- Join by count: one handle is `@a`, two are `@a and @b`, three or
+  more are `@a, @b, and @c`. If no handle remains, omit the thanks line
+  and say so in the unresolved questions; an empty list usually means
+  `tools/changelog` rendered no `by [@handle]` annotations.
 - Do NOT link the @-mentions in the output — GitHub auto-links them.
 
 ### Step 5 — Write the draft
@@ -174,6 +222,8 @@ the file, not in chat. Typical content:
 - Things to verify before publishing (issue references, feature
   completeness, prior-release framing)
 - Anything the skill chose to omit that the author may want back
+- Thanks-line gaps from Step 4: the release-notes author missing from
+  the contributor list, or no handles at all
 
 Format the section as:
 
@@ -230,7 +280,15 @@ why it matters to a user. Reference commands in backticks. Link issues as
 
 **<Supply Chain or Trust Theme>** — <narrative>
 
-***Thanks to*** @alice, @bob, @carol, and @mchmarny.
+**AICR Operator (Preview)** — The chart
+`oci://ghcr.io/nvidia/charts/aicr-operator:<VERSION>` (`sha256:<chart>`)
+defaults to `ghcr.io/nvidia/aicr-operator@sha256:<operator>` and
+`ghcr.io/nvidia/aicr-registry@sha256:<registry>`, and runs AICR v<X.Y.Z>,
+the release it was qualified against (`ghcr.io/nvidia/aicr@sha256:<aicr>`).
+<Qualified profiles from docs/operator/support.md, e.g. "No profile is
+qualified yet.">
+
+***Thanks to*** @alice, @bob, @carol, and @<author>.
 ```
 
 ## Failure Modes
@@ -248,5 +306,5 @@ why it matters to a user. Reference commands in backticks. Link issues as
 - Does not run `git tag` or push tags
 - Does not create the GitHub release
 - Does not edit `CHANGELOG.md` or any in-repo file
-- Does not re-derive commit ranges, author handles, or commit lists
+- Does not re-derive commit ranges, commit author handles, or commit lists
   outside of `tools/changelog` output

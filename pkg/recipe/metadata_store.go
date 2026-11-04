@@ -1296,8 +1296,11 @@ func (s *MetadataStore) BuildRecipeResultWithEvaluatorAndProfile(
 	if err != nil {
 		return nil, err
 	}
+	_, uncoveredEntries := s.uncoveredDimensionDetails(
+		criteria, s.uncoveredDimensions(criteria, appliedOverlays), excludedOverlays,
+	)
 	if survivalErr := ensureProfileDeclarationSurvived(
-		effectiveProfile, survivingProfile, excludedOverlays, constraintWarnings,
+		effectiveProfile, survivingProfile, excludedOverlays, constraintWarnings, uncoveredEntries,
 	); survivalErr != nil {
 		return nil, survivalErr
 	}
@@ -1752,7 +1755,7 @@ func existingRawOverrideLayers(ctx context.Context, provider DataProvider, ref C
 	var layers []map[string]any
 
 	if ref.ValuesFile != "" {
-		baseValuesFile := fmt.Sprintf("components/%s/values.yaml", ref.Name)
+		baseValuesFile := BaseValuesFile(ref.Name)
 		if ref.ValuesFile != baseValuesFile {
 			baseData, err := provider.ReadFile(ctx, baseValuesFile)
 			switch {

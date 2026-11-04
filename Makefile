@@ -197,7 +197,7 @@ check-docs-mdx-parse: ## Validates docs/ with the real MDX parser (requires Node
 	@./tools/check-docs-mdx-parse
 
 .PHONY: check-docs-yaml
-check-docs-yaml: ## Validates YAML-labelled code blocks throughout docs/ (requires Node; CI-blocking)
+check-docs-yaml: ## Validates YAML-labeled code blocks throughout docs/ (requires Node; CI-blocking)
 	@./tools/check-docs-yaml
 
 .PHONY: check-docs-shell
@@ -241,6 +241,7 @@ LICENSE_IGNORES = \
 	-ignore 'bundles/**' \
 	-ignore 'dist/**' \
 	-ignore '**/testdata/**' \
+	-ignore 'pkg/evidence/cncf/schemas/*.yaml' \
 	-ignore 'recipes/evidence/*.yaml' \
 	-ignore 'recipes/evidence/*/*/*.yaml' \
 	-ignore 'THIRD_PARTY_NOTICES.md' \
@@ -249,6 +250,9 @@ LICENSE_IGNORES = \
 	-ignore 'tools/mdx/node_modules/**' \
 	-ignore '.github/actions/setup-dgxc-goproxy/**'
 
+# pkg/evidence/cncf/schemas/ holds verbatim copies of the upstream CNCF AI
+# Conformance checklists (cncf/k8s-ai-conformance docs/AIConformance-*.yaml),
+# pinned by digest in pkg/evidence/cncf/checklist.go; a header would break the pin.
 # The two recipes/evidence patterns in LICENSE_IGNORES match exactly the
 # generated, header-less pointer shapes MarshalPointer emits — the transient
 # flat <recipe>.yaml pending state and the final <recipe>/<source>/sha256-*.yaml
@@ -266,8 +270,11 @@ license: ## Add/verify license headers in source files
 #### the policy. The only sanctioned exceptions are specific MPL-2.0 packages
 #### whose use has been explicitly approved; each is listed by exact import path
 #### so unrelated MPL-2.0 deps still fail closed for review. The go-cleanhttp /
-#### go-retryablehttp pair, and the HashiCorp Vault client subtree (#1577, the
-#### hashivault:// KMS signing provider), are the approved exceptions.
+#### go-retryablehttp pair, the HashiCorp Vault client subtree (#1577, the
+#### hashivault:// KMS signing provider), and the golang-lru v2 and arc/v2
+#### modules (#3494, the cache CNCF Distribution links into the AICR
+#### Operator's in-cluster registry, cmd/aicr-registry) are the approved
+#### exceptions.
 ####
 #### go-licenses identifies standard library packages by matching their source
 #### path against go/build's GOROOT, which is empty in a binary linked with
@@ -310,6 +317,8 @@ license-check: ## Check license is approved
         --ignore=github.com/hashicorp/go-secure-stdlib/parseutil \
         --ignore=github.com/hashicorp/go-secure-stdlib/strutil \
         --ignore=github.com/hashicorp/go-sockaddr \
+        --ignore=github.com/hashicorp/golang-lru/arc/v2 \
+        --ignore=github.com/hashicorp/golang-lru/v2 \
         --ignore=github.com/hashicorp/hcl \
         --ignore=github.com/in-toto/attestation \
         --ignore=github.com/in-toto/in-toto-golang \
@@ -326,8 +335,8 @@ test-tool-pins: ## Checks go.mod is the only pin for tools built from this modul
 	@GOFLAGS="-mod=readonly" go test -count=1 -run '^TestToolPinsLiveOnlyInGoMod$$' ./tests/architecture/
 
 .PHONY: test-shell
-test-shell: ## Runs shell unit tests (tools/*_test.sh, tests/uat/lib/*_test.sh, tests/uat/kind/*_test.sh; hermetic, no cluster)
-	@set -e; for t in tools/*_test.sh tests/uat/lib/*_test.sh tests/uat/kind/*_test.sh; do [ -e "$$t" ] || continue; echo "Running $$t..."; bash "$$t"; done
+test-shell: ## Runs shell unit tests (tools/*_test.sh, tools/component-test/*_test.sh, tests/uat/lib/*_test.sh, tests/uat/kind/*_test.sh; hermetic, no cluster)
+	@set -e; for t in tools/*_test.sh tools/component-test/*_test.sh tests/uat/lib/*_test.sh tests/uat/kind/*_test.sh; do [ -e "$$t" ] || continue; echo "Running $$t..."; bash "$$t"; done
 
 # validators/ tests run as part of `make test` but are excluded from the
 # coverage.out this target emits: per-package coverage there runs 41-92%
@@ -449,6 +458,36 @@ nvsentinel-health-events-analyzer-e2e: ## Live Kind test: nvsentinel-health-even
 	@set -e; \
 	echo "Running nvsentinel-health-events-analyzer mixin e2e test..."; \
 	tests/e2e/nvsentinel-health-events-analyzer/run.sh
+
+.PHONY: nvsentinel-event-exporter-e2e
+nvsentinel-event-exporter-e2e: ## Live Kind test: nvsentinel-event-exporter delivers filtered CloudEvents with an OIDC token to a mock sink (#2621)
+	@set -e; \
+	echo "Running nvsentinel-event-exporter mixin e2e test..."; \
+	tests/e2e/nvsentinel-event-exporter/run.sh
+
+.PHONY: nvsentinel-log-collector-e2e
+nvsentinel-log-collector-e2e: ## Live Kind test: nvsentinel-log-collector captures a node's diagnostics into the in-cluster file server before remediation (#2619)
+	@set -e; \
+	echo "Running nvsentinel-log-collector mixin e2e test..."; \
+	tests/e2e/nvsentinel-log-collector/run.sh
+
+.PHONY: nvsentinel-node-validation-e2e
+nvsentinel-node-validation-e2e: ## Live Kind test: nvsentinel-node-validation holds a cordoned new GPU node until a ValidationRequest passes (#3088)
+	@set -e; \
+	echo "Running nvsentinel-node-validation mixin e2e test..."; \
+	tests/e2e/nvsentinel-node-validation/run.sh
+
+.PHONY: nvsentinel-post-remediation-validation-e2e
+nvsentinel-post-remediation-validation-e2e: ## Live Kind test: a node drained for a reboot stays cordoned until its post-remediation ValidationRequest passes (#3089)
+	@set -e; \
+	echo "Running nvsentinel post-remediation validation e2e test..."; \
+	tests/e2e/nvsentinel-post-remediation-validation/run.sh
+
+.PHONY: nvsentinel-external-remediation-e2e
+nvsentinel-external-remediation-e2e: ## Live Kind test: nvsentinel-external-remediation hands a declared fault's node to an ExternalRemediationRequest and takes it back (#3091)
+	@set -e; \
+	echo "Running nvsentinel-external-remediation mixin e2e test..."; \
+	tests/e2e/nvsentinel-external-remediation/run.sh
 
 .PHONY: npd-nvsentinel-object-monitor-e2e
 npd-nvsentinel-object-monitor-e2e: ## Live Kind test: an NPD Node condition becomes an NVSentinel health event (#2614)
@@ -697,6 +736,14 @@ nvcre-closure: ## Regenerates the NVCRE workload runtime closure from the regist
 .PHONY: nvcre-closure-check
 nvcre-closure-check: ## Verifies the committed NVCRE workload closure matches the pinned chart version
 	@GOFLAGS="-mod=readonly" go run ./tools/nvcre-closure -check
+
+.PHONY: crd-inventory
+crd-inventory: ## Regenerates recipes/components/*/crds.yaml, the CRDs each pinned chart installs (needs helm and network)
+	@GOFLAGS="-mod=readonly" go run ./tools/crd-inventory -repo-root "$(CURDIR)"
+
+.PHONY: crd-inventory-check
+crd-inventory-check: ## Verifies every committed CRD inventory matches a fresh render of its pinned chart (needs helm and network)
+	@GOFLAGS="-mod=readonly" go run ./tools/crd-inventory -repo-root "$(CURDIR)" -check
 
 .PHONY: registry-inventory
 registry-inventory: ## Extracts the build/CI registry & package egress inventory (YAML + Markdown) from structured sources
@@ -1087,8 +1134,99 @@ clean-all: clean ## Deep cleans including Go module cache
 	@echo "Deep clean completed"
 
 .PHONY: cleanup
-cleanup: ## Cleans up AICR Kubernetes resources (requires kubectl)
-	tools/cleanup
+cleanup: ## Cleans up AICR Kubernetes resources (requires a kubeconfig and helm)
+	GOFLAGS="-mod=readonly" go run ./tools/cleanup
+
+# =============================================================================
+# AICR Operator (ADR-027)
+# =============================================================================
+
+# The operator's pins live under `operator:` in .settings.yaml. Its unit and
+# envtest suites run in `make test`; these targets cover what `make test`
+# cannot: the Kubernetes floor, generated code, and the kind suites, which use
+# only the kind cluster's own kubeconfig, never ~/.kube/config.
+OPERATOR_ENVTEST_K8S_FLOOR ?= $(shell yq -r '.operator.envtest_kubernetes_floor' .settings.yaml 2>/dev/null)
+OPERATOR_E2E_KUBECONFIG    ?= $(CURDIR)/.operator-e2e/kubeconfig
+AICR_E2E_IMAGE             ?= $(shell yq -r '.operator.aicr_image' .settings.yaml 2>/dev/null)
+AICR_E2E_VERSION           ?= $(shell yq -r '.operator.aicr_version' .settings.yaml 2>/dev/null)
+AICR_E2E_VALIDATOR_IMAGES  ?= $(shell yq -r '.operator.aicr_validator_images | [.[]] | join(",")' .settings.yaml 2>/dev/null)
+# A development build. Only operator-candidate stamps release versions, and
+# only the aicr_operator_development tag lets the operator accept development
+# settings. OPERATOR_TAGS= builds without it.
+OPERATOR_VERSION           ?= v0.0.0-dev
+OPERATOR_TAGS              ?= aicr_operator_development
+OPERATOR_LDFLAGS           := -s -w \
+	-X github.com/NVIDIA/aicr/pkg/operator/version.Version=$(OPERATOR_VERSION) \
+	-X github.com/NVIDIA/aicr/pkg/operator/version.Commit=$(COMMIT)
+
+.PHONY: operator-build
+operator-build: ## Builds the operator (development opt-in) and the kubectl-aicr plugin into dist/
+	@GOFLAGS="-mod=readonly" CGO_ENABLED=0 go build -trimpath -tags "$(OPERATOR_TAGS)" -ldflags "$(OPERATOR_LDFLAGS)" -o dist/aicr-operator ./cmd/aicr-operator
+	@GOFLAGS="-mod=readonly" CGO_ENABLED=0 go build -trimpath -ldflags "$(OPERATOR_LDFLAGS)" -o dist/kubectl-aicr ./cmd/kubectl-aicr
+	@echo "Built dist/aicr-operator and dist/kubectl-aicr ($(OPERATOR_VERSION))"
+
+.PHONY: operator-check-generated
+operator-check-generated: generate ## Fails if the operator's generated deep copies or CRDs are stale
+	@git diff --exit-code -- api/operator charts/aicr-operator/files/crds >/dev/null || \
+		(echo "Generated code is stale. Run 'make generate' and commit the result." && git diff --stat -- api/operator charts/aicr-operator/files/crds && exit 1)
+	@test -z "$$(git status --porcelain --untracked-files=all -- ':(glob)api/operator/**/zz_generated.*' charts/aicr-operator/files/crds)" || \
+		(echo "Untracked generated files:" && git status --porcelain --untracked-files=all -- ':(glob)api/operator/**/zz_generated.*' charts/aicr-operator/files/crds && exit 1)
+	@echo "Generated code is current"
+
+# CRD rules and admission policies are evaluated by the API server, so they
+# run again on the oldest supported Kubernetes.
+.PHONY: operator-envtest-floor
+operator-envtest-floor: ## Runs the operator's CRD validation and chart suites on the Kubernetes floor
+	@set -e; \
+	test -n "$(OPERATOR_ENVTEST_K8S_FLOOR)" || { echo "no operator.envtest_kubernetes_floor in .settings.yaml (is yq installed?)"; exit 1; }; \
+	echo "Running CRD validation and chart tests on Kubernetes $(OPERATOR_ENVTEST_K8S_FLOOR)..."; \
+	assets=$$(setup-envtest use $(OPERATOR_ENVTEST_K8S_FLOOR) -p path); \
+	test -n "$$assets" || { echo "setup-envtest returned no assets for $(OPERATOR_ENVTEST_K8S_FLOOR)"; exit 1; }; \
+	KUBECONFIG=$(CURDIR)/.no-kubeconfig KUBERNETES_SERVICE_HOST= KUBERNETES_SERVICE_PORT= \
+	KUBEBUILDER_ASSETS="$$assets" \
+	GOFLAGS="-mod=readonly" go test -count=1 -timeout=$(TEST_TIMEOUT) ./api/operator/... ./tests/operator/chart/...
+
+.PHONY: operator-kind-up
+operator-kind-up: ## Creates the operator's kind cluster with the e2e suite's registry
+	@./tools/operator-kind up
+
+.PHONY: operator-kind-up-floor
+operator-kind-up-floor: ## Creates the operator's kind cluster on the Kubernetes floor
+	@./tools/operator-kind up floor
+
+.PHONY: operator-kind-down
+operator-kind-down: ## Deletes the operator's kind cluster
+	@./tools/operator-kind down
+
+.PHONY: operator-candidate
+operator-candidate: ## Builds an operator candidate into dist/candidate (CANDIDATE_VERSION=v0.1.0-rc.1)
+	@./tools/operator-candidate build
+
+.PHONY: operator-candidate-verify
+operator-candidate-verify: ## Builds the operator candidate twice and requires identical bytes
+	@./tools/operator-candidate verify
+
+.PHONY: operator-e2e
+operator-e2e: ## Runs the pinned AICR images as operator-built Jobs on the operator's kind cluster
+	@AICR_OPERATOR_E2E_KUBECONFIG=$(OPERATOR_E2E_KUBECONFIG) \
+	AICR_OPERATOR_E2E_REGISTRY_AUTH=$(CURDIR)/.operator-e2e/registry-auth.json \
+	AICR_OPERATOR_E2E_IMAGE=$(AICR_E2E_IMAGE) \
+	AICR_OPERATOR_E2E_AICR_VERSION=$(AICR_E2E_VERSION) \
+	AICR_OPERATOR_E2E_VALIDATOR_IMAGES=$(AICR_E2E_VALIDATOR_IMAGES) \
+	GOFLAGS="-mod=readonly" go test -count=1 -v -timeout=30m ./tests/operator/e2e/...
+
+.PHONY: operator-skeleton
+operator-skeleton: ## Runs the operator with the pinned Argo CD on its kind cluster, one release end to end
+	@./tools/operator-skeleton
+
+.PHONY: operator-qualify
+operator-qualify: ## Runs the operator's fault-injection suite against dist/candidate, upgrading to dist/candidate-next
+	@./tools/operator-qualify
+
+.PHONY: operator-qualify-published
+operator-qualify-published: ## Installs the newest published operator release and runs the lifecycle scenarios upgrading to dist/candidate
+	@./tools/operator-qualify pull-published
+	@AICR_OPERATOR_QUALIFY_LIFECYCLE_ONLY=1 QUALIFY_TIMEOUT=45m CANDIDATE_DIR="$${PUBLISHED_DIR:-dist/published}" CANDIDATE_NEXT_DIR=dist/candidate ./tools/operator-qualify
 
 # =============================================================================
 # Tilt Local Development

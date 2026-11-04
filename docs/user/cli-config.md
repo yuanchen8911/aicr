@@ -81,7 +81,9 @@ default. Several booleans are tri-state for the same reason: absent means
 "inherit the CLI default", an explicit `false` is an opt-out
 (`spec.validate.execution.failOnError`, `failFast`,
 `spec.snapshot.execution.privileged`, `spec.recipe.criteriaStrict`,
-`spec.validate.evidence.*`).
+`spec.validate.evidence.*`). `spec.recipe.requireEvidence` is tri-state too,
+but an explicit `false` does not turn off `AICR_REQUIRE_EVIDENCE` when that
+variable is already on.
 
 **Secrets are never part of the schema.** The cosign OIDC identity token used
 by attestation and evidence push is deliberately absent — supply it via the
@@ -115,7 +117,7 @@ spec:
         - dedicated=gpu-workload:NoSchedule
       requireGpu: false
       runtimeClassName: ""           # mutually exclusive with requireGpu
-      os: ""                         # ubuntu | rhel | cos | amazonlinux | ol | talos | sles
+      os: ""                         # ubuntu | rhel | cos | amazonlinux | ol | talos | sles | rocky
       requests: ""                   # "cpu=500m,memory=1Gi"
       limits: ""
     execution:
@@ -148,12 +150,13 @@ spec:
       format: yaml                   # yaml | json | table
     data: ""                         # optional data-overlay dir/archive
     criteriaStrict: false            # reject criteria outside the embedded catalog
+    requireEvidence: false           # reject a resolved recipe with no committed pointer
 
   bundle:
     input:
       recipe: recipe.yaml            # must match recipe.output.path when both set
     output:
-      target: ./bundles              # local dir or oci:// URI
+      target: ./bundles              # local dir, oci:// URI, or oci-layout:<dir>[:tag]
       imageRefs: ""                  # external digest file; OCI output only
     deployment:
       deployer: helmfile             # helm | helmfile | argocd | argocd-helm | flux | terraform | fleet
@@ -162,6 +165,17 @@ spec:
       dynamic: []
       vendorCharts: false
       appName: ""                    # argocd parent Application name override
+      # argocd:                      # argocd / argocd-helm only (rejected with helmfile above); omitted key = unset
+      #   namePrefix: tenant-a-      # child Application name prefix
+      #   destinationServer: https://prod.example.com:6443  # child destination; default in-cluster
+      #   project: gpu-infra         # child project; default "default"
+      #   cascadeDelete: true        # finalizer on parent and children
+      #   syncRetry:                 # spec.syncPolicy.retry on every child
+      #     limit: 20                # required when backoff is set; 0 disables retries
+      #     backoff:                 # omitted fields keep Argo CD's defaults
+      #       duration: 30s
+      #       factor: 2
+      #       maxDuration: 5m       # must not be less than duration
     scheduling:
       systemNodeSelector: {}
       systemNodeTolerations: []
@@ -273,6 +287,7 @@ exclusive** — query by criteria or derive from a snapshot, not both.
 | `output.format` | string | `yaml` \| `json` \| `table` |
 | `data` | string | Data-overlay directory/archive (same as `--data`) |
 | `criteriaStrict` | bool (tri-state) | Reject criteria values outside the embedded catalog; mirrors `--criteria-strict` / `AICR_CRITERIA_STRICT` (any of the three enables it) |
+| `requireEvidence` | bool (tri-state) | Reject a resolved recipe with no committed evidence pointer; mirrors `--require-evidence` / `AICR_REQUIRE_EVIDENCE` (any of the three enables it). A false value does not turn off an environment value that is already on. A resolve that uses `data` or `--data` fails, even when the leaf overlay stays embedded. Applies to `aicr recipe` and `aicr query` |
 
 ### spec.bundle
 
@@ -281,13 +296,14 @@ Inputs to `aicr bundle`.
 | Field | Type | Notes |
 |-------|------|-------|
 | `input.recipe` | string | Recipe to bundle |
-| `output.target` | string | Local directory or `oci://` URI |
+| `output.target` | string | Local directory, `oci://` URI, or `oci-layout:<dir>[:tag]` OCI image layout (see [OCI Layout Output](cli-reference.md#oci-layout-output)) |
 | `output.imageRefs` | string | Optional external image-reference output file for an OCI `output.target` only. Local output is rejected. Its parent must be an existing real directory, and the target must be outside and not aliased to the planned or completed bundle. The target, including that it can be written, is checked before the bundle is generated. |
 | `deployment.deployer` | string | Deployer choice (same values as `--deployer`) |
 | `deployment.repo` | string | GitOps repo for repo-shaped deployers |
-| `deployment.set` / `.dynamic` | []string | Value overrides, `key:path=value` |
+| `deployment.set` / `.dynamic` | []string | Value overrides, `key:path=value`. The `deployer:<key>` spelling is deprecated in favor of `deployment.argocd`; see [Deprecations](deprecations.md#argo-cd-options-as-deployer-value-overrides) |
 | `deployment.vendorCharts` | bool | Vendor charts into the bundle |
 | `deployment.appName` | string | Argo CD parent `Application` name override (multi-bundle installs sharing a namespace) |
+| `deployment.argocd` | object | Argo CD bundle settings for `argocd` and `argocd-helm`: `namePrefix`, `destinationServer`, `project`, `cascadeDelete`, and `syncRetry` (`limit`, `backoff.duration`, `backoff.factor`, `backoff.maxDuration`). Each mirrors an `--argocd-*` flag, which overrides it field by field. Setting a field that a `deployer:<key>` entry in `deployment.set` also sets is rejected. See [Argo CD Deployer Options](cli-reference.md#argo-cd-deployer-options) |
 | `scheduling.*` | object | `systemNodeSelector`/`Tolerations`, `acceleratedNodeSelector`/`Tolerations`, `draEvictionNodeLabel`, `workloadGate`, `workloadSelector`, `nodes`, `storageClass`, `sharedStorageClass`. Selectors are YAML maps; tolerations use the CLI's `key=value:effect` strings. `draEvictionNodeLabel` accepts one `key=value` label and has no default: setting it opts in to DRA eviction coordination, which AICR applies only when DRA and GPU Operator are both enabled. |
 | `attestation.enabled` | bool | Enable bundle attestation (signing); keyless OIDC by default, KMS-backed when `signingKey` is set |
 | `attestation.certificateIdentityRegexp` | string | Expected signer identity |

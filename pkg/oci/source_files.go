@@ -1544,6 +1544,54 @@ func (l *ownedLayout) release() (string, error) {
 	return l.path, nil
 }
 
+// releaseAs renames the layout to name in its parent and releases it. It
+// fails with ErrCodeConflict when name exists and removes the layout on any
+// failure. Where the filesystem supports RENAME_NOREPLACE (Linux), the rename
+// itself refuses an existing name; elsewhere a directory created at name
+// between the check and the rename can still be replaced.
+func (l *ownedLayout) releaseAs(name string) (string, error) {
+	l.finishOnce.Do(func() {
+		l.finishErr = l.finishReleaseAs(name)
+		if l.finishErr != nil {
+			l.finishErr = apperrors.PropagateOrWrap(l.finishErr, apperrors.ErrCodeInternal,
+				"failed to finalize OCI layout")
+		}
+	})
+	if l.finishErr != nil {
+		return "", l.finishErr
+	}
+	return l.path, nil
+}
+
+func (l *ownedLayout) finishReleaseAs(name string) error {
+	if err := l.validate(); err != nil {
+		return l.finishRemove(err)
+	}
+	target := filepath.Join(l.parentPath, name)
+	if err := renameNoReplace(l.parent, l.childName, name); err != nil {
+		if stderrors.Is(err, fs.ErrExist) {
+			return l.finishRemove(apperrors.New(apperrors.ErrCodeConflict,
+				"OCI layout target already exists: "+target))
+		}
+		return l.finishRemove(apperrors.Wrap(apperrors.ErrCodeInternal,
+			"failed to move OCI layout to "+target, err))
+	}
+	l.childName = name
+	l.path = target
+	return l.finishRelease()
+}
+
+// renameCheckThenMove is the two-step fallback for platforms or filesystems
+// without a no-replace rename: it refuses an existing newName, then renames.
+func renameCheckThenMove(root *os.Root, oldName, newName string) error {
+	if _, err := root.Lstat(newName); err == nil {
+		return fs.ErrExist
+	} else if !stderrors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return root.Rename(oldName, newName)
+}
+
 func (l *ownedLayout) finish(release bool) {
 	l.finishOnce.Do(func() {
 		if release {

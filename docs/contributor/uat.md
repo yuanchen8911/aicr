@@ -126,21 +126,21 @@ The `faultinject` step runs after `verify` on every cloud lane. It writes a synt
 |---|---|---|
 | 1. Detection | `SysLogsXIDError=True` appears on the node | always |
 | 2. Quarantine | the node is cordoned | `nvsentinel-quarantine` or `nvsentinel-remediation` |
-| 3. Recovery | the node's boot ID changes, then the node is uncordoned | `nvsentinel-remediation` |
+| 3. Recovery | the node's boot ID changes, then the node is uncordoned by a passing post-reboot DCGM diagnostic (`k8saas.nvidia.com/uncordon-reason=ValidationSucceeded` and a `Succeeded` ValidationRequest that `fault-quarantine` created) | `nvsentinel-remediation` |
 
 A stage that does not apply is recorded as `skipped` in `faultinject-result.json`, not failed. The gates are read from `bundle/recipe.yaml`, the recipe the bundle deployed. No shipped recipe composes either mixin, so nightly cells run Stage 1 only.
 
-**Running Stages 2 and 3.** Dispatch with `nvsentinel_remediation=quarantine` or `remediation`. `phase_prep` then composes the matching mixin onto the cell's leaf overlay through a `--data` overlay of the same name, and fails if the re-resolved recipe does not deploy that step. `remediation` also composes `nvsentinel-health-events-analyzer`, which `aicr bundle` requires beside live remediation:
+**Running Stages 2 and 3.** Dispatch with `nvsentinel_remediation=quarantine` or `remediation`. `phase_prep` then composes the matching mixin onto the cell's leaf overlay through a `--data` overlay of the same name, and fails if the re-resolved recipe does not deploy that step. `remediation` also composes `nvsentinel-health-events-analyzer` and `nvsentinel-node-validation`, which `aicr bundle` requires beside live remediation:
 
 ```bash
-# Stages 1-3 on AWS H100 training: cordon, janitor reboot, uncordon
+# Stages 1-3 on AWS H100 training: cordon, janitor reboot, DCGM diagnostic, uncordon
 gh workflow run uat-run.yaml --repo NVIDIA/aicr --ref main \
   -f reservation=aws-h100-ct-2 -f intent=training -f nvsentinel_remediation=remediation
 ```
 
 **Where it is accepted.** `uat-run.yaml`'s `resolve` job refuses the input before anything is provisioned unless every bound below holds. `tests/uat/lib/platform-gate_test.sh` covers each one.
 
-- **`intent=training`.** The `faultinject` step grows to 15 minutes with quarantine and 30 with remediation, and only the training budget has room. A serving workload left on the node would also hold `node-drainer`, so janitor would never reboot it.
+- **`intent=training`.** The `faultinject` step grows to 15 minutes with quarantine and 55 with remediation, which waits for the post-reboot diagnostic, and only the training budget has room. A serving workload left on the node would also hold `node-drainer` for up to its `deleteAfterTimeoutMinutes` (set by the remediation step mixins), past the budget, so janitor would not reboot it in time.
 - **`lifecycle=nightly`.** Quarantine leaves the node cordoned with the fault set, because a syslog fault clears only on a reboot. A held daytime cluster would keep that node out of service.
 - **`deployer=helmfile`.** The Argo CD budget has no room either.
 - **Built from source (`aicr_version` empty).** The leaf overlay is read from the checkout, so it must match the binary.
@@ -159,7 +159,7 @@ gh workflow run uat-run.yaml --repo NVIDIA/aicr --ref main \
 gh workflow run uat-kind-sim.yaml --repo NVIDIA/aicr --ref main
 ```
 
-It is dispatched directly, **not** through `uat-run.yaml`: it holds no lease and consumes no GPU capacity, because simulated devices need no hardware. It stands its cluster up through `tests/uat/kind/bootstrap-cluster.sh`, the same committed script a local reproduction calls, so the CI cluster and the local one cannot drift apart; `tests/uat/kind/bootstrap-cluster_test.sh` fails if a second copy of `kind create cluster` appears in a workflow or under `tests/uat/`. The phases come from the shared `tests/uat/lib/phases.sh` through the `tests/uat/kind/run-sim` shim, which differs from `tests/uat/kind/run` only in what the cluster is: the GPU-node census is enforced (four labelled workers) instead of skipped. No CUJ phase runs, because a Slurm recipe has none.
+It is dispatched directly, **not** through `uat-run.yaml`: it holds no lease and consumes no GPU capacity, because simulated devices need no hardware. It stands its cluster up through `tests/uat/kind/bootstrap-cluster.sh`, the same committed script a local reproduction calls, so the CI cluster and the local one cannot drift apart; `tests/uat/kind/bootstrap-cluster_test.sh` fails if a workflow or a script under `tests/uat/` runs a `kind create cluster` whose `--name` or `--config` names the Slurm cluster (`aicr-uat-slurm`) or its `slurm-cluster-config.yaml`, directly or through a variable or `${{ env.VAR }}` the same file assigns; a workflow expression there that the file cannot resolve counts as the Slurm cluster, and so does a variable assigned one. Lanes that create a cluster of their own topology and name, such as the GPU-free gpu-operator lane in `.github/workflows/gpu-operator-mokka-test.yaml`, are not copies of this one and are not flagged. The phases come from the shared `tests/uat/lib/phases.sh` through the `tests/uat/kind/run-sim` shim, which differs from `tests/uat/kind/run` only in what the cluster is: the GPU-node census is enforced (four labelled workers) instead of skipped. No CUJ phase runs, because a Slurm recipe has none.
 
 **It gates NVSentinel's GPU health monitors.** The host engine is what the simulated devices add for NVSentinel: its labeler stamps `dcgm.version` only on nodes with a Ready DCGM pod, and the GPU health monitor DaemonSets select on that label. The lane's `gpu_health` step runs `tests/uat/kind/verify-gpu-health-monitors.sh` after the topology check, and fails unless the monitor is Ready on all four workers and has connected to the host engine; conformance runs only when it passes. It is a lane step rather than a recipe health check because `recipes/checks/nvsentinel` omits the monitor DaemonSets, which legitimately sit at zero pods on any lane with no host engine. Both images are large, and `bootstrap-cluster.sh` pulls both in a local run as in CI. The host engine is a 1.9GB pull from nvcr.io, with up to 900s (`DCGM_ROLLOUT_TIMEOUT` in `tests/uat/kind/setup-gpu-sim.sh`) to roll out. The monitor image adds another 2.5GB, pre-pulled on every worker under `MONITOR_PREPULL_TIMEOUT` (1200s). Bootstrap pulls the monitor image because the labeler stamps the label as soon as it starts, so otherwise the pull would land inside nvsentinel's 600s `helm --wait` during install.
 
@@ -369,6 +369,8 @@ Reservations are data, not code. To onboard a new reserved pool, add a row to `i
   cluster-config-path: tests/uat/aws/cluster-config-b200.yaml
   test-config-dir: tests/uat/aws/tests
 ```
+
+The row's `reservation-id` must equal every reservation its `cluster-config-path` targets, meaning each worker's `capacity.reservation.target` on AWS and each `nodeConfig.capacityReservations` entry on GCP. A row without a `reservation-id` must point at a cluster-config that targets none. The lease is keyed on the row's `name`, and provisioning and the AWS capacity check read the reservation from the cluster-config, so nothing at run time reads `reservation-id`. Swapping a reservation means editing both files. `TestCommittedClusterConfigsMatchRegistry` in `pkg/uatbroker` fails the PR when they disagree.
 
 No broker, workflow, or Go change is needed — the nightly batch enumerates rows from the registry, and `uat-run.yaml` resolves them. The unit of sequencing is the *reservation*, so a new GPU type in an existing cloud simply runs in parallel with the others on its own lease. (Provisioning is per *cloud*: the same `uat-aws.yaml` pipeline provisions any AWS accelerator from the row's `cluster-config-path`; you do not add a per-accelerator workflow.)
 

@@ -471,6 +471,31 @@ For the deployer matrix (Argo CD and Flux, OCI and Git source lanes), see [Deplo
 
 See [kwok/README.md](kwok/README.md) for adding recipes, profiles, and troubleshooting.
 
+## AICR Operator
+
+The opt-in AICR Operator ([ADR-027](docs/design/027-aicr-operator.md)) lives in `cmd/aicr-operator`, `cmd/kubectl-aicr`, `api/operator`, `pkg/operator`, `charts/aicr-operator` and `tests/operator`. It runs AICR only as a pinned image: the `operator-boundary` depguard rule in `.golangci.yaml` rejects any import of another AICR package. Its pins live under `operator:` in `.settings.yaml`, and its user documentation is in [docs/operator](docs/operator/index.md).
+
+Its unit and envtest suites run in `make test`. The targets below cover the rest; the kind suites need Docker, kind, Helm, yq and envsubst.
+
+| Command | Description |
+|---------|-------------|
+| `make operator-build` | Build `dist/aicr-operator` and `dist/kubectl-aicr` (development version, with the `aicr_operator_development` tag) |
+| `make generate` | Regenerate deep copies and CRDs after an API type change |
+| `make operator-check-generated` | Fail when generated code or CRDs are stale |
+| `make operator-envtest-floor` | CRD validation and chart suites on the Kubernetes floor |
+| `make operator-kind-up` / `operator-kind-up-floor` | Create the two-node `aicr-operator` kind cluster with an in-cluster registry |
+| `make operator-kind-down` | Delete it |
+| `make operator-e2e` | Run the pinned AICR images as operator-built Jobs |
+| `make operator-skeleton` | Run the operator with the pinned Argo CD, one release end to end |
+| `CANDIDATE_VERSION=<version> make operator-candidate` | Build a release candidate of the current commit into `dist/candidate` (clean tree required) |
+| `make operator-candidate-verify` | Build the candidate twice and require identical bytes |
+| `make operator-qualify` | Fault-injection suite against `dist/candidate`, upgraded to `dist/candidate-next` |
+| `make operator-qualify-published` | Lifecycle scenarios from the newest published release (attestations verified), upgraded to `dist/candidate` |
+
+The operator accepts development settings (`development.bypassApprovals`, `development.skipDiscovery`) only when built with the `aicr_operator_development` build tag and without a release version. A plain `go build` or `ko build` refuses them. `ko` adds the tag when `AICR_OPERATOR_DEVELOPMENT=true`, which `make operator-skeleton` sets.
+
+The merge gate runs `make operator-check-generated` and `make operator-envtest-floor` on every push to `main`, and on pull requests that change `api/operator`, `pkg/operator`, `tests/operator`, `charts/aicr-operator`, the generator, the Go module or `.settings.yaml`. CI runs each kind suite on its own cluster. Locally, recreate the cluster between suites (`make operator-kind-down operator-kind-up`), or set `OPERATOR_ADOPT=1` to install over another suite's objects. Set `OPERATOR_E2E_REQUIRED=1` to make a suite fail, not skip, when no cluster is reachable. `make operator-qualify` needs both candidates, built as `.github/workflows/operator-e2e.yaml` builds them. `make operator-qualify-published` needs only `dist/candidate`, plus `gh` signed in to verify the published release's attestations. It picks the newest published, non-prerelease release; set `PUBLISHED_VERSION` to pin one (for example `PUBLISHED_VERSION=1.2.0`), or `PUBLISHED_BELOW` to stay older than a version, as the release does with its own tag; `PUBLISHED_DIR` (default `dist/published`) receives it. It sets `AICR_OPERATOR_QUALIFY_LIFECYCLE_ONLY=1`, which skips the qualify suite's fault scenarios: they test the installed release against this commit's code.
+
 ## Make Targets Reference
 
 ### Quality & Testing
@@ -594,7 +619,7 @@ running `make cleanup` (`tools/cleanup`) can leave the `nvidia_uvm` kernel
 module wedged mid-unload on GPU nodes. The symptom appears on the *next*
 install: the driver validation init container crashes
 (`Init:CrashLoopBackOff`, logs show `failed to create device node
-nvidia-uvm`). The cleanup script detects driver-managed mode (via the
+nvidia-uvm`). The cleanup tool detects driver-managed mode (via the
 `nvidia-driver-daemonset` or `driver.enabled` in the release values) and
 prints this guidance; the fix is to reboot the GPU nodes before reinstalling:
 
@@ -619,7 +644,7 @@ the Helm uninstall in its namespace, the CRD group match, and the namespace
 deletion. Fence it out of all three phases:
 
 ```bash
-tools/cleanup --exclude-ns skyhook --exclude-crd skyhook.nvidia.com,nodewright.nvidia.com
+go run ./tools/cleanup --exclude-ns skyhook --exclude-crd skyhook.nvidia.com,nodewright.nvidia.com
 ```
 
 Both flags are repeatable and accept comma-separated values. `--exclude-ns`
@@ -630,9 +655,98 @@ protects CRDs whose name contains the given match from deletion. It is applied
 with `--dry-run` first to confirm what will and will not be removed.
 
 Phase 3 only deletes CRDs whose API group exactly matches a group AICR
-components install (`AICR_CRD_GROUPS` in `tools/cleanup`). An unrelated
+components install (`aicrCRDGroups` in `tools/cleanup/cleaner.go`). An unrelated
 `*.nvidia.com` group, such as a third-party harness, is never matched and needs
 no `--exclude-crd`.
+
+Some namespaces are kept without any flag:
+
+- A namespace holding a Helm release AICR does not own (see below). Phase 1
+  skips that release, and phase 4 keeps its namespace so the release can still
+  be removed with `helm uninstall`.
+- A namespace holding an AICR release that Flux's helm-controller manages.
+  Phase 1 skips it, because helm-controller reinstalls a release removed
+  behind its back. Delete the `HelmRelease` in the Flux namespace
+  (`flux-system` by default) instead, which uninstalls it.
+- `openshift-nfd` and `cert-manager-operator`, unless phase 1 finds an AICR
+  release in them that is not in `uninstalled` status. On OpenShift the
+  platform team often installs these operators through OperatorHub. The list
+  is `sharedNamespaces` in `tools/cleanup/namespaces.go`.
+- Every phase 4 namespace, when helm is not installed or `helm list` fails. Without the
+  release list, cleanup cannot tell which namespaces hold releases it would
+  orphan.
+
+`--keep-namespaces` keeps `aicr-validation` too, but still deletes what
+`aicr validate` left there: the validator Jobs and ConfigMaps, and the snapshot
+agent's Job, ServiceAccount, Role and RoleBinding. The snapshot agent's
+staging ConfigMap (`aicr-agent-snapshot-<runID>`) is left in place.
+
+### How Cleanup Decides Which Releases AICR Owns
+
+Phase 1 uninstalls a Helm release only when AICR owns it. Without `--bundle`,
+a release is owned when any of these recognizes it:
+
+- The installed-component inventory (`pkg/inventory`), read once per naming
+  scheme. Helm, helmfile, Terraform and Fleet releases carry the component
+  name. Flux releases are named `<targetNamespace>-<component>` and are
+  recognized but left to helm-controller. Argo CD Applications are not Helm
+  releases, so cleanup only warns that Argo CD re-syncs what it removes.
+  Delete the Applications or their parent Application first.
+- The AICR stamp (`aicr.run/generated-by`) on a Helm release, for
+  releases no component name matches, such as an injected manifest folder.
+- The registry's release names, plus the few retired components in
+  `legacyComponents` (`tools/cleanup/helm.go`), which predate the stamp. This
+  is also the fallback when an inventory read fails.
+
+### Limiting Cleanup to One Bundle
+
+```bash
+go run ./tools/cleanup --bundle ./bundles --dry-run
+```
+
+`--bundle` reads the release index in the bundle's `bundle-info.yaml`
+(`layout.releases`). Phase 1 uninstalls only those releases, matched by name
+and namespace. Phase 4 deletes only the namespaces those releases install
+into, so namespaces no bundle names, such as `gang-scheduling-test`, are left
+alone. A directory with no `bundle-info.yaml` is an error, so pass the root
+of a `--split` bundle set, not one of its class directories. For a bundle
+that predates the index, omit `--bundle`. An Argo CD bundle installs Applications, not
+Helm releases, so phase 1 uninstalls nothing and cleanup warns to delete the
+Applications first. `--bundle` does not limit phase 3, which still deletes
+CRDs in AICR's API groups cluster-wide, and with them every custom resource
+of those kinds. On a cluster shared with another tenant, add `--keep-crds`.
+
+### Workloads That Outlive Their Operator
+
+A user workload can hold objects of an AICR CRD in a namespace AICR does not
+own, for example a `DynamoGraphDeployment` or Grove `PodClique` in a serving
+namespace. Phase 1 uninstalls the operator that serves the CRD's conversion
+webhook and removes its finalizers, so deleting the CRD in phase 3 would hang:
+
+- the instances keep finalizers nothing will remove, so the CRD stays
+  `Terminating` and the next install of that operator fails on it;
+- every list of the kind fails on the dead webhook, so an AICR namespace that
+  phase 4 deletes stays `Terminating` with `NamespaceDeletionContentFailure`,
+  even when it is empty.
+
+Phase 3 therefore sets a webhook-converted CRD's conversion strategy to `None`
+before deleting it. After a short wait, for each CRD still `Terminating`, it
+clears the finalizers of the instances its deletion has already marked, except
+in `--exclude-ns` namespaces. Those objects are already being deleted with the
+CRD.
+
+`--keep-crds` changes neither, since a kept CRD must keep its webhook for the
+reinstalled operator. Instead, cleanup warns about each kept CRD whose webhook
+Service is gone: deleting any namespace hangs until its operator is
+reinstalled. Reinstall the operator before deleting namespaces, or run with
+`--keep-namespaces` as well.
+
+Cleanup ends by checking once more for CRDs and namespaces it deleted that are
+still `Terminating`. It names each one, with the namespace's deletion-failure
+condition, and finishes with "AICR cleanup finished with resources still
+terminating" instead of "AICR cleanup complete". A namespace whose delete was
+refused, for example by RBAC or admission, is reported as not deleted rather
+than as `Terminating`. Its exit status stays 0.
 
 ### Debugging Tests
 

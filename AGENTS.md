@@ -132,6 +132,7 @@ workspace paths. Use local file paths only when explicitly requested.
 | `pkg/k8s/pod` | Shared K8s Job/Pod utilities (wait, logs, ConfigMap URIs) | Yes |
 | `validators/helper` | Shared validator helpers (PodLifecycle, GPU/resource utilities) | Yes |
 | `pkg/defaults` | Centralized timeout and configuration constants | Yes |
+| `pkg/operator` | Opt-in AICR Operator (ADR-027): runs AICR only as a pinned image and imports no other AICR package (`operator-boundary` depguard rule), so `pkg/errors` and `pkg/defaults` do not apply | Yes |
 
 **Critical Architecture Principle:**
 - `pkg/cli` and `pkg/server` = user interaction only, no business logic
@@ -248,8 +249,8 @@ slog.Error("operation failed", "error", err, "component", "gpu-collector")
 
 | Task | Location | Key Points |
 |------|----------|------------|
-| New Helm component | `recipes/registry.yaml` | Add entry with name, displayName, helm settings, nodeScheduling |
-| New Kustomize component | `recipes/registry.yaml` | Add entry with name, displayName, kustomize settings |
+| New Helm component | `recipes/registry.yaml` | Add entry with name, displayName, class, helm settings, nodeScheduling; add its row to `docs/user/component-catalog.md` |
+| New Kustomize component | `recipes/registry.yaml` | Add entry with name, displayName, class, kustomize settings; add its row to `docs/user/component-catalog.md` |
 | Component values | `recipes/components/<name>/` | Create values.yaml with Helm chart configuration |
 | New collector | `pkg/collector/<type>/` | Implement `Collector` interface, add to factory |
 | New API endpoint | `pkg/server/` | Handler (thin adapter over `pkg/client/v1`) + middleware chain + OpenAPI spec update |
@@ -261,6 +262,7 @@ slog.Error("operation failed", "error", err, "component", "gpu-collector")
 # recipes/registry.yaml
 - name: my-operator
   displayName: My Operator
+  class: ops  # core or ops (ADR-018); required for every embedded entry
   valueOverrideKeys: [myoperator]
   helm:
     defaultRepository: https://charts.example.com
@@ -276,6 +278,7 @@ slog.Error("operation failed", "error", err, "component", "gpu-collector")
 # recipes/registry.yaml
 - name: my-kustomize-app
   displayName: My Kustomize App
+  class: ops  # core or ops (ADR-018); required for every embedded entry
   valueOverrideKeys: [mykustomize]
   kustomize:
     defaultSource: https://github.com/example/my-app
@@ -285,6 +288,8 @@ slog.Error("operation failed", "error", err, "component", "gpu-collector")
 
 **Note:** A component must have either `helm` OR `kustomize` configuration, not both.
 
+**Note:** Every embedded registry entry declares `class` (`core` or `ops`, ADR-018) and has a row with that class in `docs/user/component-catalog.md`; `TestEmbeddedRegistryDeclaresClass` and `TestComponentCatalogClassColumnMatchesRegistry` fail `make qualify` otherwise. `core` is what a plain GPU pod needs to run, with its fabric and install prerequisites; `ops` is everything else, workload platforms included.
+
 **Note:** A Helm chart that renders no container images (a CRD-only chart) also needs an entry in `expectedNoImages` in `tools/bom/main.go`, or `make bom-docs` and the scheduled BOM refresh fail. No PR-time check renders charts, so run `make bom-docs` to catch it.
 
 **After any change to `recipes/registry.yaml`, a component's values file, or a chart version pin (in registry, overlay, or mixin):** run `make bom-docs` and commit the regenerated `docs/user/container-images.md` in the same PR. The BOM is rendered fresh from each Helm chart's actual templates, so an unbumped pin can still pick up upstream image drift — running it locally is the only reliable way to know whether the doc needs an update. The BOM's **version column and component set are gated**: `TestCommittedBOMVersionsMatchRegistry` (run by `make test` → `make qualify`, and by the `bom-freshness` merge-gate job on docs-only PRs) fails CI when a pinned version or the component set drifts from the registry, so a version change that forgets `make bom-docs` is caught. Not gated at PR time is *rendered-image drift* — an unbumped pin picking up a new image inside a chart's templates; `make bom-check` (a full re-render comparison) is its **opt-in** blocking check and is not wired into `make qualify`, `make lint`, or the merge gate, while the scheduled BOM-refresh workflow (`.github/workflows/bom-refresh.yaml`) auto-detects that drift weekly and opens a PR. So still run `make bom-docs` on any chart-touching change.
@@ -292,6 +297,8 @@ slog.Error("operation failed", "error", err, "component", "gpu-collector")
 **After any chart version pin bump (`defaultVersion` / `defaultTag`, in registry, overlay, or mixin):** the component's ADR-021 transition record must describe the boundary you just crossed. Records live at `recipes/components/<name>/upgrades.yaml`, referenced from the registry entry's `upgrades.file`. Two rules govern reach: a **`safe`** record's `to` ceiling may not reach past the current pin (only `safe` vouches, so only `safe` is held to what AICR ships — `manual` and `blocked` may describe a boundary above the pin, which is how upgrade guidance lands *before* the bump it describes), and the `from` domains may not leave a hole below the pin (so no operator version matches nothing). The second is what makes the obligation self-renewing: a bump leaving a hole below the new pin fails whatever any ceiling says. A coverage gate backs this: a component's record must cover every pin it has reached, a pin no record covers may not move (compared per source, so adding or dropping an overlay override counts), and a record may not disappear while its component remains. A record written ahead of its bump covers nothing until the pin reaches it, and a component that predates records needs one the first time its pin moves. `make lint` and every pull request run `check-upgrade-records`, which compares against the merge base with `upstream/main` if that remote exists, else `origin/main` (override with `AICR_UPGRADE_BASE_REF`).
 
 Author `safe` only with a `verifiedBy` naming a UAT lane, KWOK run, or upstream release note; `manual` and `blocked` need at least one step for every one of the seven deployers. A wrong `safe` is worse than no record, because it converts uncertainty into false confidence; when you do not know, leave it unwritten and let it report `unknown`. `summary` is not a changelog or release note: it names what breaks and by what mechanism, tightly, because it is read beside the steps at the moment someone decides whether to upgrade. Put upstream migration guides, release notes, and the component's own docs in `references` instead. Never add a Go test asserting a verdict for a real component: verdicts are validated empirically by KWOK and UAT, and pinning them in the unit suite turns "keep tests green" into pressure to weaken records. Full authoring guide: `docs/contributor/upgrade-records.md`.
+
+**After a pin bump (in registry, overlay, or mixin) or a values change of a component whose health check asserts a CRD, or after adding or removing a CRD assertion:** run `make crd-inventory` and commit the regenerated `recipes/components/<name>/crds.yaml` files, deletions included. The tool renders each pinned chart with `--include-crds` and the values of each recipe that asserts against it, and reports every asserted CRD the render for the asserting recipe does not install. `TestHealthCheckCRDAssertionsAnchored` fails `make test` when an inventory has no entry for a pin that a registry or leaf recipe health check is checked against, or a check asserts a CRD missing from both the list that entry gives the asserting recipe and the component's vendored manifests. See "CRD assertions" in `docs/contributor/validator.md`.
 
 **Using mixins for shared OS/platform content:**
 ```yaml

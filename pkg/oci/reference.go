@@ -17,6 +17,7 @@ package oci
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"path"
 	"strings"
@@ -34,6 +35,10 @@ const URIScheme = "oci://"
 
 // uriScheme is the unexported alias retained for legacy in-package use.
 const uriScheme = URIScheme
+
+// LayoutScheme prefixes an output target that writes an OCI image layout
+// directory instead of pushing to a registry ("oci-layout:<dir>[:tag]").
+const LayoutScheme = "oci-layout:"
 
 // EnsureScheme returns ref with the oci:// prefix added when missing.
 // Used by callers that accept user input in either form.
@@ -58,11 +63,15 @@ func TrimScheme(ref string) string {
 	return strings.TrimPrefix(ref, URIScheme)
 }
 
-// Reference represents a parsed output target, which can be either an OCI registry
-// reference or a local directory path.
+// Reference represents a parsed output target: an OCI registry reference, an
+// OCI image layout directory, or a local directory path.
 type Reference struct {
-	// IsOCI indicates whether this is an OCI registry reference (true) or local path (false).
+	// IsOCI indicates an OCI registry reference; it is false for a local
+	// directory and for an OCI image layout target.
 	IsOCI bool
+	// IsLayout indicates an OCI image layout target. LocalPath is the layout
+	// directory and Tag its tag; IsOCI is false.
+	IsLayout bool
 	// Registry is the OCI registry host (e.g., "ghcr.io", "localhost:5000").
 	// Only populated when IsOCI is true.
 	Registry string
@@ -71,7 +80,7 @@ type Reference struct {
 	Repository string
 	// Tag is the image tag (e.g., "v1.0.0").
 	// Empty string means no tag was specified; caller should apply a default.
-	// Only populated when IsOCI is true.
+	// Only populated when IsOCI or IsLayout is true.
 	Tag string
 	// LocalPath is the local directory path for non-OCI output.
 	// Only populated when IsOCI is false.
@@ -82,9 +91,14 @@ type Reference struct {
 // For OCI URIs (oci://registry/repository:tag), it extracts the components.
 // For plain paths, it treats them as local directories.
 //
+// For oci-layout:<dir>[:tag], it returns a layout reference.
+//
 // If no tag is specified in an OCI URI, Tag will be empty; the caller is responsible
 // for applying a default (e.g., CLI version).
 func ParseOutputTarget(target string) (*Reference, error) {
+	if strings.HasPrefix(target, LayoutScheme) {
+		return parseLayoutTarget(strings.TrimPrefix(target, LayoutScheme))
+	}
 	if !strings.HasPrefix(target, uriScheme) {
 		return &Reference{
 			IsOCI:     false,
@@ -121,10 +135,54 @@ func ParseOutputTarget(target string) (*Reference, error) {
 	}, nil
 }
 
+// parseLayoutTarget parses "<dir>[:tag]". As with oras --oci-layout, the
+// text after the last colon is the tag only when it is a valid tag with no
+// path separator; otherwise the whole value is the directory.
+func parseLayoutTarget(value string) (*Reference, error) {
+	dir, tag := value, ""
+	if i := strings.LastIndex(value, ":"); i >= 0 {
+		candidate := value[i+1:]
+		if !strings.ContainsAny(candidate, `/\`) && validateDistributionTag(candidate) == nil {
+			dir, tag = value[:i], candidate
+		}
+	}
+	if dir == "" {
+		return nil, apperrors.New(apperrors.ErrCodeInvalidRequest,
+			"OCI layout target requires a directory: "+LayoutScheme+"<dir>[:tag]")
+	}
+	trimmed := strings.TrimRight(dir, `/\`)
+	if err := checkLayoutDirName(trimmed[strings.LastIndexAny(trimmed, `/\`)+1:]); err != nil {
+		return nil, err
+	}
+	return &Reference{IsLayout: true, LocalPath: dir, Tag: tag}, nil
+}
+
+// checkLayoutDirName rejects a layout directory name containing ':' or '@'.
+// Either one means the value most likely held a tag that failed to parse or a
+// digest, which the oras-style split would otherwise keep in the directory
+// name and write with the default tag.
+func checkLayoutDirName(name string) error {
+	if !strings.ContainsAny(name, ":@") {
+		return nil
+	}
+	return apperrors.New(apperrors.ErrCodeInvalidRequest,
+		fmt.Sprintf("OCI layout directory name %q must not contain ':' or '@': in %s<dir>[:tag], "+
+			"the text after the last ':' must be a valid OCI tag "+
+			"(up to 128 of [A-Za-z0-9_.-], not starting with '.' or '-'), "+
+			"and a digest (@sha256:...) is not accepted for a write target", name, LayoutScheme))
+}
+
 // String returns the full reference string.
 // For OCI references: "oci://registry/repository:tag" (or without tag if empty).
+// For layout references: "oci-layout:dir:tag" (or without tag if empty).
 // For local paths: the local path.
 func (r *Reference) String() string {
+	if r.IsLayout {
+		if r.Tag == "" {
+			return LayoutScheme + r.LocalPath
+		}
+		return LayoutScheme + r.LocalPath + ":" + r.Tag
+	}
 	if !r.IsOCI {
 		return r.LocalPath
 	}
@@ -179,8 +237,11 @@ func (r *Reference) ParentNamespace() string {
 }
 
 // WithTag returns a copy of the reference with the specified tag.
-// For non-OCI references, returns the same reference unchanged.
+// For local directory references, returns the same reference unchanged.
 func (r *Reference) WithTag(tag string) *Reference {
+	if r.IsLayout {
+		return &Reference{IsLayout: true, LocalPath: r.LocalPath, Tag: tag}
+	}
 	if !r.IsOCI {
 		return r
 	}
@@ -216,6 +277,20 @@ type OutputConfig struct {
 	Annotations map[string]string
 }
 
+// manifestAnnotations returns cfg.Annotations, or the default AICR
+// annotations when it is nil.
+func (cfg OutputConfig) manifestAnnotations() map[string]string {
+	if cfg.Annotations != nil {
+		return cfg.Annotations
+	}
+	return map[string]string{
+		"org.opencontainers.image.version": cfg.Version,
+		"org.opencontainers.image.vendor":  "NVIDIA",
+		"org.opencontainers.image.title":   "AICR Bundle",
+		"org.opencontainers.image.source":  "https://github.com/NVIDIA/aicr",
+	}
+}
+
 // PackageAndPushResult contains the result of a successful package and push operation.
 type PackageAndPushResult struct {
 	// Digest is the SHA256 digest of the pushed artifact.
@@ -229,6 +304,10 @@ type PackageAndPushResult struct {
 	Reference string
 	// StorePath is the path to the local OCI Image Layout directory.
 	StorePath string
+	// StoreInfo identifies the directory at StorePath as WriteLayout or
+	// WriteHelmChartLayout published it, so a caller can tell it from one
+	// put there afterward. It is nil for other operations.
+	StoreInfo fs.FileInfo
 }
 
 // PackageAndPush packages a directory as an OCI artifact and pushes it to a registry.
@@ -275,16 +354,7 @@ func packageAndPushWithDependencies(
 		"tag", cfg.Reference.Tag,
 	)
 
-	// Build annotations
-	annotations := cfg.Annotations
-	if annotations == nil {
-		annotations = map[string]string{
-			"org.opencontainers.image.version": cfg.Version,
-			"org.opencontainers.image.vendor":  "NVIDIA",
-			"org.opencontainers.image.title":   "AICR Bundle",
-			"org.opencontainers.image.source":  "https://github.com/NVIDIA/aicr",
-		}
-	}
+	annotations := cfg.manifestAnnotations()
 
 	// Package locally first. Package returns properly coded errors
 	// (ErrCodeInvalidRequest, ErrCodeInternal, ErrCodeUnavailable); preserve

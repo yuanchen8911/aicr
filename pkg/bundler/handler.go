@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -44,6 +45,14 @@ const (
 	bundleQueryAcceleratedNodeSelector   = "accelerated-node-selector"
 	bundleQueryAcceleratedNodeToleration = "accelerated-node-toleration"
 	bundleQueryAppName                   = "app-name"
+	bundleQueryArgoCDCascadeDelete       = "argocd-cascade-delete"
+	bundleQueryArgoCDDestinationServer   = "argocd-destination-server"
+	bundleQueryArgoCDNamePrefix          = "argocd-name-prefix"
+	bundleQueryArgoCDProject             = "argocd-project"
+	bundleQueryArgoCDSyncRetryLimit      = "argocd-sync-retry-limit"
+	bundleQueryArgoCDBackoffDuration     = "argocd-sync-retry-backoff-duration"
+	bundleQueryArgoCDBackoffFactor       = "argocd-sync-retry-backoff-factor"
+	bundleQueryArgoCDBackoffMaxDuration  = "argocd-sync-retry-backoff-max-duration"
 	bundleQueryBundlers                  = "bundlers"
 	bundleQueryDeployer                  = "deployer"
 	bundleQueryDRAEvictionNodeLabel      = "dra-eviction-node-label"
@@ -52,6 +61,7 @@ const (
 	bundleQueryRepo                      = "repo"
 	bundleQuerySerial                    = "serial"
 	bundleQuerySet                       = "set"
+	bundleQuerySplit                     = "split"
 	bundleQuerySystemNodeSelector        = "system-node-selector"
 	bundleQuerySystemNodeToleration      = "system-node-toleration"
 	bundleQueryVendorCharts              = "vendor-charts"
@@ -65,6 +75,14 @@ var supportedBundleQueryParameters = map[string]struct{}{
 	bundleQueryAcceleratedNodeSelector:   {},
 	bundleQueryAcceleratedNodeToleration: {},
 	bundleQueryAppName:                   {},
+	bundleQueryArgoCDCascadeDelete:       {},
+	bundleQueryArgoCDDestinationServer:   {},
+	bundleQueryArgoCDNamePrefix:          {},
+	bundleQueryArgoCDProject:             {},
+	bundleQueryArgoCDSyncRetryLimit:      {},
+	bundleQueryArgoCDBackoffDuration:     {},
+	bundleQueryArgoCDBackoffFactor:       {},
+	bundleQueryArgoCDBackoffMaxDuration:  {},
 	bundleQueryBundlers:                  {},
 	bundleQueryDeployer:                  {},
 	bundleQueryDRAEvictionNodeLabel:      {},
@@ -73,6 +91,7 @@ var supportedBundleQueryParameters = map[string]struct{}{
 	bundleQueryRepo:                      {},
 	bundleQuerySerial:                    {},
 	bundleQuerySet:                       {},
+	bundleQuerySplit:                     {},
 	bundleQuerySystemNodeSelector:        {},
 	bundleQuerySystemNodeToleration:      {},
 	bundleQueryVendorCharts:              {},
@@ -99,6 +118,9 @@ func ParseBundleConfig(r *http.Request) (*config.Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if params.argoCD, err = parseArgoCDQueryParams(r.URL.Query(), params.deployer); err != nil {
+		return nil, err
+	}
 	return bundleConfigFromParams(params), nil
 }
 
@@ -120,7 +142,9 @@ func bundleConfigFromParams(params *bundleParams) *config.Config {
 		config.WithRepoURL(params.repoURL),
 		config.WithVendorCharts(params.vendorCharts),
 		config.WithSerial(params.serial),
+		config.WithSplit(params.split),
 		config.WithAppName(params.appName),
+		config.WithArgoCDSettings(params.argoCD),
 		config.WithBundlers(params.bundlers),
 	)
 }
@@ -336,7 +360,9 @@ type bundleParams struct {
 	repoURL                    string
 	vendorCharts               bool
 	serial                     bool
+	split                      bool
 	appName                    string
+	argoCD                     config.ArgoCDSettings
 	bundlers                   []string
 }
 
@@ -433,24 +459,26 @@ func parseQueryParams(r *http.Request) (*bundleParams, error) {
 	}
 
 	// Parse vendor-charts (opt-in air-gap vendoring)
-	if v := query.Get(bundleQueryVendorCharts); v != "" {
-		b, parseErr := strconv.ParseBool(v)
-		if parseErr != nil {
-			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
-				"vendor-charts must be a boolean (true/false)", parseErr)
-		}
-		params.vendorCharts = b
+	if v, set, parseErr := parseBoolQuery(query, bundleQueryVendorCharts); parseErr != nil {
+		return nil, parseErr
+	} else if set {
+		params.vendorCharts = v
 	}
 
 	// Parse serial (deploy components one at a time instead of parallelizing
 	// independent ones; the API counterpart of the --serial CLI flag).
-	if v := query.Get(bundleQuerySerial); v != "" {
-		b, parseErr := strconv.ParseBool(v)
-		if parseErr != nil {
-			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
-				"serial must be a boolean (true/false)", parseErr)
-		}
-		params.serial = b
+	if v, set, parseErr := parseBoolQuery(query, bundleQuerySerial); parseErr != nil {
+		return nil, parseErr
+	} else if set {
+		params.serial = v
+	}
+
+	// Parse split (class-partitioned bundle set, ADR-018; the API counterpart
+	// of the --split CLI flag).
+	if v, set, parseErr := parseBoolQuery(query, bundleQuerySplit); parseErr != nil {
+		return nil, parseErr
+	} else if set {
+		params.split = v
 	}
 
 	// Parse app-name (parent Argo Application name for argocd / argocd-helm;
@@ -496,4 +524,82 @@ func parseQueryParams(r *http.Request) (*bundleParams, error) {
 	}
 
 	return params, nil
+}
+
+// parseBoolQuery reads the named boolean query parameter. set is false when
+// the parameter is absent; a value that is not a boolean is
+// ErrCodeInvalidRequest.
+func parseBoolQuery(query url.Values, name string) (value, set bool, err error) {
+	v := query.Get(name)
+	if v == "" {
+		return false, false, nil
+	}
+	b, parseErr := strconv.ParseBool(v)
+	if parseErr != nil {
+		return false, false, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest,
+			name+" must be a boolean (true/false)", parseErr)
+	}
+	return b, true, nil
+}
+
+// parseArgoCDQueryParams parses the argocd-* query parameters, the REST
+// counterpart of the --argocd-* CLI flags. An absent parameter stays nil.
+// Rejected on other deployers, like app-name, so a typo on a helm request
+// fails loudly. Value validation happens at bundle time, together with any
+// deprecated set=deployer:<key> entries.
+func parseArgoCDQueryParams(query url.Values, deployer config.DeployerType) (config.ArgoCDSettings, error) {
+	var s config.ArgoCDSettings
+	names := []string{
+		bundleQueryArgoCDCascadeDelete, bundleQueryArgoCDDestinationServer,
+		bundleQueryArgoCDNamePrefix, bundleQueryArgoCDProject,
+		bundleQueryArgoCDSyncRetryLimit, bundleQueryArgoCDBackoffDuration,
+		bundleQueryArgoCDBackoffFactor, bundleQueryArgoCDBackoffMaxDuration,
+	}
+	if deployer != config.DeployerArgoCD && deployer != config.DeployerArgoCDHelm {
+		for _, name := range names {
+			if query.Has(name) {
+				return s, aicrerrors.New(aicrerrors.ErrCodeInvalidRequest,
+					name+" is only valid with deployer=argocd or deployer=argocd-helm")
+			}
+		}
+		return s, nil
+	}
+
+	str := func(name string) *string {
+		if !query.Has(name) {
+			return nil
+		}
+		v := query.Get(name)
+		return &v
+	}
+	i64 := func(name string) (*int64, error) {
+		if !query.Has(name) {
+			return nil, nil //nolint:nilnil // absent parameter: unset, not an error
+		}
+		v, err := strconv.ParseInt(query.Get(name), 10, 64)
+		if err != nil {
+			return nil, aicrerrors.Wrap(aicrerrors.ErrCodeInvalidRequest, name+" must be an integer", err)
+		}
+		return &v, nil
+	}
+
+	s.NamePrefix = str(bundleQueryArgoCDNamePrefix)
+	s.DestinationServer = str(bundleQueryArgoCDDestinationServer)
+	s.Project = str(bundleQueryArgoCDProject)
+	cascade, cascadeSet, err := parseBoolQuery(query, bundleQueryArgoCDCascadeDelete)
+	if err != nil {
+		return s, err
+	}
+	if cascadeSet {
+		s.CascadeDelete = &cascade
+	}
+	if s.SyncRetryLimit, err = i64(bundleQueryArgoCDSyncRetryLimit); err != nil {
+		return s, err
+	}
+	if s.SyncRetryBackoffFactor, err = i64(bundleQueryArgoCDBackoffFactor); err != nil {
+		return s, err
+	}
+	s.SyncRetryBackoffDuration = str(bundleQueryArgoCDBackoffDuration)
+	s.SyncRetryBackoffMaxDuration = str(bundleQueryArgoCDBackoffMaxDuration)
+	return s, nil
 }

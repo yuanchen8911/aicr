@@ -120,8 +120,8 @@ spec:
   packages:
     nvidia-tuned:
       image: ghcr.io/nvidia/nodewright-packages/nvidia-tuned
-      version: "0.10.0"
-      containerSHA: sha256:124f3bdedbb651125cec1bf20d3e2f7fcbbe10588c44f36d8e5680b38b9ef8f6
+      version: "0.11.0"
+      containerSHA: sha256:38e56b645a6e3234904e813c81b80dd79db3ba87721609eb6b6f452672b8a40a
       # nvidia-gb300-performance carries a [bootloader] section (iommu.passthrough,
       # hugepages, numa_balancing, earlycon), which takes effect only on reboot.
       interrupt:

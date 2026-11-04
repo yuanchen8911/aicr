@@ -122,6 +122,9 @@ type ApplicationData struct {
 	// See #1628.
 	CascadeDelete bool
 
+	// SyncRetry renders spec.syncPolicy.retry; nil omits it. See #3264.
+	SyncRetry *bundlercfg.SyncRetry
+
 	// ApplyOutOfSyncOnly adds ApplyOutOfSyncOnly=true to spec.syncPolicy.syncOptions.
 	// Set only for the -readiness folder's Application: paired with the Job-level
 	// Replace=true,Force=true annotation (see gatemanifest.jobMetadataAnnotations),
@@ -172,6 +175,31 @@ const DefaultProject = "default"
 // pass DNS-1123 validation but fail at sync with Helm's
 // "release name exceeds max length of 53" error.
 const HelmReleaseNameMaxLen = 53
+
+// ValidateChildAppNames rejects a prefix that composes any release into a
+// child Application name that is not a valid DNS-1123 subdomain, exceeds
+// HelmReleaseNameMaxLen, or equals parent (a child with the parent's name
+// would overwrite the parent Application CR). The cap applies to every child,
+// Helm-rendered or not, to keep one invariant. Deployers call it before
+// writing any output, so a rejected bundle leaves nothing behind.
+func ValidateChildAppNames(prefix, parent string, releases []string) error {
+	for _, release := range releases {
+		name := prefix + release
+		if err := bundlercfg.ValidateAppName(name); err != nil {
+			return errors.Wrap(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("Argo CD name prefix produces invalid child Application name %q", name), err)
+		}
+		if len(name) > HelmReleaseNameMaxLen {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("Argo CD name prefix produces child Application name %q (%d chars); child Application names are capped at %d characters because Argo CD derives the Helm release name from the Application name for Helm-rendered children", name, len(name), HelmReleaseNameMaxLen))
+		}
+		if name == parent {
+			return errors.New(errors.ErrCodeInvalidRequest,
+				fmt.Sprintf("child Application name %q collides with the parent Application name; choose a different --app-name or --argocd-name-prefix", name))
+		}
+	}
+	return nil
+}
 
 // ResourcesFinalizer is Argo CD's cascading-deletion finalizer. When
 // CascadeDelete is set it is added to the parent and every child
@@ -323,6 +351,12 @@ type Generator struct {
 	// CascadeDelete adds ResourcesFinalizer to the parent and every child
 	// Application. Baked at bundle time. See #1628.
 	CascadeDelete bool
+
+	// SyncRetry sets spec.syncPolicy.retry on every child Application,
+	// including the pre/post-manifest and readiness folders; the parent is
+	// unchanged. Nil leaves retry out, so Argo CD applies its auto-sync
+	// default. Baked at bundle time. See #3264.
+	SyncRetry *bundlercfg.SyncRetry
 
 	// InlineUpstreamValues replaces the multi-source $values pattern for
 	// KindUpstreamHelm Applications with a single source whose helm.valuesObject
@@ -495,6 +529,9 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 	if err := bundlercfg.ValidateProject(g.Project); err != nil {
 		return nil, err
 	}
+	if err := g.SyncRetry.Validate(); err != nil {
+		return nil, err
+	}
 
 	// Reject DynamicValues at the library boundary unless the caller
 	// explicitly opts in. The strip-pass below removes cluster-values.yaml
@@ -512,12 +549,6 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 						name, len(paths)))
 			}
 		}
-	}
-
-	// Create output directory
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return nil, errors.Wrap(errors.ErrCodeInternal,
-			"failed to create output directory", err)
 	}
 
 	repoURL, targetRevision := resolveRepoSettings(g)
@@ -541,6 +572,26 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 			return nil, errors.New(errors.ErrCodeInvalidRequest,
 				fmt.Sprintf("invalid component name %q: must not contain path separators or parent directory references", comp.Name))
 		}
+	}
+
+	// Child names compose from the releases localformat will emit, so plan
+	// them and validate before anything touches outputDir.
+	releases, planErr := localformat.ReleaseNames(ctx, localformat.Options{
+		Components:             g.toLocalformatComponents(components, nil),
+		ComponentPreManifests:  g.ComponentPreManifests,
+		ComponentPostManifests: g.ComponentPostManifests,
+		ComponentReadiness:     g.ComponentReadiness,
+	})
+	if planErr != nil {
+		return nil, planErr
+	}
+	if nameErr := ValidateChildAppNames(g.NamePrefix, g.appName(), releases); nameErr != nil {
+		return nil, nameErr
+	}
+
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return nil, errors.Wrap(errors.ErrCodeInternal,
+			"failed to create output directory", err)
 	}
 
 	// Delegate per-component folder writing to localformat.Write. localformat
@@ -658,29 +709,10 @@ func (g *Generator) Generate(ctx context.Context, outputDir string) (*deployer.O
 			return nil, err
 		}
 		appData.Name = g.NamePrefix + appData.Name
-		if err := bundlercfg.ValidateAppName(appData.Name); err != nil {
-			return nil, errors.Wrap(errors.ErrCodeInvalidRequest,
-				fmt.Sprintf("deployer namePrefix produces invalid child Application name %q", appData.Name), err)
-		}
-		// Argo CD derives the Helm release name from the Application name
-		// for Helm-rendered children, so a composed name over Helm's cap
-		// passes DNS-1123 validation but fails at sync time. The cap is
-		// applied uniformly to ALL children (including non-Helm ones) to
-		// keep a single invariant rather than branching on folder kind.
-		// Reject at bundle time instead.
-		if len(appData.Name) > HelmReleaseNameMaxLen {
-			return nil, errors.New(errors.ErrCodeInvalidRequest,
-				fmt.Sprintf("deployer namePrefix produces child Application name %q (%d chars); child Application names are capped at %d characters because Argo CD derives the Helm release name from the Application name for Helm-rendered children", appData.Name, len(appData.Name), HelmReleaseNameMaxLen))
-		}
-		// A child that composes to the parent's name would overwrite the
-		// parent Application CR in the argocd namespace.
-		if appData.Name == appName {
-			return nil, errors.New(errors.ErrCodeInvalidRequest,
-				fmt.Sprintf("child Application name %q collides with the parent Application name; choose a different --app-name or deployer namePrefix", appData.Name))
-		}
 		appData.DestinationServer = g.destinationServer()
 		appData.Project = g.project()
 		appData.CascadeDelete = g.CascadeDelete
+		appData.SyncRetry = g.SyncRetry
 		appDataList = append(appDataList, appData)
 
 		folderDir, joinErr := deployer.SafeJoin(outputDir, f.Dir)
@@ -851,19 +883,11 @@ func waveForFolder(f localformat.Folder, level int) int {
 	case f.Parent + "-post":
 		return base + 2
 	default:
-		if isReadinessFolder(f) {
+		if f.IsReadiness() {
 			return base + 3
 		}
 		return base + 1 // primary: Name == Parent
 	}
-}
-
-// isReadinessFolder reports whether f is the injected -readiness folder for
-// its parent component. Shared by waveForFolder (sync-wave banding) and
-// buildApplicationData (ApplyOutOfSyncOnly scoping) so the two can't
-// silently diverge on what counts as a readiness folder. See #2367.
-func isReadinessFolder(f localformat.Folder) bool {
-	return f.Name == f.Parent+"-readiness"
 }
 
 // buildApplicationData constructs ApplicationData for a single folder. The
@@ -886,7 +910,7 @@ func buildApplicationData(comp recipe.ComponentRef, f localformat.Folder, syncWa
 		RepoURL:            repoURL,
 		TargetRevision:     targetRevision,
 		BundleDir:          f.Dir,
-		ApplyOutOfSyncOnly: isReadinessFolder(f),
+		ApplyOutOfSyncOnly: f.IsReadiness(),
 	}
 	switch f.Kind {
 	case localformat.KindLocalHelm:

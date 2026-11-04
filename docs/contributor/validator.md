@@ -79,8 +79,15 @@ minimal redaction policy blanks every `message`. A bundle carrying WHICH check
 was withheld but not WHY would be the same "reads as complete" defect the flag's
 guards exist to prevent. The CNCF evidence renderer does
 NOT: `pkg/evidence/cncf/renderer.go` drops every skipped entry before grouping
-(pinned by `TestRenderSkippedExcluded`), so a withheld requirement would leave
-no file and no index entry. `validateFlagCombinations` refuses `--skip-check`
+(pinned by `TestRenderSkippedExcluded`), so a withheld requirement gets no page
+and, when another submission-required check produced an entry so an index is
+written at all, appears there only as `NOT TESTED (not run)`, with no reason
+recorded. The requirement set it groups into is the upstream
+checklist for the selected version (`pkg/evidence/cncf/checklist.go`, embedded
+verbatim under `schemas/` and digest-pinned); `requirements.go` maps each
+conformance check to the requirement it evidences, and
+`TestEveryMustHasExpectedChecks` fails when a supported version carries a MUST
+no check covers. `validateFlagCombinations` refuses `--skip-check`
 together with `--evidence-dir` for that reason, rather than emitting a
 submission that reads as complete, and `Client.RenderCNCFEvidence` refuses a
 report carrying a `SkipCheckReasonCode` skip. `preflightSkipChecks` runs beside `preflightDeclaredChecks`, on the
@@ -131,21 +138,25 @@ parse errors as `ErrCodeInvalidRequest`, fail-closed.
 **One name bypasses the scalar flow entirely:** the node-set form
 `NodeTopology.gpu-nodes.label` ([#1755](https://github.com/NVIDIA/aicr/issues/1755))
 is dispatched by exact name in `constraints.Evaluate` *before*
-`ParseConstraintPath`, uses its own value grammar
-(`<label-key>=<value>` / `!<label-key>`, validated with the Kubernetes
-label validators), and quantifies the predicate over the GPU-node set
-synthesized from `NodeTopology.label` readings instead of comparing a
-single reading. The label that defines the GPU-node universe is
+`ParseConstraintPath`, takes a Kubernetes label selector as its value
+(parsed by `labels.Parse`), and requires every node in the GPU-node set
+synthesized from `NodeTopology.label` readings to match it, instead of
+comparing a single reading. The label that defines the GPU-node universe is
 **service-specific** — GKE's `cloud.google.com/gke-accelerator` today
 ([#2359](https://github.com/NVIDIA/aicr/issues/2359)) — resolved from
 the snapshot's `k8s.node.provider` via `fingerprint.FromMeasurements`.
 Adding a new service means adding one entry to
 `gpuNodeUniverseLabels` in `pkg/constraints/gpu_nodes.go` and covering
 it in `gpu_nodes_test.go`; the label MUST be present on GPU nodes from
-pool creation, before the GPU Operator or NFD run (the constraint form
-is pre-deployment). See `pkg/constraints/gpu_nodes.go` for its
-fail-closed rules (truncation, empty universe, malformed or ambiguous
-encodings, unknown service, service with no declared universe label).
+pool creation, before the GPU Operator or NFD run, so recipe generation
+can evaluate the form.
+
+The readiness pre-flight calls `constraints.EvaluateReadiness`. On a
+service with no entry, or none resolvable (bare metal, `--data`
+services), it identifies GPU nodes by `nvidia.com/gpu.present=true`,
+where generation fails closed. See `pkg/constraints/gpu_nodes.go` for
+the fail-closed rules (truncation, empty universe, malformed or
+ambiguous encodings, and an unknown or unmapped service at generation).
 
 **Adding a new operator:**
 
@@ -459,12 +470,12 @@ fails its key's shape (an IP under `nodesTotal`, `305.44` under
 
 | Value shape | Keys |
 |-------------|------|
-| non-negative integer count | `nodesValidated`, `nodesTotal`, `workerNodes`, `gpusInvolved`, `draReady`, `draDesired`, `nodewrightComplete`, `nodewrightExpected`, `namespacesActive`, `namespacesExpected`, `gpusBenchmarked`, `gpusPerNode` |
+| non-negative integer count | `nodesValidated`, `nodesTotal`, `nodesFailed`, `nodesSkipped`, `workerNodes`, `gpusInvolved`, `draReady`, `draDesired`, `nodewrightComplete`, `nodewrightExpected`, `namespacesActive`, `namespacesExpected`, `gpusBenchmarked`, `gpusPerNode` |
 | non-negative decimal, at most one fractional digit | `achievedGbps`, `thresholdGbps`, `tolerancePct`, `throughputTokPerSec`, `ttftP99Ms`, `throughputThreshold`, `ttftThresholdMs`, `scaledThreshold` |
 | signed decimal (`+1.8`, `-12.3`) | `passMargin` (percent above or below `thresholdGbps`) |
 | `true` or `false` | `nodeLocal`, `versionSatisfied` |
 | `v` plus one to three numeric parts, optional `-alpha`, `-beta`, or `-rc` suffix (`v25.3.0-rc.1`) | `detectedVersion` |
-| closed set | `skipReason` (below), `runtimeSource` (`delivered-artifact`, `recipe-supplied-runtime`, `cluster-capability`), `transport` (`default`, `net`, `nvls`), `fabric` (`efa`, `roce`), `configuredPolicy` (every GPU allocation policy), `resolvedMode` (`device-plugin-extended-resource`, `dra-resource-claim`) |
+| closed set | `skipReason` (below), `runtimeSource` (`delivered-artifact`, `recipe-supplied-runtime`, `cluster-capability`), `transport` (`default`, `net`, `nvls`), `fabric` (`efa`), `configuredPolicy` (every GPU allocation policy), `resolvedMode` (`device-plugin-extended-resource`, `dra-resource-claim`) |
 
 Codes are closed sets rather than a shape regex, because a kebab-case regex
 would still pass an identifier like `customer-prod-cluster`. The `skipReason`
@@ -488,19 +499,28 @@ page are the contract.
 
 | Check | Keys |
 |-------|------|
-| `nccl-all-reduce-bw*` | `transport`, `workerNodes`, `gpusInvolved`, `fabric`, `achievedGbps`, `thresholdGbps`, `tolerancePct`, `passMargin` |
-| `expected-resources` | `namespacesActive`, `namespacesExpected`, `draReady`, `draDesired`, `nodewrightComplete`, `nodewrightExpected`, and the RDMA gate's `nodesValidated`, `nodesTotal` |
+| `nccl-all-reduce-bw*` | `runtimeSource`, `transport`, `workerNodes`, `gpusInvolved`, `fabric`, `achievedGbps`, `thresholdGbps`, `tolerancePct`, `passMargin` |
+| `nccl-cre-all-reduce-bw` | `achievedGbps`, `thresholdGbps`, `tolerancePct`, `passMargin` |
+| `gke-gpu-nic-topology` | `nodesValidated`, `nodesTotal` |
+| `expected-resources` | `namespacesActive`, `namespacesExpected`, `draReady`, `draDesired`, `nodewrightComplete`, `nodewrightExpected`, and the RDMA gate's `nodesValidated`, `nodesTotal`, `nodesFailed`, `nodesSkipped` |
 | `inference-perf` | `throughputTokPerSec`, `ttftP99Ms`, `throughputThreshold`, `scaledThreshold`, `ttftThresholdMs`, `gpusBenchmarked`, `gpusPerNode` |
 | `secure-accelerator-access`, `inference-perf` | `configuredPolicy`, `resolvedMode`, `nodeLocal` |
 | `dra-support` | `configuredPolicy` |
 | `gpu-operator-version` | `detectedVersion`, `versionSatisfied` |
+| `check-nvidia-smi` | `nodesValidated`, `nodesTotal`, `nodesFailed`, `nodesSkipped` |
 | any check, on an in-pod skip | `skipReason` |
 
 - NCCL publishes `transport`, `workerNodes`, and `gpusInvolved` before the
   benchmark runs, so a failed run still records its scope. `fabric` appears
-  only on `nccl-all-reduce-bw-net`, when `AICR_NCCL_FABRIC` selected the
-  baked-in EKS template. `tolerancePct` is the slack below `thresholdGbps`
-  that still passes.
+  only on `nccl-all-reduce-bw-net`, when it runs the baked-in EKS template.
+  `tolerancePct` is the slack below `thresholdGbps` that still passes.
+- `check-nvidia-smi` publishes all four counts on every exit once the GPU
+  node list succeeds: no GPU nodes (all `0`), all cordoned, no free node,
+  after verification, and when the deadline stops it early. Nodes it never
+  reached are in no count, so the counts can sum to less than `nodesTotal`.
+- `gke-gpu-nic-topology` publishes `nodesValidated` and `nodesTotal` on every
+  exit once the node list succeeds, including an empty list and a
+  `no-verifiable-nodes` skip. A failed node list publishes neither.
 - `draReady` and `draDesired` come from the last observed DRA kubelet-plugin
   DaemonSet, and are absent if none was found. `nodewrightComplete` and
   `nodewrightExpected` are `0`/`0` when every Skyhook CR is suppressed.
@@ -650,7 +670,6 @@ be set from the catalog or a `--data` overlay:
 | `HF_TOKEN` | `inference-perf` | Hugging Face token for model downloads; see [`inference-perf`](#inference-perf-model-concurrency-and-weights-cache). |
 | `AICR_INFERENCE_PERF_NO_CLEANUP` | `inference-perf` | When true (`strconv.ParseBool`), leaves the per-run namespace in place for inspection; forwarded as `1`. |
 | `AICR_REQUIRE_SCOPED_INFERENCE_GATEWAY` | `inference-gateway` | When truthy, the check fails if the gateway's `LoadBalancer` Service is open to `0.0.0.0/0` — its `spec.loadBalancerSourceRanges` is empty or includes an any-source CIDR (`0.0.0.0/0` or `::/0`). Default (unset): the open exposure is recorded and warned but the check still passes. |
-| `AICR_NCCL_FABRIC` | `nccl-all-reduce-bw-net` | NET fabric selector: `efa` (default) or `roce`. |
 | `AICR_NCCL_RUNTIME_IMAGE` | `nccl-all-reduce-bw`, `nccl-all-reduce-bw-net`, `nccl-all-reduce-bw-nvls` | Overrides the NCCL launcher/worker image baked into the per-platform TrainingRuntime templates; a malformed reference fails closed in the pod. |
 
 **RBAC.** The engine creates a per-run ServiceAccount and
@@ -900,20 +919,21 @@ tagged with its cordon state, and:
    past it. A future check with a different tradeoff should say so
    explicitly rather than assume cordons are unconditionally
    unschedulable.
-2. Report cordoned nodes explicitly in the check's stdout evidence
-   (`<node>: skipped (cordoned)`), never omit them from the node count.
+2. Report cordoned nodes explicitly in the check's stdout evidence,
+   never omit them from the node count. `check-nvidia-smi` prints one
+   line per node: `<node>: PASSED`, `<node>: FAILED (<reason>)`, or
+   `<node>: SKIPPED (<cause>)`.
 3. Print a coverage line (`RESULT: nodesValidated: <validated>/<total>`)
    on every exit path (skip, failure, and success), not only the
    success path, so a pass *or* a failure on reduced scope is visible.
+   `check-nvidia-smi` appends the breakdown:
+   `(passed <n>, failed <n>, skipped <n>: busy <n>, cordoned <n>)`,
+   with `busy-probe error <n>` between `busy` and `cordoned` when the
+   busy-probe errored on any node.
    `<validated>` is the count actually confirmed working, not the
-   schedulable count: it is `0` on the all-cordoned and busy-skip
-   paths (nothing was attempted yet) and the successful-node count on
-   the failure path (a partial pass is not conflated with a full one).
-   Exception: when the recipe declares `Deployment.gpu-driver.version`,
-   those same all-cordoned and busy paths (and the no-GPU-nodes path)
-   fail closed instead of Skip — a declared host-driver floor that
-   cannot be measured must not PASS (#1995). Skip remains only when
-   the floor constraint is absent.
+   schedulable count: it is `0` on the paths that verify nothing and
+   the successful-node count on the failure path (a partial pass is not
+   conflated with a full one).
    The `RESULT:` prefix is `pkg/validator/validator.go`'s
    `resultSummaryPrefix` convention: the validator runtime echoes the
    trailing text of any such stdout line into live CLI output via
@@ -929,23 +949,57 @@ tagged with its cordon state, and:
    through `validators.EmitExtra` (#1951) — see **Structured coverage
    survives redaction** below.
 
-`expected-resources`' RDMA fabric probe follows this pattern too. It validates
-only the schedulable RDMA-capable nodes, lists each cordoned one as
-`<node>: skipped (cordoned)`, and still counts it in `nodesTotal`. The probe
-re-runs on every poll but prints its enumeration and `RESULT:` line once, at
-the settled outcome.
+`check-nvidia-smi` also skips a schedulable node that is busy, meaning
+a pod there that has not finished (Pending or Running) already
+requests `nvidia.com/gpu`. The check does not place its own GPU pod
+beside an existing workload. A busy node is skipped per node, not for
+the whole check (#3361).
 
-It emits Extra twice, a floor with `nodesValidated=0` on the first observation
-of an RDMA-capable node, then the terminal counts, which win because sentinels
-merge key-wise. The floor keeps a cordoned node's narrowing in the signed
-bundle if the pod is killed before the terminal emit. The gate fails closed,
-so "could not observe the fabric" reports `0` validated.
+- Every free schedulable node is verified.
+- Any verified node failing fails the check.
+- At least one node passing, with none failing, passes the check, with
+  the busy nodes disclosed as skipped.
+- When no node is free, the check skips with `nodes-busy`.
+- When the busy-probe errored on every schedulable node, the check
+  fails closed instead (#2122). A probe error on one node, while
+  another is free, skips that node as `busy-probe error`.
+- Each node is probed immediately before it is verified. A job that
+  claims a node's GPUs while earlier nodes are being verified makes that
+  node `SKIPPED (busy)`, not `FAILED`.
+- When the check's deadline expires, it stops with a timeout error.
+  Nodes it never reached, or was verifying when the deadline hit, are
+  not counted as failed.
+
+When the recipe declares `Deployment.gpu-driver.version`, the paths
+that verify nothing (no GPU nodes, all cordoned, all busy) fail closed
+instead of Skip. A declared host-driver floor that cannot be measured
+must not PASS (#1995). Skip remains only when the floor constraint is
+absent.
+
+`expected-resources`' RDMA fabric probe follows this pattern too, with
+the same output shape as `check-nvidia-smi`. It validates only the
+schedulable RDMA-capable nodes, lists each cordoned one as
+`<node>: SKIPPED (cordoned)`, and still counts it in `nodesTotal`. Its
+RESULT breakdown has `cordoned` as the only skip cause. The probe re-runs
+on every poll but prints its enumeration and `RESULT:` line once, at the
+settled outcome.
+
+The gate certifies the schedulable cohort as a unit, not node by node.
+
+- When it certifies, every schedulable node counts as passed.
+- When it fails closed, every schedulable node counts as failed, and
+  `nodesValidated` is `0`. "Could not observe the fabric" therefore
+  never reads as a pass.
+
+It emits Extra twice. The first is a floor on the first observation of
+an RDMA-capable node, with nothing passed or failed. The second is the
+terminal counts, which win because sentinels merge key-wise. The floor
+keeps a cordoned node's narrowing in the signed bundle if the pod is
+killed before the terminal emit.
 
 Unlike `check-nvidia-smi`, the RDMA gate never *skips* — it either
 certifies the cohort or fails closed — so it mints no `skipReason`
-enum. Its coverage rides the existing `nodesValidated`/`nodesTotal`
-allowlist keys unchanged (see below), so that change did not move the
-redaction `PolicyVersion`.
+enum.
 
 Cluster-aggregate checks that assert on an operator's aggregate status
 (`gpu-operator-health`) remain unaffected — DaemonSet operands ignore
@@ -953,10 +1007,11 @@ cordons.
 
 **Structured coverage survives redaction.** Minimal redaction strips the
 `RESULT:` stdout line, so `check-nvidia-smi` and the RDMA gate also
-publish coverage in `extra` as `nodesValidated`/`nodesTotal` or a
-`skipReason` code. A signed bundle still records a cordoned node
-narrowing the cohort. Node names appear only in stdout, never in
-`extra`.
+publish coverage in `extra` as `nodesValidated`, `nodesTotal`,
+`nodesFailed`, and `nodesSkipped`, and `check-nvidia-smi` adds a
+`skipReason` code when it skips. A signed bundle records a pass on a
+partly busy or cordoned cluster as partial coverage. Node names appear
+only in stdout, never in `extra`.
 
 For *deliberate*, durable exclusion of a node from GPU service (as
 opposed to transient cordon-for-maintenance), use the GPU Operator's
@@ -984,9 +1039,9 @@ service or accelerator — `creQualifiedEntries` in
 qualified and the catalog entry and node cap each was measured with, so a new
 combination is an entry there plus a measured threshold rather than a new code
 path. `nccl-cre-all-reduce-bw` is qualified on `eks` x `h100` with
-`communication/nccl-all-reduce`; `cre-training-goodput` has no qualified
-combination while the `training/nemotron5-8b` entry it drives does not run on
-the pinned CRE version, so it skips wherever it is declared. Both create the
+`communication/nccl-all-reduce`, and `cre-training-goodput` on the same
+combination with `training/nemotron5-8b`, each capped at two nodes. A
+combination with no entry skips. Both create the
 CR on an explicitly named set of nodes, wait with a timeout, and tear it down on
 success or failure — deleting the CR and then confirming the `TrainJob`s and
 workload pods it started are gone, since CRE's controller drops its finalizer
@@ -1069,8 +1124,8 @@ Resolution is split across the two-stage design:
   `validateNcclAllReduceBw` bypasses the `ncclCombinationSupported` applicability
   gate entirely (applicability is granted by the recipe's explicit opt-in, keyed
   on its own criteria) and `applyNCCLResources` skips every service-specific step
-  — EFA/TCPXO/RDMA discovery, the GB200-NVreg / GKE-TCPXO preflights, RoCE claim
-  application, and NVLS/IMEX provisioning — because the supplied runtime owns its
+  — EFA/TCPXO/RDMA discovery, the GB200-NVreg / GKE-TCPXO preflights, and
+  NVLS/IMEX provisioning — because the supplied runtime owns its
   fabric wiring. Transport verification still runs (the `-net` / `-nvls` markers
   are transport-internal and fabric-agnostic), so a runtime paired with a named
   variant must still prove its transport rather than pass on bandwidth alone; the
@@ -1358,16 +1413,24 @@ unrecognized value, which keeps a typo'd severity non-silent.
 | `CheckGB300HostKernelGranule` | Bare-metal GB300 (`service: generic`, `accelerator: gb300`) applies a tuned profile that sizes hugepages for a 64k-granule ARM64 host kernel. A 4k-granule host still boots — Linux rejects the `hugepagesz=512M` clause and drops its paired `hugepages=` count — so the node just runs without that pool. Advisory only (`severity: info`); skipped when the component is disabled or `tuningEnabled` resolves to false on the final effective values (recipe merge plus scalar `--set` and typed `--set-json`/`--set-file`, under the canonical name and its registry aliases). |
 | `CheckDriverOwnershipCoherence` | GPU driver-ownership coherence on the final effective values (recipe merge + `--set`/`--set-json`/`--set-file` under canonical names and registry aliases): a recipe whose snapshot observed no NVIDIA driver (`metadata.gpuDriverState: absent`) must not bundle with the preinstalled-driver assumption. When GPU Operator manages the driver, `nvidia-dra-driver-gpu.nvidiaDriverRoot` must equal `gpu-operator hostPaths.driverInstallDir`; with a preinstalled driver, the DRA root must avoid the unpopulated operator container root and may intentionally differ from `hostPaths.driverInstallDir` ([#1087](https://github.com/NVIDIA/aicr/issues/1087), [#1757](https://github.com/NVIDIA/aicr/issues/1757)). Wired at `severity: error`. |
 | `CheckMariaDBOperatorOwnershipCoherence` | MariaDB Operator installation safety for AICR-provided Slurm accounting: `metadata.mariaDBOperatorState` values `crs-detected` and `unknown` block bundling, `api-detected` or omitted evidence warns, and `absent` proceeds silently. Wired at `severity: warning` so warning results remain non-blocking while returned errors still fail the bundle. |
-| `CheckNVSentinelDatastorePrerequisites` | Cluster prerequisites of `nvsentinel-mongodb` from snapshot evidence. `metadata.defaultStorageClassState`: `absent` and `unknown` block unless `replsets.rs0.volumeSpec.pvc.storageClassName` or `--storage-class` names a class, `multiple` warns, `present` proceeds. `metadata.perconaOperatorState`: `crs-detected`, `operator-detected`, and `unknown` block, `api-detected` warns that psmdb-operator replaces the existing CRDs, `absent` and `aicr-owned` proceed. Omitted evidence warns for either field. |
-| `CheckNVSentinelRemediationPipelineCoherent` | NVSentinel's fault pipeline can work as configured: no quarantine, drain or remediation stage with the embedded `mongodbStore` or without a supported `global.datastore.provider`; each stage has the one before it (`node-drainer` needs `fault-quarantine`, `fault-remediation` needs `node-drainer`), `global.dryRun` is a boolean when `fault-remediation` is on, a live `fault-remediation` has `janitor`, `janitor` has `janitor-provider`, and `fault-remediation` has `metadata-collector`; janitor's GPU reset Job reads the driver from the root the GPU Operator populates, with a clean `driverRoot`, a RuntimeClass coherent with the enabled GPU Operator variant (none under CDI with NRI), and a service manager that waits only for operands the GPU Operator runs, in its namespace, with a custom spec's timeouts set; the GPU reset is rejected on GKE COS. With the `nvsentinel-mongodb-uri` datastore it also requires x509 auth with the `nvsentinel-mongodb-app-client` certificate and both Percona components deployed, enabled and in NVSentinel's namespace. Rejects `--dynamic` on any path it verifies. Wired at `severity: error`. |
+| `CheckNVSentinelDatastorePrerequisites` | Cluster prerequisites of `nvsentinel-mongodb` from snapshot evidence. `metadata.defaultStorageClassState`: `absent` and `unknown` block and `multiple` or no evidence warns, unless `replsets.rs0.volumeSpec.pvc.storageClassName` or `--storage-class` names a class; `present` proceeds. `metadata.perconaOperatorState`: `crs-detected`, `operator-detected`, and `unknown` block, `api-detected` warns that psmdb-operator replaces the existing CRDs, `absent` and `aicr-owned` proceed; omitted `perconaOperatorState` evidence warns. |
+| `CheckNVSentinelRemediationPipelineCoherent` | NVSentinel's fault pipeline can work as configured: no quarantine, drain or remediation stage, `health-events-analyzer` or `event-exporter` with the embedded `mongodbStore` or without a supported `global.datastore.provider`; each stage has the one before it (`node-drainer` needs `fault-quarantine`, `fault-remediation` needs `node-drainer`), `global.dryRun` is a boolean when `fault-remediation` is on, a live `fault-remediation` has `janitor`, `janitor` has `janitor-provider`, and `fault-remediation` has `metadata-collector`; janitor's GPU reset Job reads the driver from the root the GPU Operator populates, with a clean `driverRoot`, a RuntimeClass coherent with the enabled GPU Operator variant (none under CDI with NRI), and a service manager that waits only for operands the GPU Operator runs, in its namespace, with a custom spec's timeouts set; the GPU reset is rejected on GKE COS. With the `nvsentinel-mongodb-uri` datastore it also requires x509 auth with the `nvsentinel-mongodb-app-client` certificate and both Percona components deployed, enabled and in NVSentinel's namespace. Rejects `--dynamic` on any path it verifies. Wired at `severity: error`. |
 | `CheckNVSentinelMongoDBCoherent` | `nvsentinel-mongodb` is usable by NVSentinel: NVSentinel is deployed, TLS is `requireTLS`, sharding is off, the `$external` x509 app user has `readWrite` on `HealthEventsDatabase` and the `nvsentinelTTLIndex` role, `psmdb-operator` is deployed with `watchAllNamespaces: false` and `disableTelemetry: true`, and `crVersion` and `initImage` are at the operator image's minor. Dependencies are read from the declared component set, so a `bundlers=` subset still sees them. Rejects `--dynamic` on any path it verifies. Wired at `severity: error`. |
 | `CheckNVSentinelSlurmDrainMonitorRequiresSlinky` | NVSentinel's `slurm-drain-monitor` is not enabled without `slinky-slurm` (absent or disabled), or watching a blank namespace or one `slinky-slurm` does not deploy to: the monitor reads the `SlurmNodeStateDrain` condition off Slinky worker pods, which only `slinky-slurm`'s NodeSets create, so it would run and never see a pod. Rejects `--dynamic` on the monitor's toggle and namespace and on `slinky-slurm`'s `enabled`, even with the monitor off. Wired at `severity: error`. |
 | `CheckNVSentinelSlurmCustomDrainCoherent` | NVSentinel drains Slurm nodes through the slinky-drainer plugin: a recipe with `slinky-slurm` and a live (not dry-run) `fault-remediation` has `node-drainer.customDrain` on, while quarantine alone passes; `customDrain` is only on with a live `node-drainer`, a boolean `global.dryRun` that is false, `slinky-slurm`, the `slinky-drainer-crds` component, and the `slinky-drainer` component in NVSentinel's namespace watching the namespace `slinky-slurm` deploys to; and its values match the plugin's contract (DrainRequest kind, resource and `DrainComplete` condition, the `slinky-drain-template` template, NVSentinel's namespace, a positive whole-seconds `timeout`, and empty `userNamespaces` and `podDrainPolicies` with an empty `nodeSelector`, since a scope could leave slurmd nodes on pod eviction); and the slurmd NodeSet and every Slurm control pod in the Slurm namespace (slinky-slurm's controller, REST API, login and enabled accounting, and `slurm-accounting-mariadb` there) render non-empty node selectors (modelled on the bundler's order: `--set`, then node-selector injection unless the overlay opts out with an empty or null value, then `--set-json`), each control pod's giving some label key a different value from slurmd's, since the plugin waits for every Ready pod in that namespace on a drained node to report Slurm DRAIN. Rejects `--dynamic` on any path a rule that can still fire reads, so a monitoring-only Slurm recipe keeps its `--dynamic` paths. Wired at `severity: error`. |
+| `CheckNVSentinelEventExporterCoherent` | NVSentinel's Event Exporter can deliver: `sink.endpoint` and `oidc.tokenUrl` are `http` or `https` URLs with a host that is not an `example.com`, `.org` or `.net` placeholder; `oidc.clientId`, `oidc.scope`, `metadata.cluster` (not the chart's `my-cluster`) and `metadata.environment` are set by AICR's values as strings; no metadata value holds a double quote, backslash or control character other than tab, and every metadata key is a TOML bare key, since the chart writes them into its config unescaped; both `insecureSkipVerify` settings are `false`; and `oidcSecretName` is a valid Secret name. A no-op unless `global.eventExporter.enabled`; then rejects `--dynamic` on any `event-exporter` value. Wired at `severity: error`. |
+| `CheckNVSentinelLogCollectorCoherent` | NVSentinel's log collector can capture and upload a node's diagnostics: `fault-remediation.logCollector.enabled` and `global.inclusterFileServer.enabled` are on together, `fault-remediation` runs live (not dry run, with a boolean `global.dryRun` and `logCollector.enabled`), the file server keeps the mixin's `fullnameOverride` and the upload URL names its Service, and the collector can reach `nvidia-bug-report` (the GPU Operator installs the driver in the namespace `logCollector.gpuOperatorNamespaces` names, or GKE's managed install; not AKS or OKE at their default `gpuStack`, Kind, EKS on Amazon Linux, or the VR200 RKE2 and H200 k0s leaves). An `env` entry that replaces the upload URL or namespace is read in its place; `MOCK_MODE=true` skips the driver rule. A no-op unless either setting is on; rejects `--dynamic` on the paths it verifies. Wired at `severity: error`. |
+| `CheckNVSentinelExternalRemediationCoherent` | NVSentinel routes health events to an `ExternalRemediationRequest` only as upstream's contract allows. A request action is any `fault-remediation.maintenance.actions` entry whose `kind` is `ExternalRemediationRequest`, whatever its key, and the mixin's key `external-remediation`, whatever its `kind`. Errors: a request action while `global.faultRemediation.enabled` does not render `fault-remediation` (dry run passes); a request action whose `kind` is not `ExternalRemediationRequest`, `apiGroup` not `nvsentinel.dgxc.nvidia.com`, `version` not `v1`, `scope` not `Cluster` (unset renders as `Cluster`), `completeConditionType` not `ExternalRemediationComplete` (unset renders as `NodeReady`) or `equivalenceGroup` not `external-remediation`, that sets a non-empty `namespace` (upstream's contract says not to) or `impactedEntityScope`, or whose `templateFileName` names no non-null `fault-remediation.maintenance.templates` entry in AICR's values, or one with no line declaring `kind: ExternalRemediationRequest`, since `fault-remediation` creates the kind its template renders; with kubernetes-object-monitor enabled, any policy, enabled or not, with `recommendedAction: CUSTOM` and no `customRecommendedAction`, or whose `enabled` or `healthEvent.isFatal` does not render as `true` or `false` (unset included), either of which makes the monitor refuse its whole config; and, with a request action, or a `CUSTOM` policy under an enabled kubernetes-object-monitor, present, `--dynamic` on, under or above `fault-remediation.maintenance`, `global.faultRemediation.enabled`, `global.kubernetesObjectMonitor.enabled`, `kubernetes-object-monitor.policies` or `kubernetes-object-monitor.processingStrategy`, which is then the only finding. Warnings, with `fault-remediation` enabled (live or dry run): a request action while kubernetes-object-monitor is not enabled, or that no enabled `CUSTOM` policy names, unless its key is a built-in `recommendedAction` other than `CUSTOM` and `NONE`, which `fault-remediation` skips; an enabled policy routing to a request action (by `customRecommendedAction` for `CUSTOM`, else by its `recommendedAction` name) whose `isFatal` is `false` without `healthEvent.quarantineOverrides.force: true`, or whose effective `processingStrategy` (policy, else monitor, else `EXECUTE_REMEDIATION`; `UNSPECIFIED` counts as `EXECUTE_REMEDIATION`) is not `EXECUTE_REMEDIATION`; an enabled `CUSTOM` policy whose `customRecommendedAction` is not a non-null key of AICR's actions or one of the chart's `COMPONENT_RESET`, `RESTART_VM`, `RESTART_BM` and `REPLACE_VM` not set to null, which `fault-remediation` labels `remediation-failed` without repair. A policy is enabled only when `enabled` renders as `true`. A no-op unless a request action is present, or kubernetes-object-monitor is enabled with a `CUSTOM` policy. Wired at `severity: warning`, so its warnings stay non-blocking while its errors still block. |
+| `CheckNVSentinelFileServerStorageClass` | The in-cluster file server's report volume can bind, from snapshot evidence, by the rule `CheckNVSentinelDatastorePrerequisites` applies to the datastore: `metadata.defaultStorageClassState` `absent` and `unknown` block and `multiple` or no evidence warns, unless `--storage-class` or `incluster-file-server.persistence.storageClassName` names a class; an unrecognized state blocks either way. A no-op unless the file server renders with persistence on. Registered apart from `CheckNVSentinelLogCollectorCoherent`, at `severity: warning`, so its warnings stay non-blocking while its errors still block. |
+| `CheckNVSentinelDrainScopeCoherent` | NVSentinel's node-drainer drains with a validated scope and timing. It reads the values the bundle emits, which `aicr bundle` and `Client.BundleComponents` produce through `pkg/bundler/drainscope`: `systemNamespaces` generated from every namespace the recipe declares, and the mode defaulted to `DeleteAfterTimeout`. The scope and the drain entries are checked as emitted; the other values with bundle-time `--set`/`--set-json` applied again on top. With `global.nodeDrainer.enabled` on: the emitted `systemNamespaces` protects every declared namespace and the chart's own list and, with the operator's pattern merged in, does not match every namespace, and an operator-set pattern is a non-empty pattern that compiles and provably does not match every namespace (one too complex to check is rejected); the node has some `userNamespaces` entry, `podDrainPolicies` entry or custom drain owning every node, since with none `node-drainer` marks it drained at once (a `podDrainPolicies` list drains only the pods its selectors match, which the gate does not check), `userNamespaces` is not left to the chart's `AllowCompletion`, and a `userNamespaces` list has a `"*"` entry, without which `node-drainer` never drains an unlisted namespace, and no entry with a weaker mode than it, which it would override; every entry has a name and a mode node-drainer knows, every `userNamespaces` name is a valid namespace glob, and `podDrainPolicies` names are unique with a valid `namespace` glob and `podSelector`, and the two lists are not both set; `deleteAfterTimeoutMinutes` is a whole number from 10 to 1440 and `evictionTimeoutInSeconds` whole seconds from 30 to 3600; `drainGPUPods` and `partialDrainEnabled` are explicit booleans, `global.partialDrainEnabled` (which overrides it in the rendered config) agrees, and partial drain is on only with fault-quarantine's copy on. Rejects `--dynamic` on the drain paths, including the `customDrain` toggle and selector, while node-drainer is on; `CheckNVSentinelRemediationPipelineCoherent` guards `global.nodeDrainer.enabled` itself. Bundling fails when a declared component has no namespace in the recipe or registry. Wired at `severity: error`. |
+| `CheckNVSentinelNodeValidationCoherent` | NVSentinel's new-node validation can run. With lifecycle-manager on: `fullNameOverride` leaves the Deployment named `lifecycle-manager`, as the health check expects; `controllers.validationRequest.enabled` is a boolean; with that controller on, `lifecycle-manager.config.tests` and each test in it are maps and at least one test remains once null entries are dropped, a test's `command`, when set, is a non-empty list of strings, its `image` a non-empty string, and its `provider` one the config defines, where each provider, the chart's `k8s-job-provider` merged with AICR's overrides, is a map with the fields lifecycle-manager requires at startup and condition statuses of `True`, `False` or `Unknown` (image and provider required on a test AICR adds; on the chart's `dcgm-diag-test` an explicit null deletes the chart's value and is rejected), `newNodeTests` and `defaultTests` name only defined tests, each once, and are not both empty (a null list counts as empty), and `newNodeValidation` is a map, null or false, since lifecycle-manager exits at startup on any of these; when new-node validation runs (`newNodeValidation` a map), its criteria keep one named `cordoned` with the chart's expression and one named `not-under-quarantine` with the mixin's; and when the new-node tests include `dcgm-diag-test` with the chart's command, an enabled GPU Operator runs in `gpu-operator` with `dcgm.enabled: true`. Warns when `global.dryRun` is true and new-node validation runs, since lifecycle-manager ignores dry run, and when the bundle deploys no cert-manager and `webhook.certProvider` is not `openshift-service-ca`. Rejects `--dynamic` on `global.lifecycleManager`, on any `lifecycle-manager` value while it is on, and on the GPU Operator's `enabled` and `dcgm.enabled` while the DCGM rule applies. Wired at `severity: warning`; its blocking findings are errors. |
+| `CheckNVSentinelPostRemediationValidationCoherent` | NVSentinel's post-reboot validation can release a repaired node. `fault-quarantine.validation` is a map when set and its `enabled` a boolean. When it is on with `fault-quarantine` rendering: lifecycle-manager and its ValidationRequest controller run; `node-drainer` runs, since `fault-quarantine` validates only a fully drained node; `schedulingGate` and `schedulingGate.cordon` are maps when set and `cordon.remove` is true or unset; `readinessCriteria`, when set, is a list that keeps one named `not-under-quarantine` with the chart's expression; `ruleSets` is a non-empty list of maps with at least one enabled rule set and no two rule sets, disabled ones included, sharing a name; a rule set's `enabled` is a boolean when set (the chart defaults it to true); each enabled rule set has at least one `match.all` or `match.any` rule (a null list is skipped, as the chart does), each a `HealthEvent` rule with an expression, and names tests lifecycle-manager's config defines; `dcgm-diag-test` with the chart's command has an enabled GPU Operator in `gpu-operator` with `dcgm.enabled: true`; `fault-quarantine` and lifecycle-manager share a cordon label prefix, each a non-empty string when set; every `lifecycle-manager.config.schedulingGate.taints` entry's value is a string, since lifecycle-manager decodes it as one and exits at startup otherwise, and, while a requested test renders through the chart's Job template (NVSentinel v1.28.0), which writes it unquoted, is not a string such as `true`, `yes` or `1` that turns into a bool or number there and breaks every test Job; and every `NoSchedule` or `NoExecute` taint an enabled `fault-quarantine` rule set applies has such an entry with the same key, value and effect and `remove: true`, since `fault-quarantine` keeps its taints on the hand-over (with `fault-quarantine.ruleSets` unset, the chart's NVCRE certification taint counts while `global.nvcreCertificationMonitor` is on, and cannot be released at v1.28.0). Rejects `--dynamic` on `fault-quarantine.validation.enabled`, on `fault-quarantine.validation`, `fault-quarantine.labelPrefix` and `fault-quarantine.ruleSets` while validation is on, on `global.nvcreCertificationMonitor.enabled` while validation is on and `fault-quarantine.ruleSets` is unset, and on the GPU Operator's `enabled` and `dcgm.enabled` while the DCGM rule applies. Warns, without blocking, that the release values in a test Job are unverified when a requested test renders through a `lifecycle-manager.config.templates` override, which the bundle does not render; an override no requested test uses changes nothing. Wired at `severity: warning` to carry that note; every other finding is returned as an error and blocks. |
 | `CheckNPDNotDuplicatingProviderNPD` | `node-problem-detector` is bundled only on an allowlist of verified platforms — never where the provider already runs its own NPD (GKE, AKS), on OpenShift (no privileged SCC binding), or on Talos (restricted namespace) |
 | `CheckGKETCPXOInterfacesCoherence` | The final resolved kubeflow-trainer `tcpxoInterfaces` value matches the mapping the recipe records in `configuration.gke.tcpxoInterfaces` |
 | `CheckNVSentinelDriverLabelDetectable` | Where the GPU Operator does not own the driver and no driver pod exists (driver ships in the node image), NVSentinel sets `labeler.assumeDriverInstalled`, so its driver-label-gated DaemonSets do not come up half-rolled-out |
 | `CheckNVSentinelRuntimeClassCoherence` | NVSentinel metadata-collector `runtimeClassName` matches the RuntimeClass the GPU Operator creates from `operator.runtimeClass`, so its pods are not rejected at admission |
 | `CheckNVSentinelTracingEndpointRequired` | NVSentinel distributed tracing is not enabled without an OTLP collector endpoint |
+| `CheckNKTPExportersHaveBackend` | With NKTP's bundled `otel-lgtm` disabled, each of its five backend exporter endpoints (`gateway_metrics`, `gateway_logs`, `gateway_traces`, `watchdog`, and `watchdog.sidecar`, each at `otelcol.config.exporters.otlp.endpoint`) is set explicitly, since the chart default targets `otel-lgtm`; a null or blank value counts as unset. A `--dynamic` `otel-lgtm.enabled` counts as disabled; a `--dynamic` endpoint counts as set. Wired at `severity: error`. |
 | `CheckNVSentinelNicHealthMonitorRequiresMetadataCollector` | `nic-health-monitor` is not enabled without `metadata-collector` (or a `nicInclusionRegexOverride`), which would otherwise discover zero devices |
 | `CheckNVSentinelPreflightDCGMReachable` | The preflight DCGM check's hostengine address resolves to a served Service (gpu-operator present, not relocated, and `dcgm.enabled`) |
 | `CheckNVSentinelPreflightGangSchedulerRequired` | Preflight gang coordination against KAI PodGroups is not enabled while `kai-scheduler` is disabled or absent |
@@ -1550,6 +1613,49 @@ restricted at runtime to read-only Chainsaw operations
 `pkg/chainsaw.TestValidateTestReadOnly_RegistryContent` walks every
 registry-declared assert file against this allowlist under `make qualify`,
 so violations are caught before they ever reach the validator.
+
+**CRD assertions.** Every CRD a health check asserts must be backed by an
+in-tree record of what AICR installs, so a chart bump that renames or drops a
+CRD fails at PR time, before any cluster runs the check.
+`TestHealthCheckCRDAssertionsAnchored` in `tools/crd-inventory` enforces this
+offline under `make test`. It checks each registry health check at the
+registry pin, and each health check a leaf recipe deploys at that leaf's pin,
+including an overlay's inline `healthCheckAsserts`:
+
+- A Helm component's generated `recipes/components/<name>/crds.yaml` has one
+  entry per pinned chart, keyed by repository, chart and `sourceVersion`. Each
+  CRD asserted against a pin must appear in the list that pin's entry gives the
+  asserting recipe, or in the component's vendored `manifests/`.
+- A component with no chart, such as an OLM or manifest-only wrapper, may
+  assert only CRDs that some in-tree inventory or vendored manifest defines.
+- A `crds.yaml` may hold only entries for pins some CRD assertion is checked
+  against.
+
+`make crd-inventory` renders each such chart with `--include-crds` once for
+each set of values a recipe asserting against it deploys. The registry pin
+uses the component's `values.yaml`. A leaf uses its merged `valuesFile` and
+inline `overrides`, as the bundler does. At the registry pin, an entry's
+`crds` lists the CRDs the chart installs with `values.yaml`. Its `variants`
+list the leaves whose values install a different list, and that list. A leaf
+not named in `variants` gets `crds`. The tool rewrites the inventories and
+deletes any inventory no CRD assertion needs. Run it after bumping a pin, in
+the registry, an
+overlay, or a mixin, of a component whose check asserts a CRD, after changing
+that component's values, and after adding or removing a CRD assertion. It
+reports every asserted CRD missing from the render with the asserting
+recipe's values, such as a CRD from a subchart a leaf's values turn off. When
+that leaf should not have the CRD, give it its own check, as described in
+[Replace a component's health check in an overlay](../integrator/recipe-development.md#replace-a-components-health-check-in-an-overlay).
+Some operators apply CRDs from their
+own image at runtime, so their chart does not render them. `dynamo-platform`
+applies all of its CRDs from a `crd-apply` init container, and
+`network-operator` applies the nv-ipam CRDs when a NicClusterPolicy enables
+nvIpam. Such components are listed in `imageCRDSources`, and the tool also
+reads the CRDs from the image of the named container in the rendered chart.
+`make crd-inventory-check` re-renders every chart and fails on a stale
+inventory. It needs helm and network access, so `make qualify` does not run
+it. The merge gate runs it on pull requests that change its inputs, and on
+every push to `main`.
 
 **Value-gate awareness (#1844).** A registry assert file is static — it
 cannot see the component's effective Helm values. That is a problem for a

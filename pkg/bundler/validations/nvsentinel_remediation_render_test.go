@@ -23,7 +23,9 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
 	aicrhelm "github.com/NVIDIA/aicr/pkg/helm"
+	"github.com/NVIDIA/aicr/pkg/helm/helmtest"
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
 
@@ -84,14 +86,14 @@ var renderedSetupJob = regexp.MustCompile(`^release-nvsentinel-external-mongodb-
 
 // perconaSetupImage runs NVSentinel's external-datastore setup Job: the
 // mongod image, which ships mongosh.
-const perconaSetupImage = "docker.io/percona/percona-server-mongodb:8.0.26-11@sha256:53f89c001997627554e6afc0feb5906209ba109f4f98c62f2ca8456c214af60c"
+const perconaSetupImage = "docker.io/percona/percona-server-mongodb:8.0.32-14@sha256:5ba5f240d2dc98bc6236ab1d79c0862c4b62dba9d98cd0ffdf716c30473d2d11"
 
 // perconaImages are every image the separately bundled datastore renders,
 // pinned in recipes/components/{psmdb-operator,nvsentinel-mongodb}.
 var perconaImages = []string{
 	"docker.io/percona/percona-server-mongodb-operator:1.23.1@sha256:78c87b933e184b9af36dbb0078751862c75934c1521c33d3be4d0a38aa58dd0a",
 	perconaSetupImage,
-	"docker.io/percona/mongodb_exporter:0.53.0@sha256:0214e482b2cd4b1849f9f4dcef90d328a99ba3727dd1103e7da48b42060bcec1",
+	"docker.io/percona/mongodb_exporter:0.54.0@sha256:934e9db87e85e0fa63654e73c3504845993a254e898783ca905e65a68848b5a4",
 	"docker.io/percona/percona-backup-mongodb:2.15.0@sha256:12dcba7f1b55e00eb1b49dac51427d942c221b826d621d6bfad926a9d959a7c5",
 	"docker.io/percona/fluentbit:5.1.2-1@sha256:4926d7d003ca09c826a3dea5d9ccd0ba158296880471bcec82ef38f95617b913",
 	"docker.io/percona/pmm-client:3.9.1@sha256:298e731652e2be172a2505596edaee1e0c014609035347599048f62efae78e5b",
@@ -99,7 +101,7 @@ var perconaImages = []string{
 
 // genericRebootImage is the image janitor-provider's generic reboot Job runs.
 // The chart passes it as an env var, which aicr mirror cannot discover.
-const genericRebootImage = "docker.io/library/busybox:1.38.0@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+const genericRebootImage = "docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4"
 
 // chartDefaultRuleSets are fault-quarantine's rule sets at chart v1.28.0, in
 // evaluation order. AICR overrides none of them.
@@ -212,9 +214,9 @@ func renderedDocumentMatching(rendered, kind string, name *regexp.Regexp) (strin
 // TestNVSentinelRemediationChartRender renders the pinned chart with each
 // remediation step composed and asserts what reaches the cluster: which
 // pipeline Deployments render, that each runs with the step's --dry-run, the
-// fault-quarantine rule sets and node-drainer mode the steps take from the
-// chart, fault-remediation's action map, janitor-provider's reboot image, and
-// every image the step pulls.
+// fault-quarantine rule sets the steps take from the chart, node-drainer's
+// drain scope and timing, fault-remediation's action map, janitor-provider's
+// reboot image, and every image the step pulls.
 //
 // The values test pins the map AICR sets; this one pins what the chart builds
 // from it and from its own defaults, so a chart bump that renamed a key,
@@ -228,7 +230,7 @@ func TestNVSentinelRemediationChartRender(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live chart-render integration test in short mode")
 	}
-	requireHelmForObservabilityRender(t)
+	helmtest.RequireBinary(t)
 
 	store, err := recipe.LoadMetadataStoreFor(context.Background(), nil)
 	if err != nil {
@@ -237,7 +239,12 @@ func TestNVSentinelRemediationChartRender(t *testing.T) {
 
 	for _, step := range remediationStepRender {
 		t.Run(step.mixin, func(t *testing.T) {
-			out := renderNVSentinel(t, nvsentinelRenderedValues(t, store, step.mixin))
+			values := nvsentinelRenderedValues(t, store, step.mixin)
+			// The bundler adds the drain scope after recipe values resolve.
+			if err := drainscope.Apply(t.Context(), values, drainScopeRenderNamespaces); err != nil {
+				t.Fatalf("drainscope.Apply: %v", err)
+			}
+			out := renderNVSentinel(t, values)
 
 			for _, name := range remediationDeployments {
 				doc, found := renderedDocument(out, "Deployment", name)
@@ -347,7 +354,7 @@ func TestNVSentinelMongoDBChartRender(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live chart-render integration test in short mode")
 	}
-	requireHelmForObservabilityRender(t)
+	helmtest.RequireBinary(t)
 
 	op := renderRegistryComponent(t, "psmdb-operator")
 	dep, ok := renderedDocument(op, "Deployment", "release-psmdb-operator")
@@ -433,6 +440,12 @@ func assertRenderedRuleSets(t *testing.T, rendered string) {
 	}
 }
 
+// drainScopeRenderNamespaces stands in for a recipe's namespaces; the
+// bundler tests cover generating them from real recipes.
+var drainScopeRenderNamespaces = []string{"cert-manager", "nvidia-network-operator"}
+
+// assertRenderedDrainMode checks node-drainer's rendered config carries the
+// drain scope and timing AICR sets, under the keys node-drainer reads.
 func assertRenderedDrainMode(t *testing.T, rendered string) {
 	t.Helper()
 	cm, ok := renderedDocument(rendered, "ConfigMap", "node-drainer")
@@ -444,8 +457,19 @@ func assertRenderedDrainMode(t *testing.T, rendered string) {
 	for _, m := range matches {
 		got = append(got, m[1]+"="+m[2])
 	}
-	if strings.Count(cm, "[[userNamespaces]]") != 1 || len(got) != 1 || got[0] != "*=AllowCompletion" {
-		t.Errorf("node-drainer userNamespaces = %q, want only *=AllowCompletion; the documented drain (wait for pods to finish, never evict) no longer holds", got)
+	if strings.Count(cm, "[[userNamespaces]]") != 1 || len(got) != 1 || got[0] != "*="+drainscope.DefaultMode {
+		t.Errorf("node-drainer userNamespaces = %q, want only *=%s", got, drainscope.DefaultMode)
+	}
+	for _, line := range []string{
+		`systemNamespaces = "` + drainscope.SystemNamespacesPattern(drainScopeRenderNamespaces) + `"`,
+		"deleteAfterTimeoutMinutes = 300",
+		`evictionTimeoutInSeconds = "60"`,
+		"drainGPUPods = false",
+		"partialDrainEnabled = false",
+	} {
+		if !strings.Contains(cm, line) {
+			t.Errorf("node-drainer config does not carry %s:\n%s", line, cm)
+		}
 	}
 }
 
@@ -526,7 +550,7 @@ func TestNVSentinelRemediationAbsentWithoutMixin(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping live chart-render integration test in short mode")
 	}
-	requireHelmForObservabilityRender(t)
+	helmtest.RequireBinary(t)
 
 	store, err := recipe.LoadMetadataStoreFor(context.Background(), nil)
 	if err != nil {
@@ -546,5 +570,39 @@ func TestNVSentinelRemediationAbsentWithoutMixin(t *testing.T) {
 		if strings.Contains(out, image) {
 			t.Errorf("%s rendered without a remediation mixin", image)
 		}
+	}
+}
+
+// TestNVSentinelChartSystemNamespacesDefault renders node-drainer with the
+// chart's own systemNamespaces and requires drainscope.ChartSystemNamespaces
+// to name the same namespaces, so a chart bump that protects another one is
+// not silently dropped by the generated pattern.
+//
+// Pulls the chart over the network, so -short skips it.
+func TestNVSentinelChartSystemNamespacesDefault(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live chart-render integration test in short mode")
+	}
+	helmtest.RequireBinary(t)
+
+	store, err := recipe.LoadMetadataStoreFor(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("LoadMetadataStoreFor: %v", err)
+	}
+	cm, ok := renderedDocument(renderNVSentinel(t, nvsentinelRenderedValues(t, store, "nvsentinel-quarantine")),
+		"ConfigMap", "node-drainer")
+	if !ok {
+		t.Fatal("node-drainer ConfigMap not rendered")
+	}
+	m := regexp.MustCompile(`systemNamespaces = "\^\(([^)]*)\)\$"`).FindStringSubmatch(cm)
+	if m == nil {
+		t.Fatalf("node-drainer config has no anchored systemNamespaces:\n%s", cm)
+	}
+	got := strings.Split(m[1], "|")
+	want := drainscope.ChartSystemNamespaces()
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("chart systemNamespaces = %v, drainscope.ChartSystemNamespaces = %v", got, want)
 	}
 }

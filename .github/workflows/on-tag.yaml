@@ -61,9 +61,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          SEMVER_TAG_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?$'
+          # The operator's release builds accept only these tags
+          # (pkg/operator/version), and a failing operator blocks the release.
+          SEMVER_TAG_PATTERN='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(alpha|beta|rc)\.?(0|[1-9][0-9]*))?$'
           if [[ ! "${TAG}" =~ ${SEMVER_TAG_PATTERN} ]]; then
-            echo "::error::release tag is not valid SemVer: ${TAG}"
+            echo "::error::release tag is not vX.Y.Z or vX.Y.Z-(alpha|beta|rc)N: ${TAG}"
             exit 1
           fi
           CANDIDATE_TAG="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -241,6 +243,51 @@ jobs:
         uses: ./.github/actions/setup-dgxc-goproxy
         with:
           mode: enforced
+
+      # Stable tags only: pin the tag GoReleaser releases, and start the release
+      # notes at the previous STABLE tag.
+      #
+      # Current tag (#3289). GoReleaser reads it from GORELEASER_CURRENT_TAG and,
+      # when that is unset, takes the first line of
+      # `git tag --points-at HEAD --sort -version:refname`. After
+      # `make bump-promote` the GA tag and its RC tag point at the same commit,
+      # and git version-sorts v1.3.0-rc2 ahead of v1.3.0, so an unpinned GA run
+      # would be built, versioned, and published as the RC. Pin it to the tag
+      # that triggered this run. The `detect` job has already required it to be
+      # valid SemVer. This is written first so no early exit below can skip it.
+      #
+      # Previous tag. GoReleaser picks it with
+      # `git describe --tags --abbrev=0 tags/<tag>^`, which counts pre-release
+      # tags. With an RC of this version still on the remote, the RC on an
+      # earlier commit becomes the base of the `changelog.use: github` compare
+      # and the GA notes list only the changes since that RC.
+      # GORELEASER_PREVIOUS_TAG overrides that lookup. The exclusion matches
+      # tools/changelog, which also skips pre-release tags (any tag with a
+      # hyphen).
+      #
+      # Pre-releases are left alone: an RC's notes still cover the changes since
+      # the previous tag of any kind, so rc2 lists what landed after rc1.
+      #
+      # GITHUB_ENV is inherited by the steps of the composite action below,
+      # which is where `make release` runs goreleaser.
+      - name: Pin the release tag and the previous stable tag
+        if: needs.detect.outputs.is_prerelease == 'false'
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "GORELEASER_CURRENT_TAG=${TAG}" >> "${GITHUB_ENV}"
+          if ! previous="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "refs/tags/${TAG}^")"; then
+            echo "::notice::no stable tag precedes ${TAG}; leaving the previous tag to GoReleaser"
+            exit 0
+          fi
+          if [[ ! "${previous}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::previous stable tag is not a plain SemVer tag: ${previous}"
+            exit 1
+          fi
+          echo "GORELEASER_PREVIOUS_TAG=${previous}" >> "${GITHUB_ENV}"
+          echo "Releasing ${TAG}; release notes start at ${previous}"
 
       - name: Build and Release
         id: release
@@ -749,7 +796,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: hashFiles('results.sarif') != '' || steps.scan.outputs.sarif != ''
-        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee  # v4.39.0
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4.39.1
         with:
           sarif_file: ${{ steps.scan.outputs.sarif }}
           category: 'anchore-image-${{ matrix.image.key }}-${{ matrix.platform.arch }}'
@@ -796,7 +843,7 @@ jobs:
   release-check:
     name: Release Integrity Check
     runs-on: ubuntu-24.04
-    needs: [resolve-candidates, image-vuln-scan, attest]
+    needs: [resolve-candidates, image-vuln-scan, attest, operator-candidate, operator-scan, operator-reproducible, operator-lifecycle]
     if: always()
     timeout-minutes: 5
     permissions:
@@ -807,18 +854,468 @@ jobs:
           RESOLVE_RESULT: ${{ needs.resolve-candidates.result }}
           SCAN_RESULT: ${{ needs.image-vuln-scan.result }}
           ATTEST_RESULT: ${{ needs.attest.result }}
+          OPERATOR_CANDIDATE_RESULT: ${{ needs.operator-candidate.result }}
+          OPERATOR_SCAN_RESULT: ${{ needs.operator-scan.result }}
+          OPERATOR_REPRODUCIBLE_RESULT: ${{ needs.operator-reproducible.result }}
+          OPERATOR_LIFECYCLE_RESULT: ${{ needs.operator-lifecycle.result }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if [[ "${RESOLVE_RESULT}" != "success" || \
             "${SCAN_RESULT}" != "success" || \
-            "${ATTEST_RESULT}" != "success" ]]; then
+            "${ATTEST_RESULT}" != "success" || \
+            "${OPERATOR_CANDIDATE_RESULT}" != "success" || \
+            "${OPERATOR_SCAN_RESULT}" != "success" || \
+            "${OPERATOR_REPRODUCIBLE_RESULT}" != "success" || \
+            "${OPERATOR_LIFECYCLE_RESULT}" != "success" ]]; then
             echo "::error::Release security gates did not all succeed for ${TAG}."
             echo "::error::Candidate aliases remain non-public; repair the failure and rerun this tag."
             exit 1
           fi
 
           echo "Release integrity check passed."
+
+  # =============================================================================
+  # AICR Operator (preview, ADR-027): one candidate of the tagged source, built
+  # as OCI layouts, the deterministically packaged chart and the
+  # kubectl-aicr binaries (tools/operator-candidate). It is scanned like every
+  # release image; release-check fails closed on its build, scan,
+  # reproducibility and lifecycle checks, so they gate image promotion too. It is published and attested only after the
+  # images are promoted, and publish waits for it, so a failing operator
+  # blocks the release.
+  # =============================================================================
+
+  operator-candidate:
+    name: Operator Candidate
+    runs-on: ubuntu-24.04
+    needs: [detect, tests]
+    timeout-minutes: 30
+    outputs:
+      artifact: ${{ steps.name.outputs.name }}
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      # The candidate build runs ko and the operator through `go run`, so its
+      # modules come through Artifactory like the rest of the release.
+      - name: Configure the DGXC Go proxy
+        uses: ./.github/actions/setup-dgxc-goproxy
+        with:
+          mode: enforced
+
+      - name: Assert the proxy is actually in front
+        shell: bash
+        run: |
+          set -euo pipefail
+          proxy="$(go env GOPROXY)"
+          expected="https://edge.urm.nvidia.com/artifactory/api/go/dgxc-go-virtual"
+          [ "${proxy}" = "${expected}" ] \
+            || { echo "::error::GOPROXY is '${proxy}', expected exactly '${expected}'"; exit 1; }
+          [ "$(go env GOSUMDB)" != off ] \
+            || { echo "::error::GOSUMDB=off; modules would not be verified against the transparency log"; exit 1; }
+
+      - name: Warm the module cache through the proxy
+        shell: bash
+        run: go mod download
+
+      - name: Install Helm and yq
+        uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_yq: 'true'
+          yq_version: ${{ steps.versions.outputs.yq }}
+
+      # Also checks the candidate for credential material and that its
+      # linux/amd64 operator refuses development settings.
+      - name: Build the operator candidate
+        env:
+          CANDIDATE_VERSION: ${{ github.ref_name }}
+          CANDIDATE_REPOSITORY: ghcr.io/nvidia/aicr-operator
+          CANDIDATE_REGISTRY_REPOSITORY: ghcr.io/nvidia/aicr-registry
+        run: make operator-candidate
+
+      # Before release-check, so a finding stops promotion and every push.
+      - name: Malware scan the kubectl-aicr binaries
+        uses: ./.github/actions/malware-scan
+        with:
+          scan_path: dist/candidate/plugin/
+          category: 'clamav-operator-plugin'
+
+      - name: Name the candidate artifact
+        id: name
+        env:
+          CANDIDATE_TAG: ${{ needs.detect.outputs.candidate_tag }}
+        run: echo "name=aicr-operator-candidate-${CANDIDATE_TAG}-attempt-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: dist/candidate
+          retention-days: 30
+          if-no-files-found: error
+
+      # setup-dgxc-goproxy left a live Artifactory token in $RUNNER_TEMP
+      # (see build-ko).
+      - name: Remove the proxy credential
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/dgxc-goauth"
+
+  # The tagged source builds the operator candidate byte for byte twice, the
+  # second time with an empty Go build cache (tools/operator-candidate verify).
+  # It runs beside operator-candidate and gates publishing.
+  operator-reproducible:
+    name: Operator Reproducibility
+    runs-on: ubuntu-24.04
+    needs: [detect, tests]
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      - name: Configure the DGXC Go proxy
+        uses: ./.github/actions/setup-dgxc-goproxy
+        with:
+          mode: enforced
+
+      - name: Assert the proxy is actually in front
+        shell: bash
+        run: |
+          set -euo pipefail
+          proxy="$(go env GOPROXY)"
+          expected="https://edge.urm.nvidia.com/artifactory/api/go/dgxc-go-virtual"
+          [ "${proxy}" = "${expected}" ] \
+            || { echo "::error::GOPROXY is '${proxy}', expected exactly '${expected}'"; exit 1; }
+          [ "$(go env GOSUMDB)" != off ] \
+            || { echo "::error::GOSUMDB=off; modules would not be verified against the transparency log"; exit 1; }
+
+      - name: Warm the module cache through the proxy
+        shell: bash
+        run: go mod download
+
+      - name: Install Helm and yq
+        uses: ./.github/actions/setup-build-tools
+        with:
+          install_helm: 'true'
+          helm_version: ${{ steps.versions.outputs.helm }}
+          install_yq: 'true'
+          yq_version: ${{ steps.versions.outputs.yq }}
+
+      - name: Build the candidate twice and compare
+        env:
+          CANDIDATE_VERSION: ${{ github.ref_name }}
+          CANDIDATE_REPOSITORY: ghcr.io/nvidia/aicr-operator
+          CANDIDATE_REGISTRY_REPOSITORY: ghcr.io/nvidia/aicr-registry
+        run: make operator-candidate-verify
+
+      - name: Remove the proxy credential
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/dgxc-goauth"
+
+  # The lifecycle scenarios from the newest published release older than this
+  # tag, attestations verified, upgraded to this candidate, rolled back and
+  # uninstalled in the documented order (make operator-qualify-published).
+  # A failure blocks image promotion and publishing, as ADR-027 requires of
+  # an operator gate. It runs third-party images on privileged kind nodes, so
+  # it holds neither the release's OIDC identity nor the Go proxy's
+  # credential; its modules come from the default proxy, as the PR lanes'
+  # do, and it publishes nothing.
+  operator-lifecycle:
+    name: Operator Lifecycle from the Published Release
+    runs-on: ubuntu-24.04
+    needs: [detect, operator-candidate]
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      attestations: read
+      packages: read
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up the kind cluster
+        uses: ./.github/actions/operator-kind
+        with:
+          kubernetes: newest
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.operator-candidate.outputs.artifact }}
+          path: dist/candidate
+
+      - name: Qualify the upgrade from the published release
+        env:
+          OPERATOR_E2E_REQUIRED: '1'
+          OPERATOR_KIND_IMAGE_CACHE: ${{ runner.temp }}/kind-images
+          GH_TOKEN: ${{ github.token }}
+          PUBLISHED_BELOW: ${{ github.ref_name }}
+        run: make operator-qualify-published
+
+      - name: Operator logs
+        if: ${{ failure() || cancelled() }}
+        run: |
+          kubectl --kubeconfig .operator-e2e/kubeconfig -n aicr-system logs deployment/aicr-operator --tail=300 || true
+          kubectl --kubeconfig .operator-e2e/kubeconfig get clusterruntimes,runtimerollouts -o yaml || true
+
+      - name: Delete kind cluster
+        if: ${{ always() }}
+        run: make operator-kind-down
+
+  operator-scan:
+    name: Operator Vuln Scan (${{ matrix.platform.arch }})
+    runs-on: ubuntu-24.04
+    needs: [operator-candidate]
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux/amd64
+            arch: amd64
+          - name: linux/arm64
+            arch: arm64
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.operator-candidate.outputs.artifact }}
+          path: dist/candidate
+
+      - name: Scan the operator image
+        id: scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
+        env:
+          GRYPE_PLATFORM: ${{ matrix.platform.name }}
+        with:
+          image: 'oci-dir:dist/candidate/image'
+          severity-cutoff: 'high'
+          output-format: sarif
+          only-fixed: true
+          fail-build: true
+          config: .grype.yaml
+          vex: .openvex.json
+        continue-on-error: true
+
+      - name: Upload SARIF to GitHub Security
+        if: hashFiles('results.sarif') != '' || steps.scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4.39.1
+        with:
+          sarif_file: ${{ steps.scan.outputs.sarif }}
+          category: 'anchore-image-aicr-operator-${{ matrix.platform.arch }}'
+        continue-on-error: true
+
+      # The chart's in-cluster registry (cmd/aicr-registry), built with the
+      # operator and held to the same bar.
+      - name: Scan the in-cluster registry image
+        id: registry-scan
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
+        env:
+          GRYPE_PLATFORM: ${{ matrix.platform.name }}
+        with:
+          image: 'oci-dir:dist/candidate/registry-image'
+          severity-cutoff: 'high'
+          output-format: sarif
+          only-fixed: true
+          fail-build: true
+          config: .grype.yaml
+          vex: .openvex.json
+        continue-on-error: true
+
+      - name: Upload the registry SARIF to GitHub Security
+        if: steps.registry-scan.outputs.sarif != ''
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4.39.1
+        with:
+          sarif_file: ${{ steps.registry-scan.outputs.sarif }}
+          category: 'anchore-image-aicr-registry-${{ matrix.platform.arch }}'
+        continue-on-error: true
+
+      - name: Fail on vulnerabilities
+        if: steps.scan.outcome == 'failure' || steps.registry-scan.outcome == 'failure'
+        env:
+          OPERATOR_SCAN: ${{ steps.scan.outcome }}
+          REGISTRY_SCAN: ${{ steps.registry-scan.outcome }}
+          PLATFORM: ${{ matrix.platform.name }}
+        run: |
+          [[ "${OPERATOR_SCAN}" == failure ]] && echo "::error::Vulnerability scan found issues in the operator image for ${PLATFORM}"
+          [[ "${REGISTRY_SCAN}" == failure ]] && echo "::error::Vulnerability scan found issues in the in-cluster registry image for ${PLATFORM}"
+          exit 1
+
+  operator-publish:
+    name: Publish Operator Artifacts
+    runs-on: ubuntu-24.04
+    needs: [detect, release-check, promote-images, operator-candidate, operator-scan, operator-reproducible, operator-lifecycle]
+    timeout-minutes: 20
+    outputs:
+      digests: ${{ steps.digests.outputs.digests }}
+    permissions:
+      contents: write
+      # setup-dgxc-goproxy mints its Artifactory credential through OIDC.
+      id-token: write
+      packages: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Load versions
+        id: versions
+        uses: ./.github/actions/load-versions
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version: ${{ steps.versions.outputs.go }}
+          cache: false
+
+      - name: Configure the DGXC Go proxy
+        uses: ./.github/actions/setup-dgxc-goproxy
+        with:
+          mode: enforced
+
+      - name: Assert the proxy is actually in front
+        shell: bash
+        run: |
+          set -euo pipefail
+          proxy="$(go env GOPROXY)"
+          expected="https://edge.urm.nvidia.com/artifactory/api/go/dgxc-go-virtual"
+          [ "${proxy}" = "${expected}" ] \
+            || { echo "::error::GOPROXY is '${proxy}', expected exactly '${expected}'"; exit 1; }
+          [ "$(go env GOSUMDB)" != off ] \
+            || { echo "::error::GOSUMDB=off; modules would not be verified against the transparency log"; exit 1; }
+
+      - name: Warm the module cache through the proxy
+        shell: bash
+        run: go mod download
+
+      - name: Download the candidate
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: ${{ needs.operator-candidate.outputs.artifact }}
+          path: dist/candidate
+
+      - name: Check the candidate is this tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(jq -r '.version' dist/candidate/candidate.json)"
+          commit="$(jq -r '.source.commit' dist/candidate/candidate.json)"
+          if [[ "${version}" != "${TAG}" || "${commit}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::the candidate is ${version} at ${commit}, not ${TAG} at ${GITHUB_SHA}"
+            exit 1
+          fi
+
+      # Publishing the same candidate again is a no-op, so a rerun converges;
+      # a tag that already names other content is refused.
+      - name: Push the operator and registry images and the chart
+        id: push
+        env:
+          CANDIDATE_REGISTRY_USERNAME: ${{ github.actor }}
+          CANDIDATE_REGISTRY_PASSWORD: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          go run ./tools/operator-release push -dir dist/candidate -chart-registry ghcr.io/nvidia/charts | tee -a "$GITHUB_OUTPUT"
+
+      # attest-operator.yaml attests these exact digests: each image index
+      # and platform manifest from the candidate, and the chart as pushed.
+      - name: Record the published digests
+        id: digests
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.image-digest }}
+          REGISTRY_DIGEST: ${{ steps.push.outputs.registry-digest }}
+          CHART_DIGEST: ${{ steps.push.outputs.chart-digest }}
+        run: |
+          set -euo pipefail
+          digests="$(jq -cS -e \
+            --arg operator "${IMAGE_DIGEST}" --arg registry "${REGISTRY_DIGEST}" --arg chart "${CHART_DIGEST}" '{
+              operator: $operator,
+              "operator-amd64": .operator.platforms["linux/amd64"],
+              "operator-arm64": .operator.platforms["linux/arm64/v8"],
+              registry: $registry,
+              "registry-amd64": .registry.platforms["linux/amd64"],
+              "registry-arm64": .registry.platforms["linux/arm64/v8"],
+              chart: $chart
+            }' dist/candidate/candidate.json)"
+          echo "digests=${digests}" >> "$GITHUB_OUTPUT"
+      # The draft release build-ko created; publish requires these names
+      # (expected_release_asset_names in release-images.sh).
+      - name: Attach the kubectl-aicr binaries to the release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${TAG}" dist/candidate/plugin/kubectl-aicr-* --clobber --repo "${GITHUB_REPOSITORY}"
+
+      # setup-dgxc-goproxy left a live Artifactory token in $RUNNER_TEMP
+      # (see build-ko).
+      - name: Remove the proxy credential
+        if: always()
+        shell: bash
+        run: rm -f "${RUNNER_TEMP}/dgxc-goauth"
+
+  # CycloneDX SBOM, OpenVEX and provenance for the operator's images, and
+  # provenance for its chart and plugin, from the reusable workflow so the
+  # provenance is SLSA Build Level 3, like AICR's images.
+  operator-attest:
+    name: Attest Operator Artifacts
+    needs: [operator-publish, operator-candidate]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/attest-operator.yaml
+    with:
+      digests: ${{ needs.operator-publish.outputs.digests }}
+      plugin_artifact: ${{ needs.operator-candidate.outputs.artifact }}
 
   # =============================================================================
   # Promote: preflight all public aliases, then converge them to exact digests
@@ -887,7 +1384,7 @@ jobs:
   publish:
     name: Publish Release
     runs-on: ubuntu-24.04
-    needs: [detect, promote-images]
+    needs: [detect, promote-images, operator-publish, operator-attest]
     timeout-minutes: 5
     permissions:
       contents: write
@@ -1225,6 +1722,12 @@ jobs:
       - attach-source
       - release-check
       - promote-images
+      - operator-candidate
+      - operator-scan
+      - operator-reproducible
+      - operator-lifecycle
+      - operator-publish
+      - operator-attest
       - publish
       - publish-homebrew
       - notify
@@ -1245,6 +1748,12 @@ jobs:
           ATTEST: ${{ needs.attest.result }}
           RELEASE_CHECK: ${{ needs.release-check.result }}
           PROMOTE: ${{ needs.promote-images.result }}
+          OPERATOR_CANDIDATE: ${{ needs.operator-candidate.result }}
+          OPERATOR_SCAN: ${{ needs.operator-scan.result }}
+          OPERATOR_REPRODUCIBLE: ${{ needs.operator-reproducible.result }}
+          OPERATOR_LIFECYCLE: ${{ needs.operator-lifecycle.result }}
+          OPERATOR_PUBLISH: ${{ needs.operator-publish.result }}
+          OPERATOR_ATTEST: ${{ needs.operator-attest.result }}
           PUBLISH: ${{ needs.publish.result }}
           HOMEBREW: ${{ needs.publish-homebrew.result }}
           NOTIFY: ${{ needs.notify.result }}
@@ -1276,6 +1785,12 @@ jobs:
             echo "| Attestation | ${ATTEST} |"
             echo "| Release Check | ${RELEASE_CHECK} |"
             echo "| Image Promotion | ${PROMOTE} |"
+            echo "| Operator Candidate | ${OPERATOR_CANDIDATE} |"
+            echo "| Operator Vulnerability Scan | ${OPERATOR_SCAN} |"
+            echo "| Operator Reproducibility | ${OPERATOR_REPRODUCIBLE} |"
+            echo "| Operator Lifecycle | ${OPERATOR_LIFECYCLE} |"
+            echo "| Operator Publish | ${OPERATOR_PUBLISH} |"
+            echo "| Operator Attestation | ${OPERATOR_ATTEST} |"
             echo "| Publish | ${PUBLISH} |"
             echo "| Third-Party Source | ${ATTACH_SOURCE} |"
             echo "| Homebrew | ${HOMEBREW} |"

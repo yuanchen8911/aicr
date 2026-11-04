@@ -26,6 +26,9 @@
 //
 //   - ResolveRecipe / ResolveRecipeFromCriteria / ResolveRecipeFromSnapshot
 //     and LoadRecipe — produce or load a *RecipeResult.
+//   - RequirePublishedEvidence — reject a resolved recipe that has no
+//     committed evidence pointer. Callers decide whether to invoke it;
+//     ResolveRecipe does not.
 //   - BundleComponents — resolve Helm values and stitched manifests for
 //     each component in a *RecipeResult.
 //   - CollectSnapshot — deploy the snapshotter Job and retrieve a *Snapshot.
@@ -159,6 +162,7 @@ import (
 
 	"github.com/NVIDIA/aicr/pkg/bundler"
 	"github.com/NVIDIA/aicr/pkg/bundler/bundleinfo"
+	"github.com/NVIDIA/aicr/pkg/bundler/drainscope"
 	"github.com/NVIDIA/aicr/pkg/bundler/validations"
 	"github.com/NVIDIA/aicr/pkg/constraints"
 	"github.com/NVIDIA/aicr/pkg/defaults"
@@ -742,15 +746,17 @@ func (c *Client) criteriaRegistry(
 }
 
 // assertOwns rejects RecipeResults that were not produced by this Client.
-// The owner field is stamped in ResolveRecipe with the producing Client's
-// pointer identity; passing result A to client B silently mixed A's
-// component refs with B's DataProvider reads before this check existed,
-// producing wrong Helm values or supplemental manifests with no error.
+// Every Client method that returns a RecipeResult stamps the owner field
+// with the producing Client's pointer identity; passing result A to
+// client B silently mixed A's component refs with B's DataProvider reads
+// before this check existed, producing wrong Helm values or supplemental
+// manifests with no error.
 //
-// A nil owner means the caller bypassed ResolveRecipe (e.g., constructed
-// the RecipeResult directly). That's a programmer error too — the
-// internal field requires the facade to populate it, and the only public
-// path is ResolveRecipe — so the check rejects nil owner as well.
+// A nil owner means the RecipeResult did not come from a Client (e.g.,
+// WrapResolved or a struct literal). The bundle, validate, preflight, and
+// evidence methods reject such a result, so the check rejects nil owner as
+// well; MirrorInventory does not call this and accepts an unowned result
+// by design.
 //
 // The error embeds %p of both pointers; in controller logs that lets an
 // operator distinguish "wrong Client" from "no Client at all" without
@@ -760,7 +766,7 @@ func (c *Client) assertOwns(r *RecipeResult) error {
 		return nil
 	}
 	return errors.NewWithContext(errors.ErrCodeInvalidRequest,
-		"RecipeResult was produced by a different Client (or constructed outside ResolveRecipe); cross-client bundle/validate is not permitted",
+		"RecipeResult was produced by a different Client (or constructed outside ResolveRecipe); cross-client use is not permitted",
 		map[string]any{
 			"expectedOwner": fmt.Sprintf("%p", c),
 			"actualOwner":   fmt.Sprintf("%p", r.owner),
@@ -891,10 +897,10 @@ func (c *Client) ResolveRecipe(ctx context.Context, req RecipeRequest) (*RecipeR
 	if err != nil {
 		return nil, err
 	}
-	// Stamp the owning Client so BundleComponents / ValidateState can
-	// reject cross-client misuse. Pointer identity is the token —
-	// unforgeable from outside this package because RecipeResult.owner
-	// is unexported.
+	// Stamp the owning Client so the bundle, validate, preflight, and
+	// evidence methods can reject cross-client misuse. Pointer identity
+	// is the token — unforgeable from outside this package because
+	// RecipeResult.owner is unexported.
 	result.owner = c
 	return result, nil
 }
@@ -1041,11 +1047,53 @@ func (c *Client) inheritObjectNames(
 	if err != nil {
 		return err
 	}
-	current, err := internalObjectNames(ctx, resolved)
+	// Read before pinning, so references are found under the current names.
+	currentValues, err := internalMergedValues(ctx, resolved)
 	if err != nil {
 		return err
 	}
-	return recipe.ApplyInheritedObjectNames(resolved.ComponentRefs, prior, current)
+	current, err := projectObjectNames(currentValues)
+	if err != nil {
+		return err
+	}
+	pins, err := recipe.ApplyInheritedObjectNames(resolved.ComponentRefs, prior, current)
+	if err != nil {
+		return err
+	}
+	warnUnreboundObjectNames(inheritFrom, pins,
+		recipe.FindObjectNameReferences(pins, resolved.ComponentRefs, currentValues))
+	return nil
+}
+
+// warnUnreboundObjectNames logs a warning for each of pins with
+// HealthCheckMayBeStale set and for each of refs.
+func warnUnreboundObjectNames(inheritFrom string, pins []recipe.ObjectNamePin, refs []recipe.ObjectNameReference) {
+	for _, pin := range pins {
+		if !pin.HealthCheckMayBeStale {
+			continue
+		}
+		slog.Warn("inherit-from pinned an object name its health check may not assert",
+			"inheritFrom", inheritFrom,
+			"component", pin.Component,
+			"field", pin.Path,
+			"inherited", pin.Inherited,
+			"current", pin.Current,
+			"reason", "a check is rebound only for a fullnameOverride both artifacts state, only where an "+
+				"object name begins with it, and only when no other pin moves the same current name to a "+
+				"different inherited one. An unset side takes a name the chart derives from the release",
+			"remedy", "check the component's health check against the deployed object names")
+	}
+	for _, ref := range refs {
+		slog.Warn("inherit-from pinned an object name that another setting may still address by its current name",
+			"inheritFrom", inheritFrom,
+			"component", ref.Pin.Component,
+			"field", ref.Pin.Path,
+			"inherited", ref.Pin.Inherited,
+			"current", ref.Pin.Current,
+			"referencedBy", ref.Component,
+			"location", ref.Location,
+			"remedy", "override the reference to the inherited name if it addresses this object")
+	}
 }
 
 // requireHydratedRecipe rejects an inheritance source that is not already a
@@ -1896,6 +1944,21 @@ func (c *Client) BundleComponents(ctx context.Context, r *RecipeResult) ([]Compo
 	helmValues, err := resolveHelmComponentValues(ctx, r)
 	if err != nil {
 		return nil, err
+	}
+	if sentinel, ok := helmValues[drainscope.ComponentName]; ok {
+		if err := bundler.ApplyNVSentinelDrainScope(ctx, sentinel, r.internal); err != nil {
+			return nil, err
+		}
+	}
+	// Before pinning, so the gates read the injected values. With no bundlers
+	// filter or --set here, the platform is every enabled ref.
+	scope, scopeErr := bundler.InjectPromQLScrapeScope(r.internal.DataProvider(), r.internal.ComponentRefs, helmValues)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+	if scope.Server != "" && len(scope.Consumers) == 0 {
+		slog.Warn("PromQL server is enabled but no enabled component declares telemetry.promql, so its Prometheus scrapes nothing",
+			"component", scope.Server)
 	}
 	pinned := r.internal.WithResolvedValues(helmValues)
 	if err := bundler.ValidateAccountingValues(pinned, helmValues); err != nil {
